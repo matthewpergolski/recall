@@ -1,0 +1,33 @@
+/target/
+capture-helper/.build/
+
+# Local meeting data and generated artifacts
+/memory-bank/
+/sessions/*
+!/sessions/.gitkeep
+*.m4a
+*.wav
+*.mp3
+*.flac
+*.vtt
+
+# Local transcription models/binaries are large and should be installed separately.
+/models/*
+!/models/.gitkeep
+/tools/*
+!/tools/.gitkeep
+!/tools/whisper/
+/tools/whisper/*
+!/tools/whisper/.gitkeep
+!/tools/whisper/bin/
+/tools/whisper/bin/*
+!/tools/whisper/bin/.gitkeep
+
+# Local config/secrets
+.env
+.env.*
+
+/.DS_Store
+/.idea/
+/.vscode/
+*.log
