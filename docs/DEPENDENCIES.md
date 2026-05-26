@@ -41,7 +41,7 @@ Transcription currently needs three things:
 | --- | --- | --- |
 | `whisper-cli` | Runs local speech-to-text inference | `whisper.cpp` on GitHub |
 | `ggml` Whisper model | Model weights loaded by `whisper-cli` | Hugging Face `ggerganov/whisper.cpp` |
-| `ffmpeg` | Converts Recall `.m4a` audio to 16 kHz mono WAV | Homebrew for now, or an approved corporate binary |
+| `ffmpeg` | Chunks Recall `.m4a` audio and converts chunks to 16 kHz mono WAV | Homebrew for now, or an approved corporate binary |
 
 `ffmpeg` is a temporary dependency. The intended corporate-friendly direction is to replace it with a Swift/AVFoundation conversion command so transcription only needs `whisper-cli` and a model.
 
@@ -112,6 +112,47 @@ Options for getting `whisper-cli` without Homebrew:
 3. Have IT/security publish an internally approved `whisper-cli` binary.
 
 Recall should not assume Homebrew in corporate environments. It should accept explicit paths through `RECALL_WHISPER_BIN` and `RECALL_WHISPER_MODEL`.
+
+## Optional Agent Analysis
+
+Agent analysis is optional. Recording and local transcription work without it.
+
+If you want Recall to generate summary/action files, install and authenticate at least one supported headless CLI agent:
+
+| Agent | Command Recall Expects |
+| --- | --- |
+| Grok | `grok` |
+| Cline | `cline` |
+| Codex | `codex` |
+| Claude | `claude` |
+
+Check local availability:
+
+```sh
+recall agents list
+recall agents doctor
+```
+
+Configure a default agent with CLI flags:
+
+```sh
+recall --agent grok --auto-analyze
+recall analyze latest --agent grok
+```
+
+Or with local config:
+
+```toml
+# ~/.config/recall/config.toml
+consent_default = "provided"
+
+[analysis]
+default_agent = "grok"
+auto_analyze = true
+preset = "general"
+```
+
+Headless agents may call their own hosted services depending on the tool. Keep this optional when you need a fully local-only workflow.
 
 ## Future Installer Direction
 

@@ -25,6 +25,7 @@ tools/*
 ## Why
 
 - `sessions/` contains meeting audio, transcripts, summaries, metadata, and stop files.
+- Session subfolders can also contain agent outputs such as `summary.md`, `actions.md`, `decisions.md`, `questions.md`, `followups.md`, `transcription-debug/`, and `analysis-debug/`.
 - `models/` contains large Whisper model files such as `ggml-base.en.bin`.
 - `tools/` may contain local or corporate-approved binaries.
 - `target/` and `capture-helper/.build/` are generated build outputs.

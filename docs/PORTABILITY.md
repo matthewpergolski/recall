@@ -67,9 +67,9 @@ For zsh, that usually goes in:
 ~/.zshrc
 ```
 
-## Optional Consent Shortcut
+## Optional Shortcuts
 
-This is optional. It just opens Recall with consent already marked while keeping `recall sources`, `recall list`, and other subcommands normal.
+This is optional. It just opens Recall with consent already marked.
 
 ```sh
 alias recall-ready='recall --consent provided'
@@ -87,19 +87,13 @@ Then use:
 recall-ready
 ```
 
-If you want plain `recall` to open the TUI with consent marked while preserving subcommands, use a shell function instead of an alias:
+Plain `recall` can also be aliased with defaults. Recall parses leading TUI defaults before subcommands, so this still preserves commands like `recall list` and `recall transcribe latest`:
 
 ```sh
-recall() {
-  if [ "$#" -eq 0 ]; then
-    command recall --consent provided
-  else
-    command recall "$@"
-  fi
-}
+alias recall='command recall --consent provided --agent grok --auto-analyze'
 ```
 
-Do not alias `recall` itself to `command recall --consent provided`; that makes `recall sources` expand into an invalid command shape.
+For longer-term defaults, prefer `~/.config/recall/config.toml`; see `docs/AGENT_ANALYSIS.md`.
 
 ## Reinstall After Moving
 
@@ -117,12 +111,14 @@ By default, sessions are written relative to the directory where you run Recall:
 
 ```text
 sessions/
-  <timestamp>-quick-capture/
+  <MM-DD-YYYY_H-MMapm>-et-quick-capture/
     audio/
       mic.m4a
 ```
 
-If you run the installed `recall` command from another directory, it will create `sessions/` in that current directory. A future config file should make the storage location explicit.
+If you run the installed `recall` command from another directory, it will create `sessions/` in that current directory. Current config supports consent and analysis defaults; explicit storage-location config is still future work.
+
+Session IDs use Eastern Time for the timestamp prefix and include `et` in the folder name so names are stable for the user's preferred meeting timezone even when the project is run from another local timezone. If agent analysis returns a useful title, Recall can rename a generic folder such as `05-26-2026_7-21pm-et-quick-capture` to a topic-based name such as `05-26-2026_7-21pm-et-rain-birthdays-and-jersey-mikes-chat`.
 
 ## Current Caveat
 

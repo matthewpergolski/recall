@@ -4,7 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use time::OffsetDateTime;
+use serde_json::Value;
+use time::{Duration, Month, OffsetDateTime, Weekday};
 
 #[derive(Debug, Clone)]
 pub struct StartOptions {
@@ -67,8 +68,13 @@ impl StartOptions {
 pub fn start_session(options: &StartOptions) -> io::Result<Session> {
     let created_at_unix = unix_timestamp();
     let slug = slugify(&options.title);
-    let id = format!("{}-{slug}", readable_local_timestamp());
-    let path = options.storage_dir.join(&id);
+    let id = format!("{}-et-{slug}", readable_eastern_timestamp());
+    let path = unique_session_path(&options.storage_dir, &id);
+    let id = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&id)
+        .to_string();
 
     fs::create_dir_all(path.join("audio"))?;
 
@@ -95,13 +101,17 @@ pub fn list_sessions(storage_dir: &Path) -> io::Result<Vec<PathBuf>> {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() && path.join("recall.json").exists() {
-            sessions.push(path);
+            let created_at = read_session_created_at_unix(&path).unwrap_or(0);
+            sessions.push((created_at, path));
         }
     }
 
-    sessions.sort();
-    sessions.reverse();
-    Ok(sessions)
+    sessions.sort_by(|(left_created, left_path), (right_created, right_path)| {
+        right_created
+            .cmp(left_created)
+            .then_with(|| right_path.cmp(left_path))
+    });
+    Ok(sessions.into_iter().map(|(_, path)| path).collect())
 }
 
 pub fn default_storage_dir() -> io::Result<PathBuf> {
@@ -117,6 +127,12 @@ fn write_session_files(session: &Session) -> io::Result<()> {
         transcript_markdown(session),
     )?;
     Ok(())
+}
+
+fn read_session_created_at_unix(session_path: &Path) -> Option<u64> {
+    let metadata = fs::read_to_string(session_path.join("recall.json")).ok()?;
+    let value = serde_json::from_str::<Value>(&metadata).ok()?;
+    value.get("created_at_unix")?.as_u64()
 }
 
 fn session_json(session: &Session) -> String {
@@ -177,17 +193,72 @@ fn unix_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
-fn readable_local_timestamp() -> String {
-    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+fn readable_eastern_timestamp() -> String {
+    let now_utc = OffsetDateTime::now_utc();
+    readable_eastern_timestamp_for(now_utc)
+}
+
+fn readable_eastern_timestamp_for(now_utc: OffsetDateTime) -> String {
+    let now = now_utc + Duration::hours(i64::from(eastern_offset_hours(now_utc)));
+    let hour = now.hour();
+    let suffix = if hour < 12 { "am" } else { "pm" };
+    let hour_12 = match hour % 12 {
+        0 => 12,
+        value => value,
+    };
     format!(
-        "{:04}{:02}{:02}-{:02}{:02}{:02}",
-        now.year(),
+        "{:02}-{:02}-{:04}_{}-{:02}{suffix}",
         u8::from(now.month()),
         now.day(),
-        now.hour(),
-        now.minute(),
-        now.second()
+        now.year(),
+        hour_12,
+        now.minute()
     )
+}
+
+fn eastern_offset_hours(utc: OffsetDateTime) -> i8 {
+    let year = utc.year();
+    let dst_start = us_eastern_dst_start_utc(year);
+    let dst_end = us_eastern_dst_end_utc(year);
+    if utc >= dst_start && utc < dst_end {
+        -4
+    } else {
+        -5
+    }
+}
+
+fn us_eastern_dst_start_utc(year: i32) -> OffsetDateTime {
+    let day = nth_weekday_of_month_day(year, Month::March, Weekday::Sunday, 2);
+    time::Date::from_calendar_date(year, Month::March, day)
+        .expect("valid DST start date")
+        .with_hms(7, 0, 0)
+        .expect("valid DST start time")
+        .assume_utc()
+}
+
+fn us_eastern_dst_end_utc(year: i32) -> OffsetDateTime {
+    let day = nth_weekday_of_month_day(year, Month::November, Weekday::Sunday, 1);
+    time::Date::from_calendar_date(year, Month::November, day)
+        .expect("valid DST end date")
+        .with_hms(6, 0, 0)
+        .expect("valid DST end time")
+        .assume_utc()
+}
+
+fn nth_weekday_of_month_day(year: i32, month: Month, weekday: Weekday, occurrence: u8) -> u8 {
+    let mut seen = 0;
+    for day in 1..=31 {
+        let Ok(date) = time::Date::from_calendar_date(year, month, day) else {
+            break;
+        };
+        if date.weekday() == weekday {
+            seen += 1;
+            if seen == occurrence {
+                return day;
+            }
+        }
+    }
+    unreachable!("requested weekday occurrence should exist")
 }
 
 fn slugify(title: &str) -> String {
@@ -212,6 +283,21 @@ fn slugify(title: &str) -> String {
     }
 }
 
+fn unique_session_path(parent: &Path, base_name: &str) -> PathBuf {
+    let mut candidate = parent.join(base_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    for index in 2.. {
+        candidate = parent.join(format!("{base_name}-{index}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("loop returns once a unique session path is found")
+}
+
 fn escape_json(value: &str) -> String {
     let mut escaped = String::new();
     for ch in value.chars() {
@@ -229,7 +315,12 @@ fn escape_json(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_json, slugify, ConsentMode};
+    use super::{
+        eastern_offset_hours, escape_json, list_sessions, readable_eastern_timestamp_for, slugify,
+        ConsentMode,
+    };
+    use std::fs;
+    use time::{Date, Month};
 
     #[test]
     fn parses_consent_modes() {
@@ -262,5 +353,55 @@ mod tests {
     fn escapes_json_strings() {
         assert_eq!(escape_json("a \"quoted\" value"), "a \\\"quoted\\\" value");
         assert_eq!(escape_json("line\nbreak"), "line\\nbreak");
+    }
+
+    #[test]
+    fn eastern_offset_obeys_us_dst_boundaries() {
+        let winter = Date::from_calendar_date(2026, Month::January, 15)
+            .unwrap()
+            .with_hms(12, 0, 0)
+            .unwrap()
+            .assume_utc();
+        let summer = Date::from_calendar_date(2026, Month::May, 26)
+            .unwrap()
+            .with_hms(12, 0, 0)
+            .unwrap()
+            .assume_utc();
+
+        assert_eq!(eastern_offset_hours(winter), -5);
+        assert_eq!(eastern_offset_hours(summer), -4);
+    }
+
+    #[test]
+    fn formats_eastern_timestamp_for_paths() {
+        let utc = Date::from_calendar_date(2026, Month::May, 26)
+            .unwrap()
+            .with_hms(23, 21, 45)
+            .unwrap()
+            .assume_utc();
+
+        assert_eq!(readable_eastern_timestamp_for(utc), "05-26-2026_7-21pm");
+    }
+
+    #[test]
+    fn lists_sessions_by_created_at_instead_of_folder_name() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "recall-session-list-test-{}",
+            super::unix_timestamp()
+        ));
+        let older = storage_dir.join("05-26-2026_9-30pm-et-older");
+        let newer = storage_dir.join("05-26-2026_11-00pm-et-newer");
+
+        fs::create_dir_all(&older).unwrap();
+        fs::create_dir_all(&newer).unwrap();
+        fs::write(older.join("recall.json"), r#"{"created_at_unix": 100}"#).unwrap();
+        fs::write(newer.join("recall.json"), r#"{"created_at_unix": 200}"#).unwrap();
+
+        let sessions = list_sessions(&storage_dir).unwrap();
+
+        assert_eq!(sessions.first(), Some(&newer));
+        assert_eq!(sessions.get(1), Some(&older));
+
+        let _ = fs::remove_dir_all(storage_dir);
     }
 }

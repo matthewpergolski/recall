@@ -27,14 +27,16 @@ Implemented:
 - Swift helper ScreenCaptureKit fallback system-audio recording
 - CoreAudio process-tap system/call audio recorder
 - TUI starts both microphone and system-audio recorders
-- readable local timestamp session IDs
-- local Whisper transcription with combined timeline
+- readable Eastern Time timestamp session IDs
+- automatic TUI transcription after session end
+- headless agent analysis command and TUI auto-analysis option
+- chunked local Whisper transcription with clean primary transcript and debug transcript artifacts
 
 Not implemented yet:
 
-- Automatic transcription when a TUI session ends
-- Transcript dedupe when mic and call tracks contain overlapping remote speech
-- Real summaries/action extraction
+- Fully tuned transcript dedupe across varied speaker-mode recordings
+- Real-agent output validation and prompt tuning
+- Traceability from generated action/decision files back to transcript timestamps
 
 ## v0: Product Shell
 
@@ -89,10 +91,16 @@ Purpose: turn recordings into useful written memory.
 
 v2 should include:
 
-- Audio chunking
+- Audio chunking: done
 - Local transcription path: initial manual command done
+- Automatic transcription after TUI session end: initial implementation done
 - Optional cloud transcription path
 - Timestamped transcript: combined timeline done
+- Clean merged transcript with overlap dedupe for mic bleed: initial implementation done
+- Summary-ready primary transcript: done
+- Debug transcript folder for raw combined/per-track text: done
+- Agent analysis command: initial implementation done
+- TUI auto-analysis after transcription: initial implementation done
 - Summary
 - Decisions
 - Action items
@@ -105,7 +113,9 @@ Success criteria:
 - Each action/decision can be traced back to transcript timestamps.
 - Output is useful for normal personal, family, school, and work meetings.
 
-Current gap: transcription is manual (`recall transcribe latest`) rather than automatic after session end, and combined timeline dedupe/speaker labeling still need work.
+Current gap: automatic transcription and agent analysis are initial; clean transcript dedupe/speaker labeling, traceable summaries/actions, and real agent output parsing still need more validation.
+
+Near-term gate: validate and tune transcript merge quality before prioritizing automatic summaries or action extraction. Speaker-mode recordings should not produce a confusing duplicate transcript when the mic also hears remote audio.
 
 ## v3: Recall Library
 
@@ -116,7 +126,7 @@ v3 should include:
 - Session search
 - Browse previous sessions
 - Tags
-- Better titles
+- Better titles: initial agent-generated title and folder rename path added
 - Export to Markdown folders, Obsidian, Apple Notes, or email
 - Config file for storage location and defaults
 

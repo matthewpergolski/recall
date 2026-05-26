@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -62,6 +62,10 @@ impl SystemRecorder {
             events.push(event);
         }
         events
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
     }
 
     pub fn stop(&mut self) -> io::Result<()> {
