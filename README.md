@@ -52,18 +52,33 @@ Optional for agent analysis:
 
 See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for Homebrew and no-Brew setup paths.
 
-## Install
+## Fresh Clone Quickstart
 
-Clone the repo, then:
+Clone the repo:
+
+```sh
+git clone https://github.com/matthewpergolski/recall.git
+cd recall
+```
+
+Install the local `recall` command:
 
 ```sh
 cargo install --path .
 ```
 
-Or run without installing:
+Or run from the repo without installing:
 
 ```sh
 cargo run
+```
+
+Check the local setup:
+
+```sh
+recall doctor
+recall sources
+recall audio-tap-probe
 ```
 
 ## Transcription Setup
@@ -80,6 +95,9 @@ Corporate/no-Brew setup:
 
 ```text
 tools/
+  ffmpeg/
+    bin/
+      ffmpeg
   whisper/
     bin/
       whisper-cli
@@ -90,9 +108,12 @@ models/
 Then:
 
 ```sh
+export PATH="$PWD/tools/ffmpeg/bin:$PATH"
 export RECALL_WHISPER_BIN="$PWD/tools/whisper/bin/whisper-cli"
 export RECALL_WHISPER_MODEL="$PWD/models/ggml-base.en.bin"
 ```
+
+The model can come from Hugging Face. The `whisper-cli` and `ffmpeg` binaries should come from source builds, release artifacts, or internal binaries approved by your organization.
 
 ## Usage
 

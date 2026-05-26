@@ -65,6 +65,9 @@ Expected project-local layout:
 
 ```text
 tools/
+  ffmpeg/
+    bin/
+      ffmpeg
   whisper/
     bin/
       whisper-cli
@@ -81,10 +84,13 @@ Where the files come from:
 Then point Recall at those files:
 
 ```sh
+export PATH="$PWD/tools/ffmpeg/bin:$PATH"
 export RECALL_WHISPER_BIN="$PWD/tools/whisper/bin/whisper-cli"
 export RECALL_WHISPER_MODEL="$PWD/models/ggml-base.en.bin"
 recall transcribe latest
 ```
+
+Recall currently finds `ffmpeg` through `PATH`. Put an approved `ffmpeg` binary on `PATH` until Recall replaces that dependency with native AVFoundation conversion.
 
 ## Manual Model Download
 

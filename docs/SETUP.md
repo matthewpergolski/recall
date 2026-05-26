@@ -1,5 +1,27 @@
 # Setup
 
+## Fresh Clone
+
+```sh
+git clone https://github.com/matthewpergolski/recall.git
+cd recall
+cargo install --path .
+```
+
+Or run without installing:
+
+```sh
+cargo run
+```
+
+Run setup checks:
+
+```sh
+recall doctor
+recall sources
+recall audio-tap-probe
+```
+
 ## Required Toolchain
 
 Recall currently needs:
