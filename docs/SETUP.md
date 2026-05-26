@@ -105,7 +105,15 @@ Optional shell shortcut:
 alias recall-ready='recall --consent provided'
 ```
 
-Use `recall-ready` when you want to launch the TUI with consent already marked. Avoid aliasing `recall` itself to always include `--consent provided`, because that breaks subcommands like `recall sources`.
+Use `recall-ready` when you want to launch the TUI with consent already marked.
+
+You can also alias `recall` itself with defaults:
+
+```sh
+alias recall='command recall --consent provided --agent grok --auto-analyze'
+```
+
+Recall parses leading defaults before subcommands, so `recall list`, `recall sources`, and `recall transcribe latest` still work. For persistent defaults without shell aliases, use `~/.config/recall/config.toml`; see `docs/AGENT_ANALYSIS.md`.
 
 ## macOS Permissions
 

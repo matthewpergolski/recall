@@ -15,24 +15,38 @@
 - Real call test writes valid non-silent `mic.m4a` and `call.m4a`.
 - Local transcription command scaffold: `recall transcribe latest`.
 - Transcription docs: `docs/TRANSCRIPTION.md`.
+- Chunked transcription for long recordings.
 - Combined transcript timeline across call and mic tracks.
-- TUI session title option and readable local timestamp session IDs.
+- Initial clean conversation timeline with conservative mic-bleed dedupe.
+- Summary-ready `transcript.md` now contains only the clean transcript.
+- Raw combined/per-track transcript material moved to `transcription-debug/`.
+- Automatic TUI transcription after ending a session, with progress/status display.
+- Headless agent analysis command: `recall analyze latest --agent <name>`.
+- Mic input device-change detection and TUI warnings for early mic recorder exits.
+- Built-in agent profiles for Grok, Cline, Codex, and Claude.
+- Optional TUI auto-analysis via `--agent <name> --auto-analyze`.
+- Config defaults via `~/.config/recall/config.toml`.
+- TUI session title option and readable Eastern Time session IDs.
+- Agent-generated session titles replace generic "Quick Capture" headings and folder slugs after analysis.
 - Memory bank and repo agent instructions are in place.
 - Portability docs and first-session testing docs are in place.
 
 ## Current Focus
 
-- Improve transcript quality by reducing duplicate mic/call overlap.
-- Use the transcript as the input for later summaries, decisions, and action items.
+- Validate and tune the clean merged transcript against more real speaker-mode calls.
+- Reduce remaining duplicate mic/call overlap when the microphone hears remote audio from speakers.
+- Use the clean transcript as the input for later summaries, decisions, and action items.
 
 ## Next
 
-- Add overlap dedupe for cases where the mic captures the remote speaker through speakers.
-- Consider a "prefer call on overlap" transcript merge mode.
+- Test the clean transcript on another speaker-mode call.
+- Tune overlap dedupe thresholds and phrase trimming based on real output.
+- Consider a stricter "prefer call on overlap" transcript merge mode.
 - Investigate macOS voice-processing / echo-cancellation input for microphone capture.
-- Add optional automatic transcription after ending a TUI session.
+- Add automatic mic recorder restart and segmented mic stitching after route changes.
 - Persist TUI markers and notes into session files.
-- Add summary, decisions, action items, questions, and follow-ups after transcription is reliable.
+- Validate real agent outputs from Grok/Cline/Claude/Codex and tune JSON extraction as needed.
+- Improve generated summary/action prompts after transcript quality is reliable.
 
 ## Transcription Plan
 

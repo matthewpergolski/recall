@@ -1,20 +1,28 @@
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::analysis::{analyze, known_agents, AnalyzeOptions, AnalyzeTarget};
 use crate::capture_sources::{detect_sources, SourceSummary};
 use crate::mic_recorder::MicRecorder;
 use crate::session::{default_storage_dir, start_session, ConsentMode, StartOptions};
 use crate::system_recorder::SystemRecorder;
+use crate::transcription::{
+    transcribe_with_progress, TrackSelection, TranscribeOptions, TranscribeTarget,
+    TranscriptionProgress, TRANSCRIPTION_CHUNK_SECONDS,
+};
 
 const TICK_RATE: Duration = Duration::from_millis(100);
+const SOURCE_REFRESH_TICKS: u64 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureState {
@@ -28,6 +36,9 @@ enum CaptureState {
 pub struct TuiOptions {
     pub consent_noted: bool,
     pub title: String,
+    pub agent: Option<String>,
+    pub auto_analyze: bool,
+    pub preset: String,
 }
 
 impl Default for TuiOptions {
@@ -35,6 +46,9 @@ impl Default for TuiOptions {
         Self {
             consent_noted: false,
             title: "Quick Capture".to_string(),
+            agent: None,
+            auto_analyze: false,
+            preset: "general".to_string(),
         }
     }
 }
@@ -63,14 +77,61 @@ struct App {
     markers: Vec<String>,
     live_notes: Vec<String>,
     sources: SourceSummary,
+    source_receiver: Option<Receiver<SourceSummary>>,
+    last_source_refresh_tick: u64,
     mic_recorder: Option<MicRecorder>,
     system_recorder: Option<SystemRecorder>,
     title: String,
     mic_level_percent: u16,
     mic_level_db: Option<f32>,
+    mic_device_label: Option<String>,
+    mic_device_id: Option<String>,
+    mic_capture_warning: Option<String>,
     call_level_percent: u16,
     call_level_db: Option<f32>,
     system_capture_failed: bool,
+    system_capture_warning: Option<String>,
+    transcription_receiver: Option<Receiver<TranscriptionUiEvent>>,
+    transcription_status: TranscriptionStatus,
+    analysis_receiver: Option<Receiver<AnalysisUiEvent>>,
+    analysis_status: AnalysisStatus,
+    agent: Option<String>,
+    auto_analyze: bool,
+    preset: String,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptionStatus {
+    label: String,
+    percent: u16,
+    transcript_path: Option<PathBuf>,
+    failed: bool,
+}
+
+#[derive(Debug, Clone)]
+enum TranscriptionUiEvent {
+    Progress(TranscriptionProgress),
+    Complete(PathBuf),
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+struct AnalysisStatus {
+    label: String,
+    percent: u16,
+    result_path: Option<PathBuf>,
+    failed: bool,
+}
+
+#[derive(Debug, Clone)]
+enum AnalysisUiEvent {
+    Complete {
+        session_path: PathBuf,
+        result_path: Option<PathBuf>,
+        written_files: usize,
+        generated_title: Option<String>,
+    },
+    Failed(String),
 }
 
 impl App {
@@ -95,14 +156,27 @@ impl App {
                 "Meters become real as capture sources start.".to_string(),
             ],
             sources: detect_sources(),
+            source_receiver: None,
+            last_source_refresh_tick: 0,
             mic_recorder: None,
             system_recorder: None,
             title: options.title,
             mic_level_percent: 0,
             mic_level_db: None,
+            mic_device_label: None,
+            mic_device_id: None,
+            mic_capture_warning: None,
             call_level_percent: 0,
             call_level_db: None,
             system_capture_failed: false,
+            system_capture_warning: None,
+            transcription_receiver: None,
+            transcription_status: TranscriptionStatus::idle(),
+            analysis_receiver: None,
+            analysis_status: AnalysisStatus::idle(),
+            agent: options.agent,
+            auto_analyze: options.auto_analyze,
+            preset: options.preset,
         })
     }
 
@@ -110,11 +184,14 @@ impl App {
         loop {
             self.process_mic_events();
             self.process_system_events();
+            self.process_source_events();
+            self.process_transcription_events();
+            self.process_analysis_events();
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(TICK_RATE)? {
                 if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press && self.handle_key(key.code)? {
+                    if key.kind == KeyEventKind::Press && self.handle_key(key)? {
                         return Ok(());
                     }
                 }
@@ -124,9 +201,26 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, code: KeyCode) -> io::Result<bool> {
-        match code {
+    fn handle_key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.transcription_receiver.is_some() || self.analysis_receiver.is_some() {
+                self.toast =
+                    "Background work is running; wait for Recall to finish before quitting."
+                        .to_string();
+                return Ok(false);
+            }
+            self.stop_recorders();
+            return Ok(true);
+        }
+
+        match key.code {
             KeyCode::Char('q') => {
+                if self.transcription_receiver.is_some() || self.analysis_receiver.is_some() {
+                    self.toast =
+                        "Background work is running; wait for Recall to finish before quitting."
+                            .to_string();
+                    return Ok(false);
+                }
                 self.stop_recorders();
                 return Ok(true);
             }
@@ -137,6 +231,8 @@ impl App {
             KeyCode::Char('m') => self.add_marker(),
             KeyCode::Char('n') => self.add_manual_note(),
             KeyCode::Char('r') => self.refresh_sources(),
+            KeyCode::Char('a') => self.toggle_auto_analyze(),
+            KeyCode::Char('A') => self.cycle_agent(),
             _ => {}
         }
 
@@ -145,6 +241,7 @@ impl App {
 
     fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.start_source_refresh_if_due();
     }
 
     fn start_capture(&mut self) -> io::Result<()> {
@@ -168,6 +265,10 @@ impl App {
         self.started_at = Some(Instant::now());
         self.accumulated = Duration::ZERO;
         self.system_capture_failed = false;
+        self.system_capture_warning = None;
+        self.mic_capture_warning = None;
+        self.mic_device_label = None;
+        self.mic_device_id = None;
 
         let mut started = Vec::new();
         let mut failures = Vec::new();
@@ -209,6 +310,7 @@ impl App {
 
         self.live_notes = vec![
             "Microphone recording writes audio/mic.m4a.".to_string(),
+            "Mic source changes are detected while recording.".to_string(),
             "System audio capture writes audio/call.m4a via CoreAudio process taps.".to_string(),
             "Press e to end and finalize active audio files.".to_string(),
         ];
@@ -261,13 +363,12 @@ impl App {
                 }
                 self.stop_recorders();
                 self.state = CaptureState::Ended;
-                self.toast =
-                    "Session ended. Audio saved under the session audio folder.".to_string();
+                self.start_transcription_job();
             }
             CaptureState::Paused => {
                 self.stop_recorders();
                 self.state = CaptureState::Ended;
-                self.toast = "Session ended from paused state.".to_string();
+                self.start_transcription_job();
             }
             _ => {
                 self.toast = "No active session to end.".to_string();
@@ -298,22 +399,126 @@ impl App {
     }
 
     fn refresh_sources(&mut self) {
-        self.sources = detect_sources();
-        self.toast = self.sources.status.clone();
+        self.start_source_refresh();
+        self.toast = "Refreshing capture sources.".to_string();
+    }
+
+    fn start_source_refresh_if_due(&mut self) {
+        if !matches!(
+            self.state,
+            CaptureState::Ready | CaptureState::Recording | CaptureState::Paused
+        ) {
+            return;
+        }
+
+        if self.source_receiver.is_some() {
+            return;
+        }
+
+        if self.tick.saturating_sub(self.last_source_refresh_tick) < SOURCE_REFRESH_TICKS {
+            return;
+        }
+
+        self.start_source_refresh();
+    }
+
+    fn start_source_refresh(&mut self) {
+        if self.source_receiver.is_some() {
+            return;
+        }
+
+        self.last_source_refresh_tick = self.tick;
+        let (sender, receiver) = mpsc::channel();
+        self.source_receiver = Some(receiver);
+        thread::spawn(move || {
+            let _ = sender.send(detect_sources());
+        });
+    }
+
+    fn process_source_events(&mut self) {
+        let mut latest = None;
+        if let Some(receiver) = &self.source_receiver {
+            while let Ok(summary) = receiver.try_recv() {
+                latest = Some(summary);
+            }
+        }
+
+        if let Some(summary) = latest {
+            self.sources = summary;
+            self.source_receiver = None;
+        }
+    }
+
+    fn toggle_auto_analyze(&mut self) {
+        self.auto_analyze = !self.auto_analyze;
+        self.toast = if self.auto_analyze {
+            format!("Auto-analyze enabled with {}.", self.agent_label())
+        } else {
+            "Auto-analyze disabled.".to_string()
+        };
+    }
+
+    fn cycle_agent(&mut self) {
+        let agents = known_agents();
+        let next = match self.agent.as_deref() {
+            None => agents.first().map(|agent| (*agent).to_string()),
+            Some(current) => {
+                let index = agents
+                    .iter()
+                    .position(|agent| *agent == current)
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+                agents.get(index).map(|agent| (*agent).to_string())
+            }
+        };
+
+        self.agent = next;
+        self.toast = format!("Agent set to {}.", self.agent_label());
     }
 
     fn process_mic_events(&mut self) {
         let Some(recorder) = self.mic_recorder.as_mut() else {
             return;
         };
+        let events = recorder.drain_events();
+        let mut clear_recorder = false;
 
-        for event in recorder.drain_events() {
+        for event in events {
             match event.event_type.as_str() {
                 "recording_started" => {
                     let path = event.path.unwrap_or_else(|| "audio/mic.m4a".to_string());
-                    self.toast = format!("Mic recording started: {path}");
+                    self.mic_device_label = event.device_name.clone();
+                    self.mic_device_id = event.device_id.clone();
+                    self.toast = match &self.mic_device_label {
+                        Some(device) => format!("Mic recording started on {device}: {path}"),
+                        None => format!("Mic recording started: {path}"),
+                    };
+                    self.live_notes.push(self.toast.clone());
+                }
+                "device_changed" => {
+                    self.mic_device_label = event.device_name.clone();
+                    self.mic_device_id = event.device_id.clone();
+                    let elapsed = event
+                        .elapsed_seconds
+                        .map(|value| format!("{value:.1}s"))
+                        .unwrap_or_else(|| self.elapsed_label());
+                    let device = self
+                        .mic_device_label
+                        .clone()
+                        .unwrap_or_else(|| "unknown input".to_string());
+                    let warning =
+                        format!("Mic input changed at {elapsed}: {device}. Watch the mic meter.");
+                    self.mic_capture_warning = Some(warning.clone());
+                    self.toast = warning.clone();
+                    self.live_notes.push(warning);
                 }
                 "level" => {
+                    if event.device_name.is_some() {
+                        self.mic_device_label = event.device_name.clone();
+                    }
+                    if event.device_id.is_some() {
+                        self.mic_device_id = event.device_id.clone();
+                    }
                     if let Some(level_db) = event.level_db {
                         self.mic_level_db = Some(level_db);
                         self.mic_level_percent = db_to_percent(level_db);
@@ -326,7 +531,7 @@ impl App {
                         .map(|value| format!(" after {value:.1}s"))
                         .unwrap_or_default();
                     self.toast = format!("Mic recording saved{elapsed}: {path}");
-                    self.mic_recorder = None;
+                    clear_recorder = true;
                     self.mic_level_percent = 0;
                     self.mic_level_db = None;
                     break;
@@ -335,12 +540,43 @@ impl App {
                     self.toast = event
                         .message
                         .unwrap_or_else(|| "Mic recorder reported an error.".to_string());
-                    self.mic_recorder = None;
+                    self.mic_capture_warning = Some(self.toast.clone());
+                    self.live_notes.push(format!("mic failed: {}", self.toast));
+                    clear_recorder = true;
                     self.mic_level_percent = 0;
                     self.mic_level_db = None;
                     break;
                 }
                 _ => {}
+            }
+        }
+
+        if clear_recorder {
+            self.mic_recorder = None;
+            return;
+        }
+
+        if let Some(recorder) = self.mic_recorder.as_mut() {
+            match recorder.try_wait() {
+                Ok(Some(status)) => {
+                    let warning = format!(
+                        "Mic recorder stopped unexpectedly at {} ({status}).",
+                        self.elapsed_label()
+                    );
+                    self.mic_capture_warning = Some(warning.clone());
+                    self.toast = warning.clone();
+                    self.live_notes.push(warning);
+                    self.mic_recorder = None;
+                    self.mic_level_percent = 0;
+                    self.mic_level_db = None;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let warning = format!("Mic recorder health check failed: {error}");
+                    self.mic_capture_warning = Some(warning.clone());
+                    self.toast = warning.clone();
+                    self.live_notes.push(warning);
+                }
             }
         }
     }
@@ -349,8 +585,10 @@ impl App {
         let Some(recorder) = self.system_recorder.as_mut() else {
             return;
         };
+        let events = recorder.drain_events();
+        let mut clear_recorder = false;
 
-        for event in recorder.drain_events() {
+        for event in events {
             match event.event_type.as_str() {
                 "recording_started" => {
                     let path = event.path.unwrap_or_else(|| "audio/call.m4a".to_string());
@@ -369,7 +607,7 @@ impl App {
                         .map(|value| format!(" after {value:.1}s"))
                         .unwrap_or_default();
                     self.toast = format!("System audio saved{elapsed}: {path}");
-                    self.system_recorder = None;
+                    clear_recorder = true;
                     self.call_level_percent = 0;
                     self.call_level_db = None;
                     break;
@@ -381,12 +619,280 @@ impl App {
                     self.live_notes
                         .push(format!("system audio failed: {}", self.toast));
                     self.system_capture_failed = true;
-                    self.system_recorder = None;
+                    self.system_capture_warning = Some(self.toast.clone());
+                    clear_recorder = true;
                     self.call_level_percent = 0;
                     self.call_level_db = None;
                     break;
                 }
                 _ => {}
+            }
+        }
+
+        if clear_recorder {
+            self.system_recorder = None;
+            return;
+        }
+
+        if let Some(recorder) = self.system_recorder.as_mut() {
+            match recorder.try_wait() {
+                Ok(Some(status)) => {
+                    let warning = format!(
+                        "System audio recorder stopped unexpectedly at {} ({status}).",
+                        self.elapsed_label()
+                    );
+                    self.system_capture_failed = true;
+                    self.system_capture_warning = Some(warning.clone());
+                    self.toast = warning.clone();
+                    self.live_notes.push(warning);
+                    self.system_recorder = None;
+                    self.call_level_percent = 0;
+                    self.call_level_db = None;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let warning = format!("System audio health check failed: {error}");
+                    self.system_capture_warning = Some(warning.clone());
+                    self.toast = warning.clone();
+                    self.live_notes.push(warning);
+                }
+            }
+        }
+    }
+
+    fn start_transcription_job(&mut self) {
+        if self.transcription_receiver.is_some() {
+            self.toast = "Transcription is already running.".to_string();
+            return;
+        }
+
+        let Some(session_path) = self.session_path.clone() else {
+            self.toast = "Session ended, but no session path was available.".to_string();
+            return;
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        self.transcription_receiver = Some(receiver);
+        self.transcription_status = TranscriptionStatus::queued();
+        self.toast = "Session ended. Audio finalized; transcription queued.".to_string();
+        self.live_notes
+            .push("Transcription queued for this session.".to_string());
+
+        thread::spawn(move || {
+            let options = TranscribeOptions {
+                target: TranscribeTarget::Session(session_path),
+                track: TrackSelection::Both,
+                storage_dir: None,
+                model_path: None,
+                whisper_bin: None,
+                chunk_seconds: TRANSCRIPTION_CHUNK_SECONDS,
+                keep_wav: false,
+            };
+
+            let progress_sender = sender.clone();
+            let result = transcribe_with_progress(&options, |progress| {
+                let _ = progress_sender.send(TranscriptionUiEvent::Progress(progress));
+            });
+
+            match result {
+                Ok(result) => {
+                    let _ = sender.send(TranscriptionUiEvent::Complete(result.transcript_path));
+                }
+                Err(error) => {
+                    let _ = sender.send(TranscriptionUiEvent::Failed(error.to_string()));
+                }
+            }
+        });
+    }
+
+    fn process_transcription_events(&mut self) {
+        let mut finished = false;
+        let mut events = Vec::new();
+
+        if let Some(receiver) = &self.transcription_receiver {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+        }
+
+        for event in events {
+            match event {
+                TranscriptionUiEvent::Progress(progress) => {
+                    self.apply_transcription_progress(progress);
+                }
+                TranscriptionUiEvent::Complete(path) => {
+                    self.transcription_status.label = "Transcript ready".to_string();
+                    self.transcription_status.percent = 100;
+                    self.transcription_status.transcript_path = Some(path.clone());
+                    self.transcription_status.failed = false;
+                    self.toast = format!("Transcript ready: {}", path.display());
+                    self.live_notes
+                        .push(format!("Transcript ready: {}", path.display()));
+                    if self.auto_analyze {
+                        self.start_analysis_job();
+                    }
+                    finished = true;
+                }
+                TranscriptionUiEvent::Failed(message) => {
+                    self.transcription_status.label = "Transcription failed".to_string();
+                    self.transcription_status.percent = 0;
+                    self.transcription_status.failed = true;
+                    self.toast = format!("Transcription failed: {message}");
+                    self.live_notes
+                        .push(format!("Transcription failed: {message}"));
+                    finished = true;
+                }
+            }
+        }
+
+        if finished {
+            self.transcription_receiver = None;
+        }
+    }
+
+    fn start_analysis_job(&mut self) {
+        if self.analysis_receiver.is_some() {
+            return;
+        }
+
+        let Some(agent) = self.agent.clone() else {
+            self.analysis_status.label = "Analysis skipped: no agent".to_string();
+            self.analysis_status.percent = 0;
+            self.toast = "Analysis skipped because no agent is selected.".to_string();
+            self.live_notes
+                .push("Analysis skipped: no agent selected.".to_string());
+            return;
+        };
+
+        let Some(session_path) = self.session_path.clone() else {
+            self.toast = "Analysis skipped because no session path was available.".to_string();
+            return;
+        };
+
+        let preset = self.preset.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.analysis_receiver = Some(receiver);
+        self.analysis_status = AnalysisStatus::running(&agent);
+        self.toast = format!("Analysis queued with {agent}.");
+        self.live_notes
+            .push(format!("Analysis queued with {agent}."));
+
+        thread::spawn(move || {
+            let options = AnalyzeOptions {
+                target: AnalyzeTarget::Session(session_path),
+                storage_dir: None,
+                agent,
+                preset,
+                dry_run: false,
+            };
+            match analyze(&options) {
+                Ok(result) => {
+                    let _ = sender.send(AnalysisUiEvent::Complete {
+                        session_path: result.session_path,
+                        result_path: result.result_path,
+                        written_files: result.written_files.len(),
+                        generated_title: result.generated_title,
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(AnalysisUiEvent::Failed(error.to_string()));
+                }
+            }
+        });
+    }
+
+    fn process_analysis_events(&mut self) {
+        let mut finished = false;
+        let mut events = Vec::new();
+
+        if let Some(receiver) = &self.analysis_receiver {
+            while let Ok(event) = receiver.try_recv() {
+                events.push(event);
+            }
+        }
+
+        for event in events {
+            match event {
+                AnalysisUiEvent::Complete {
+                    session_path,
+                    result_path,
+                    written_files,
+                    generated_title,
+                } => {
+                    self.session_path = Some(session_path.clone());
+                    if self.transcription_status.transcript_path.is_some() {
+                        self.transcription_status.transcript_path =
+                            Some(session_path.join("transcript.md"));
+                    }
+                    self.analysis_status.label = format!("Analysis ready ({written_files} files)");
+                    self.analysis_status.percent = 100;
+                    self.analysis_status.result_path = result_path.clone();
+                    self.analysis_status.failed = false;
+                    self.toast = "Analysis ready: summary/actions updated.".to_string();
+                    if let Some(path) = result_path {
+                        self.live_notes
+                            .push(format!("Analysis JSON ready: {}", path.display()));
+                    } else {
+                        self.live_notes.push("Analysis ready.".to_string());
+                    }
+                    if let Some(title) = generated_title {
+                        self.title = title.clone();
+                        self.live_notes.push(format!("Session titled: {title}"));
+                    }
+                    finished = true;
+                }
+                AnalysisUiEvent::Failed(message) => {
+                    self.analysis_status.label = "Analysis failed".to_string();
+                    self.analysis_status.percent = 0;
+                    self.analysis_status.failed = true;
+                    self.toast = format!("Analysis failed: {message}");
+                    self.live_notes.push(format!("Analysis failed: {message}"));
+                    finished = true;
+                }
+            }
+        }
+
+        if finished {
+            self.analysis_receiver = None;
+        }
+    }
+
+    fn apply_transcription_progress(&mut self, progress: TranscriptionProgress) {
+        match progress {
+            TranscriptionProgress::Started { session_path } => {
+                self.transcription_status.label = "Transcription started".to_string();
+                self.transcription_status.percent = 2;
+                self.live_notes
+                    .push(format!("Transcription started: {}", session_path.display()));
+            }
+            TranscriptionProgress::TrackStarted { track, chunks } => {
+                self.transcription_status.label =
+                    format!("Transcribing {track}: {chunks} chunk(s)");
+                self.transcription_status.percent = 5;
+            }
+            TranscriptionProgress::ChunkStarted {
+                track,
+                index,
+                total,
+            } => {
+                self.transcription_status.label =
+                    format!("Transcribing {track} chunk {index}/{total}");
+                self.transcription_status.percent =
+                    ((index as f64 / total.max(1) as f64) * 100.0).round() as u16;
+            }
+            TranscriptionProgress::TrackFinished {
+                track,
+                text_len,
+                chunks,
+            } => {
+                self.transcription_status.label =
+                    format!("Finished {track}: {text_len} chars across {chunks} chunk(s)");
+                self.transcription_status.percent = 100;
+            }
+            TranscriptionProgress::Finished { transcript_path } => {
+                self.transcription_status.label = "Finalizing transcript".to_string();
+                self.transcription_status.percent = 99;
+                self.transcription_status.transcript_path = Some(transcript_path);
             }
         }
     }
@@ -534,38 +1040,79 @@ impl App {
     fn render_sources(&self, frame: &mut Frame, area: Rect) {
         let mut items = Vec::new();
 
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("Mic: ", Style::default().fg(Color::Cyan)),
+            Span::styled(self.active_mic_source_label(), self.mic_signal_color()),
+        ])));
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("Call: ", Style::default().fg(Color::Magenta)),
+            Span::styled(self.active_call_source_label(), self.call_signal_color()),
+        ])));
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("Scan: ", Style::default().fg(Color::Gray)),
+            Span::raw(if self.source_receiver.is_some() {
+                "refreshing likely apps"
+            } else {
+                self.sources.status.as_str()
+            }),
+        ])));
+        items.push(ListItem::new(Line::raw("")));
+        items.push(ListItem::new(Line::styled(
+            "Likely call apps",
+            Style::default().fg(Color::Gray),
+        )));
+
         for app in self.sources.apps.iter().take(2) {
             items.push(ListItem::new(Line::from(vec![
-                Span::styled("App: ", Style::default().fg(Color::Magenta)),
+                Span::styled("• ", Style::default().fg(Color::Magenta)),
                 Span::raw(app),
             ])));
         }
 
-        for microphone in self.sources.microphones.iter().take(2) {
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled("Mic: ", Style::default().fg(Color::Cyan)),
-                Span::raw(microphone),
-            ])));
-        }
-
-        items.push(ListItem::new(format!("◌ {}", self.sources.status)));
         frame.render_widget(
             List::new(items).block(Block::default().title(" Sources ").borders(Borders::ALL)),
             area,
         );
     }
 
-    fn render_signal(&self, frame: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Length(2),
-                Constraint::Length(2),
-                Constraint::Min(1),
-            ])
-            .split(area);
+    fn active_mic_source_label(&self) -> String {
+        if let Some(warning) = &self.mic_capture_warning {
+            return warning.clone();
+        }
 
+        if let Some(device) = &self.mic_device_label {
+            if self.mic_recorder.is_some() {
+                return format!("active - {device}");
+            }
+            return format!("last - {device}");
+        }
+
+        if self.mic_recorder.is_some() {
+            "active - default input".to_string()
+        } else {
+            self.sources
+                .microphones
+                .first()
+                .map(|device| format!("ready - {device}"))
+                .unwrap_or_else(|| "ready - default input".to_string())
+        }
+    }
+
+    fn active_call_source_label(&self) -> String {
+        if let Some(warning) = &self.system_capture_warning {
+            return warning.clone();
+        }
+
+        if self.system_recorder.is_some() {
+            "active - system audio, all apps".to_string()
+        } else if self.system_capture_failed {
+            "unavailable".to_string()
+        } else {
+            "ready - system audio, all apps".to_string()
+        }
+    }
+
+    fn render_signal(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default().title(" Signal ").borders(Borders::ALL);
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -573,26 +1120,39 @@ impl App {
         let inner_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),
-                Constraint::Length(2),
-                Constraint::Length(2),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Min(1),
             ])
             .split(inner);
 
         frame.render_widget(
-            signal_gauge("Mic", self.mic_signal_value(), Color::Cyan),
+            signal_gauge("Mic", self.mic_signal_value(), self.mic_signal_color()),
             inner_chunks[0],
         );
         frame.render_widget(
-            signal_gauge("Call", self.call_signal_value(), Color::Magenta),
+            signal_gauge("Call", self.call_signal_value(), self.call_signal_color()),
             inner_chunks[1],
         );
         frame.render_widget(
-            signal_gauge("Noise", self.meter_value(23) / 3, Color::Green),
+            signal_gauge(
+                "Text",
+                self.transcription_status.percent,
+                self.transcription_color(),
+            ),
             inner_chunks[2],
         );
-        let _ = chunks;
+        frame.render_widget(
+            signal_gauge("Noise", self.meter_value(23) / 3, Color::Green),
+            inner_chunks[3],
+        );
+        frame.render_widget(
+            signal_gauge("AI", self.analysis_status.percent, self.analysis_color()),
+            inner_chunks[4],
+        );
     }
 
     fn mic_signal_value(&self) -> u16 {
@@ -613,6 +1173,54 @@ impl App {
         }
     }
 
+    fn mic_signal_color(&self) -> Color {
+        if self.mic_capture_warning.is_some() {
+            Color::Yellow
+        } else if self.mic_recorder.is_some() {
+            Color::Cyan
+        } else {
+            Color::Gray
+        }
+    }
+
+    fn call_signal_color(&self) -> Color {
+        if self.system_capture_failed || self.system_capture_warning.is_some() {
+            Color::Red
+        } else if self.system_recorder.is_some() {
+            Color::Magenta
+        } else {
+            Color::Gray
+        }
+    }
+
+    fn transcription_color(&self) -> Color {
+        if self.transcription_status.failed {
+            Color::Red
+        } else if self.transcription_status.percent >= 100 {
+            Color::Green
+        } else if self.transcription_receiver.is_some() {
+            Color::Yellow
+        } else {
+            Color::Gray
+        }
+    }
+
+    fn analysis_color(&self) -> Color {
+        if self.analysis_status.failed {
+            Color::Red
+        } else if self.analysis_status.percent >= 100 {
+            Color::Green
+        } else if self.analysis_receiver.is_some() {
+            Color::Yellow
+        } else {
+            Color::Gray
+        }
+    }
+
+    fn agent_label(&self) -> String {
+        self.agent.clone().unwrap_or_else(|| "none".to_string())
+    }
+
     fn render_live_recall(&self, frame: &mut Frame, area: Rect) {
         let session = self
             .session_path
@@ -624,8 +1232,64 @@ impl App {
                 Span::styled("Session: ", Style::default().fg(Color::Gray)),
                 Span::raw(session),
             ]),
+            self.capture_health_line(),
             Line::raw(""),
         ];
+
+        if self.transcription_receiver.is_some()
+            || self.transcription_status.percent > 0
+            || self.transcription_status.failed
+        {
+            lines.push(Line::from(vec![
+                Span::styled("Transcript: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!(
+                        "{} ({}%)",
+                        self.transcription_status.label, self.transcription_status.percent
+                    ),
+                    Style::default().fg(self.transcription_color()),
+                ),
+            ]));
+            if let Some(path) = &self.transcription_status.transcript_path {
+                lines.push(Line::from(vec![
+                    Span::styled("Output: ", Style::default().fg(Color::Gray)),
+                    Span::raw(path.display().to_string()),
+                ]));
+            }
+            lines.push(Line::raw(""));
+        }
+
+        lines.push(Line::from(vec![
+            Span::styled("Agent: ", Style::default().fg(Color::Gray)),
+            Span::raw(self.agent_label()),
+            Span::styled("  auto-analyze: ", Style::default().fg(Color::Gray)),
+            Span::raw(if self.auto_analyze { "on" } else { "off" }),
+            Span::styled("  preset: ", Style::default().fg(Color::Gray)),
+            Span::raw(self.preset.clone()),
+        ]));
+
+        if self.analysis_receiver.is_some()
+            || self.analysis_status.percent > 0
+            || self.analysis_status.failed
+        {
+            lines.push(Line::from(vec![
+                Span::styled("Analysis: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!(
+                        "{} ({}%)",
+                        self.analysis_status.label, self.analysis_status.percent
+                    ),
+                    Style::default().fg(self.analysis_color()),
+                ),
+            ]));
+            if let Some(path) = &self.analysis_status.result_path {
+                lines.push(Line::from(vec![
+                    Span::styled("Analysis JSON: ", Style::default().fg(Color::Gray)),
+                    Span::raw(path.display().to_string()),
+                ]));
+            }
+            lines.push(Line::raw(""));
+        }
 
         for note in self.live_notes.iter().rev().take(6).rev() {
             lines.push(Line::from(vec![
@@ -657,15 +1321,68 @@ impl App {
         );
     }
 
+    fn capture_health_line(&self) -> Line<'static> {
+        let mic_state = if let Some(warning) = &self.mic_capture_warning {
+            Span::styled(
+                format!("Mic warning: {warning}"),
+                Style::default().fg(Color::Yellow),
+            )
+        } else if self.mic_recorder.is_some() {
+            let device = self
+                .mic_device_label
+                .clone()
+                .unwrap_or_else(|| "default input".to_string());
+            Span::styled(
+                format!("Mic active: {device}"),
+                Style::default().fg(Color::Cyan),
+            )
+        } else if let Some(device) = &self.mic_device_label {
+            Span::styled(
+                format!("Mic saved: {device}"),
+                Style::default().fg(Color::Gray),
+            )
+        } else {
+            Span::styled("Mic idle", Style::default().fg(Color::Gray))
+        };
+
+        let call_state = if let Some(warning) = &self.system_capture_warning {
+            Span::styled(
+                format!("Call warning: {warning}"),
+                Style::default().fg(Color::Red),
+            )
+        } else if self.system_recorder.is_some() {
+            Span::styled("Call active", Style::default().fg(Color::Magenta))
+        } else if self.system_capture_failed {
+            Span::styled("Call unavailable", Style::default().fg(Color::Red))
+        } else {
+            Span::styled("Call idle", Style::default().fg(Color::Gray))
+        };
+
+        Line::from(vec![
+            Span::styled("Capture: ", Style::default().fg(Color::Gray)),
+            mic_state,
+            Span::raw("  |  "),
+            call_state,
+        ])
+    }
+
     fn render_decisions(&self, frame: &mut Frame, area: Rect) {
         let items = match self.state {
-            CaptureState::Ready => vec!["No session yet", "Press c after consent"],
-            CaptureState::Recording | CaptureState::Paused => vec![
-                "Microphone recording targets audio/mic.m4a",
-                "System audio targets audio/call.m4a",
-                "Transcript backend pending",
+            CaptureState::Ready => vec![
+                "No session yet".to_string(),
+                "Press c after consent".to_string(),
             ],
-            CaptureState::Ended => vec!["Audio finalized", "Transcript backend pending"],
+            CaptureState::Recording | CaptureState::Paused => vec![
+                "Microphone recording targets audio/mic.m4a".to_string(),
+                "System audio targets audio/call.m4a".to_string(),
+                "Transcription starts after session end".to_string(),
+                format!("Analysis agent: {}", self.agent_label()),
+            ],
+            CaptureState::Ended => vec![
+                "Audio finalized".to_string(),
+                self.transcription_status.label.clone(),
+                self.analysis_status.label.clone(),
+            ],
         };
 
         frame.render_widget(
@@ -676,11 +1393,14 @@ impl App {
     }
 
     fn render_actions(&self, frame: &mut Frame, area: Rect) {
-        let items = vec![
-            "Verify CoreAudio system audio on a live call",
-            "Persist markers/notes into session files",
-            "Add transcript pipeline after audio capture",
+        let mut items = vec![
+            "Review Clean Conversation for remaining mic bleed".to_string(),
+            "Persist markers/notes into session files".to_string(),
+            "Review generated summary/actions before relying on them".to_string(),
         ];
+        if let Some(path) = &self.transcription_status.transcript_path {
+            items.insert(0, format!("Transcript: {}", path.display()));
+        }
         frame.render_widget(
             List::new(items.into_iter().map(ListItem::new).collect::<Vec<_>>()).block(
                 Block::default()
@@ -711,9 +1431,18 @@ impl App {
             Span::raw(" note  "),
             Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::raw(" refresh  "),
+            Span::styled(" a ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::raw(" auto-ai  "),
+            Span::styled(" A ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::raw(" agent  "),
             Span::styled(" e ", Style::default().fg(Color::Black).bg(Color::Red)),
             Span::raw(" end  "),
             Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
+            Span::raw(" quit  "),
+            Span::styled(
+                " Ctrl+C ",
+                Style::default().fg(Color::Black).bg(Color::Gray),
+            ),
             Span::raw(" quit"),
         ]);
         let text = vec![Line::raw(&self.toast), help];
@@ -721,6 +1450,46 @@ impl App {
             Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
             area,
         );
+    }
+}
+
+impl TranscriptionStatus {
+    fn idle() -> Self {
+        Self {
+            label: "Transcript idle".to_string(),
+            percent: 0,
+            transcript_path: None,
+            failed: false,
+        }
+    }
+
+    fn queued() -> Self {
+        Self {
+            label: "Transcription queued".to_string(),
+            percent: 1,
+            transcript_path: None,
+            failed: false,
+        }
+    }
+}
+
+impl AnalysisStatus {
+    fn idle() -> Self {
+        Self {
+            label: "Analysis idle".to_string(),
+            percent: 0,
+            result_path: None,
+            failed: false,
+        }
+    }
+
+    fn running(agent: &str) -> Self {
+        Self {
+            label: format!("Analyzing with {agent}"),
+            percent: 10,
+            result_path: None,
+            failed: false,
+        }
     }
 }
 

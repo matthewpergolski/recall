@@ -41,6 +41,34 @@ struct CaptureEvent: Codable {
     let elapsedSeconds: Double?
     let levelDb: Float?
     let message: String?
+    let deviceName: String?
+    let deviceID: String?
+
+    init(
+        type: String,
+        source: String?,
+        path: String?,
+        elapsedSeconds: Double?,
+        levelDb: Float?,
+        message: String?,
+        deviceName: String? = nil,
+        deviceID: String? = nil
+    ) {
+        self.type = type
+        self.source = source
+        self.path = path
+        self.elapsedSeconds = elapsedSeconds
+        self.levelDb = levelDb
+        self.message = message
+        self.deviceName = deviceName
+        self.deviceID = deviceID
+    }
+}
+
+struct DefaultInputDevice: Equatable {
+    let id: AudioDeviceID
+    let name: String
+    let uid: String
 }
 
 struct RecordMicOptions {
@@ -322,13 +350,17 @@ struct RecallCapture {
             throw CaptureError.recorderCreationFailed
         }
 
+        var currentInputDevice = defaultInputDevice()
+
         try RecallCapture.printJSONLine(CaptureEvent(
             type: "recording_started",
             source: "mic",
             path: outputURL.path,
             elapsedSeconds: 0,
             levelDb: nil,
-            message: nil
+            message: currentInputDevice.map { "Mic input: \($0.name)" },
+            deviceName: currentInputDevice?.name,
+            deviceID: currentInputDevice?.uid
         ))
 
         let startedAt = Date()
@@ -336,6 +368,21 @@ struct RecallCapture {
             && !shouldStopRecording(stopFile: options.stopFile)
         {
             Thread.sleep(forTimeInterval: 0.25)
+            let latestInputDevice = defaultInputDevice()
+            if latestInputDevice != currentInputDevice {
+                currentInputDevice = latestInputDevice
+                try printJSONLine(CaptureEvent(
+                    type: "device_changed",
+                    source: "mic",
+                    path: nil,
+                    elapsedSeconds: Date().timeIntervalSince(startedAt),
+                    levelDb: nil,
+                    message: latestInputDevice.map { "Mic input changed to \($0.name)" }
+                        ?? "Mic input changed, but current default input could not be resolved.",
+                    deviceName: latestInputDevice?.name,
+                    deviceID: latestInputDevice?.uid
+                ))
+            }
             recorder.updateMeters()
             try printJSONLine(CaptureEvent(
                 type: "level",
@@ -343,7 +390,9 @@ struct RecallCapture {
                 path: nil,
                 elapsedSeconds: Date().timeIntervalSince(startedAt),
                 levelDb: recorder.averagePower(forChannel: 0),
-                message: nil
+                message: nil,
+                deviceName: currentInputDevice?.name,
+                deviceID: currentInputDevice?.uid
             ))
         }
 
@@ -355,8 +404,72 @@ struct RecallCapture {
             path: outputURL.path,
             elapsedSeconds: Date().timeIntervalSince(startedAt),
             levelDb: nil,
-            message: nil
+            message: currentInputDevice.map { "Mic input at stop: \($0.name)" },
+            deviceName: currentInputDevice?.name,
+            deviceID: currentInputDevice?.uid
         ))
+    }
+
+    private static func defaultInputDevice() -> DefaultInputDevice? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        guard status == noErr, deviceID != AudioDeviceID(kAudioObjectUnknown) else {
+            return nil
+        }
+
+        let name = audioObjectStringProperty(
+            objectID: deviceID,
+            selector: kAudioObjectPropertyName,
+            scope: kAudioObjectPropertyScopeGlobal
+        ) ?? "Unknown input"
+        let uid = audioObjectStringProperty(
+            objectID: deviceID,
+            selector: kAudioDevicePropertyDeviceUID,
+            scope: kAudioObjectPropertyScopeGlobal
+        ) ?? "\(deviceID)"
+
+        return DefaultInputDevice(id: deviceID, name: name, uid: uid)
+    }
+
+    private static func audioObjectStringProperty(
+        objectID: AudioObjectID,
+        selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope
+    ) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: CFString?
+        var size = UInt32(MemoryLayout<CFString?>.size)
+        let status = withUnsafeMutablePointer(to: &value) { pointer in
+            AudioObjectGetPropertyData(
+                objectID,
+                &address,
+                0,
+                nil,
+                &size,
+                pointer
+            )
+        }
+        guard status == noErr else {
+            return nil
+        }
+        return value as String?
     }
 
     private static func recordSystem(_ options: RecordSystemOptions) async throws {

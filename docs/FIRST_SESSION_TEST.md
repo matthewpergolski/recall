@@ -54,6 +54,23 @@ The important part is that the test includes both:
 
 If you only talk into your own microphone and no app plays audio back, `call.m4a` may be silent. That does not prove the call capture is broken; it means there was no system/call audio to capture.
 
+## AirPods / Speaker Switch Test
+
+To test route-change behavior:
+
+1. Start a short call on the MacBook speaker and built-in microphone.
+2. Start Recall and begin recording.
+3. Speak a clear phrase.
+4. Switch the call to AirPods.
+5. Speak another clear phrase.
+6. Switch back to MacBook speaker/mic.
+7. Speak a final clear phrase.
+8. End Recall.
+
+Watch the TUI capture-health line. Recall should show the active/default mic and warn if the mic input changes or the mic recorder stops early.
+
+Current expected behavior: Recall detects and reports the input change, but seamless mic segment restarting/stitching is still future work. If the mic file is shorter than the call file, treat that as a failed route-switch test.
+
 ## Alternative Real Call Test
 
 If Teams test call is not available, use a short call with a second device or another person.
@@ -133,16 +150,26 @@ The session passes if:
 
 - `mic.m4a` exists and plays your local microphone.
 - `call.m4a` exists and plays the Teams/Zoom/browser call audio.
+- `mic.m4a` duration is close to the active call duration when you did not intentionally mute or switch away from the mic.
 - Recall does not need VS Code's broad Screen & System Audio Recording permission when launched from a dedicated terminal.
 
 ## Current Gaps
 
-Recall can now run a separate local transcription command after the session:
+Recall transcribes automatically after ending a TUI session. You can also rerun transcription manually:
 
 ```sh
 recall transcribe latest
 ```
 
-This requires `ffmpeg`, a local `whisper.cpp` CLI, and a local ggml Whisper model. `summary.md` and `actions.md` remain placeholders until transcript-based analysis is added.
+This requires `ffmpeg`, a local `whisper.cpp` CLI, and a local ggml Whisper model.
+
+If agent analysis is configured, Recall can also generate summary/action files after transcription:
+
+```sh
+recall analyze latest --agent grok
+recall analyze latest --agent grok --dry-run
+```
+
+See `docs/AGENT_ANALYSIS.md` for alias and config setup.
 
 Source: [Microsoft Teams test call documentation](https://support.microsoft.com/en-gb/office/manage-your-call-settings-in-microsoft-teams-456cb611-3477-496f-b31a-6ab752a7595f).

@@ -77,6 +77,17 @@ sessions/
     transcript.md
     summary.md
     actions.md
+    decisions.md
+    questions.md
+    followups.md
+    transcription-debug/
+      combined-timeline.md
+      raw-tracks.md
+      full-debug-transcript.md
+    analysis-debug/
+      prompt.md
+      agent-raw-output.json or agent-raw-output.jsonl
+      agent-result.json
 ```
 
 ## Metadata Sketch
