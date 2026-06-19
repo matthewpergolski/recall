@@ -24,11 +24,12 @@ Recall is usable as a macOS prototype:
 - clean timestamped transcript for summary input
 - debug transcript artifacts for raw timelines and per-track text
 - optional headless agent analysis for summaries/actions
+- typed TUI notes and timestamped markers written into session files
+- configurable storage and transcription binary/model paths
 
 Still in progress:
 
 - transcript dedupe tuning when the mic also hears speaker audio
-- persisted TUI markers/manual notes
 - real-agent output validation and prompt tuning
 - packaging/distribution
 
@@ -108,7 +109,7 @@ models/
 Then:
 
 ```sh
-export PATH="$PWD/tools/ffmpeg/bin:$PATH"
+export RECALL_FFMPEG_BIN="$PWD/tools/ffmpeg/bin/ffmpeg"
 export RECALL_WHISPER_BIN="$PWD/tools/whisper/bin/whisper-cli"
 export RECALL_WHISPER_MODEL="$PWD/models/ggml-base.en.bin"
 ```
@@ -135,7 +136,7 @@ Start with a session title:
 recall --title "Project sync"
 ```
 
-When you press `e` in the TUI, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready.
+When you press Space or Enter to end a recording, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready. You can start another recording while a previous session continues transcribing or analyzing in the background.
 
 You can also transcribe manually:
 
@@ -175,7 +176,7 @@ recall analyze latest --agent grok --dry-run
 Enable automatic analysis after transcription:
 
 ```sh
-recall --agent grok --auto-analyze
+recall --agent grok
 ```
 
 Outputs:
@@ -203,11 +204,18 @@ Optional config file:
 ```toml
 # ~/.config/recall/config.toml
 consent_default = "provided"
+storage_dir = "~/Documents/Recall/sessions"
 
 [analysis]
 default_agent = "grok"
 auto_analyze = true
 preset = "general"
+
+[transcription]
+ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
+whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
+model_path = "~/Documents/Recall/models/ggml-base.en.bin"
+chunk_seconds = 600
 ```
 
 For long recordings, Recall chunks each audio track before transcription. The default chunk size is 10 minutes:
@@ -225,15 +233,14 @@ open "$(recall show latest)"
 ## TUI Keys
 
 - `c`: toggle consent noted
-- `Enter`: start recording
-- `e`: end and finalize recording
-- transcript progress starts after `e`
+- `Space` or `Enter`: start recording when idle; end and finalize when recording
+- transcript progress starts after recording ends
 - `r`: refresh detected sources
-- `m`: add marker placeholder
-- `n`: add manual note placeholder
+- `m`: add timestamped marker to `markers.md`
+- `n`: type a timestamped note, then `Enter` saves it to `notes.md`
 - `q` or `Ctrl+C`: quit
 
-Pause/resume is not wired for active real recording yet.
+Pause/resume is intentionally disabled for real recording until segmented audio capture is implemented.
 
 ## Session Files
 
@@ -249,6 +256,8 @@ sessions/
     decisions.md
     questions.md
     followups.md
+    markers.md
+    notes.md
     audio/
       mic.m4a
       call.m4a

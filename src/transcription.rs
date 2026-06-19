@@ -17,6 +17,7 @@ pub struct TranscribeOptions {
     pub target: TranscribeTarget,
     pub track: TrackSelection,
     pub storage_dir: Option<PathBuf>,
+    pub ffmpeg_bin: Option<PathBuf>,
     pub model_path: Option<PathBuf>,
     pub whisper_bin: Option<PathBuf>,
     pub chunk_seconds: u64,
@@ -156,7 +157,7 @@ where
     F: FnMut(TranscriptionProgress),
 {
     let session_path = resolve_session_path(options)?;
-    let ffmpeg = find_required_binary("ffmpeg", "Install ffmpeg with `brew install ffmpeg`.")?;
+    let ffmpeg = resolve_ffmpeg_binary(options)?;
     let whisper = resolve_whisper_binary(options)?;
     let model = resolve_model_path(options)?;
     let title = read_session_title(&session_path)?;
@@ -284,6 +285,30 @@ fn resolve_session_path(options: &TranscribeOptions) -> io::Result<PathBuf> {
             })
         }
     }
+}
+
+fn resolve_ffmpeg_binary(options: &TranscribeOptions) -> io::Result<PathBuf> {
+    if let Some(path) = &options.ffmpeg_bin {
+        return Ok(path.clone());
+    }
+
+    if let Some(path) = env::var_os("RECALL_FFMPEG_BIN").map(PathBuf::from) {
+        return Ok(path);
+    }
+
+    let candidates = [
+        PathBuf::from("tools/ffmpeg/bin/ffmpeg"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/ffmpeg/bin/ffmpeg"),
+    ];
+
+    if let Some(path) = candidates.into_iter().find(|path| path.exists()) {
+        return Ok(path);
+    }
+
+    find_required_binary(
+        "ffmpeg",
+        "Install ffmpeg, place it at tools/ffmpeg/bin/ffmpeg, or set RECALL_FFMPEG_BIN=/path/to/ffmpeg.",
+    )
 }
 
 fn resolve_whisper_binary(options: &TranscribeOptions) -> io::Result<PathBuf> {

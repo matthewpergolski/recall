@@ -8,7 +8,7 @@ mod transcription;
 mod tui;
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use analysis::{analyze, known_agents, AnalyzeOptions, AnalyzeTarget};
 use capture_sources::{detect_sources, probe_audio_tap};
@@ -37,12 +37,12 @@ fn main() {
     let command = args.next();
 
     match command.as_deref() {
-        Some("start") => run_start(args.collect()),
-        Some("list") => run_list(args.collect()),
-        Some("show") => run_show(args.collect()),
+        Some("start") => run_start(args.collect(), &tui_defaults),
+        Some("list") => run_list(args.collect(), &tui_defaults),
+        Some("show") => run_show(args.collect(), &tui_defaults),
         Some("sources") => run_sources(),
         Some("audio-tap-probe") => run_audio_tap_probe(),
-        Some("transcribe") => run_transcribe(args.collect()),
+        Some("transcribe") => run_transcribe(args.collect(), &tui_defaults),
         Some("analyze") => run_analyze(args.collect(), &tui_defaults),
         Some("agents") => run_agents(args.collect()),
         Some("doctor") => print_doctor(),
@@ -89,6 +89,7 @@ TRANSCRIBE OPTIONS:
     recall transcribe latest [options]
     recall transcribe <session-path> [options]
     --track <both|call|mic>               Audio track selection, default: both
+    --ffmpeg <path>                       ffmpeg binary path
     --model <path>                        Whisper ggml model path
     --whisper <path>                      whisper-cli binary path
     --storage <path>                      Storage directory for latest lookup
@@ -104,6 +105,11 @@ ANALYZE OPTIONS:
     --dry-run                             Write analysis prompt without running agent
 
 TUI ANALYSIS OPTIONS:
+    --storage <path>                      Session storage directory
+    --ffmpeg <path>                       ffmpeg binary path for auto-transcription
+    --model <path>                        Whisper model path for auto-transcription
+    --whisper <path>                      whisper-cli path for auto-transcription
+    --chunk-seconds <seconds>             Auto-transcription chunk size
     --agent <name>                        Agent to use after transcription
     --auto-analyze                        Run analysis after transcription
     --no-auto-analyze                     Disable analysis after transcription
@@ -188,8 +194,8 @@ fn run_agents(args: Vec<String>) {
     }
 }
 
-fn run_start(args: Vec<String>) {
-    let options = match parse_start_options(args) {
+fn run_start(args: Vec<String>, tui_defaults: &TuiOptions) {
+    let options = match parse_start_options(args, tui_defaults) {
         Ok(options) => options,
         Err(message) => {
             eprintln!("{message}");
@@ -242,8 +248,8 @@ fn run_sources() {
     }
 }
 
-fn run_transcribe(args: Vec<String>) {
-    let options = match parse_transcribe_options(args) {
+fn run_transcribe(args: Vec<String>, tui_defaults: &TuiOptions) {
+    let options = match parse_transcribe_options(args, tui_defaults) {
         Ok(options) => options,
         Err(message) => {
             eprintln!("{message}");
@@ -284,8 +290,8 @@ fn run_transcribe(args: Vec<String>) {
     }
 }
 
-fn run_list(args: Vec<String>) {
-    let storage_dir = match parse_storage_arg(args) {
+fn run_list(args: Vec<String>, tui_defaults: &TuiOptions) {
+    let storage_dir = match parse_storage_arg(args, tui_defaults.storage_dir.clone()) {
         Ok(Some(path)) => path,
         Ok(None) => match default_storage_dir() {
             Ok(path) => path,
@@ -317,29 +323,50 @@ fn run_list(args: Vec<String>) {
     }
 }
 
-fn run_show(args: Vec<String>) {
-    let storage_dir = match default_storage_dir() {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("Failed to resolve storage directory: {error}");
-            std::process::exit(1);
-        }
-    };
-
-    match args.as_slice() {
-        [which] if which == "latest" => match list_sessions(&storage_dir) {
-            Ok(sessions) if sessions.is_empty() => {
-                println!("No Recall sessions found in {}", storage_dir.display());
+fn run_show(args: Vec<String>, tui_defaults: &TuiOptions) {
+    let mut storage_dir = tui_defaults.storage_dir.clone();
+    let mut latest = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "latest" => latest = true,
+            "--storage" => {
+                storage_dir = Some(PathBuf::from(iter.next().unwrap_or_else(|| {
+                    eprintln!("Usage: recall show [--storage <path>] latest");
+                    std::process::exit(2);
+                })));
             }
-            Ok(sessions) => println!("{}", sessions[0].display()),
+            _ => {
+                eprintln!("Usage: recall show [--storage <path>] latest");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let storage_dir = match storage_dir {
+        Some(path) => path,
+        None => match default_storage_dir() {
+            Ok(path) => path,
             Err(error) => {
-                eprintln!("Failed to show latest session: {error}");
+                eprintln!("Failed to resolve storage directory: {error}");
                 std::process::exit(1);
             }
         },
-        _ => {
-            eprintln!("Usage: recall show latest");
-            std::process::exit(2);
+    };
+
+    if !latest {
+        eprintln!("Usage: recall show [--storage <path>] latest");
+        std::process::exit(2);
+    }
+
+    match list_sessions(&storage_dir) {
+        Ok(sessions) if sessions.is_empty() => {
+            println!("No Recall sessions found in {}", storage_dir.display());
+        }
+        Ok(sessions) => println!("{}", sessions[0].display()),
+        Err(error) => {
+            eprintln!("Failed to show latest session: {error}");
+            std::process::exit(1);
         }
     }
 }
@@ -367,6 +394,41 @@ fn parse_leading_tui_defaults(args: Vec<String>) -> Result<(TuiOptions, Vec<Stri
                 options.title = iter
                     .next()
                     .ok_or_else(|| "--title requires a value".to_string())?;
+            }
+            "--storage" => {
+                options.storage_dir = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--storage requires a value".to_string())?,
+                ));
+            }
+            "--ffmpeg" => {
+                options.ffmpeg_bin = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--ffmpeg requires a value".to_string())?,
+                ));
+            }
+            "--whisper" => {
+                options.whisper_bin = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--whisper requires a value".to_string())?,
+                ));
+            }
+            "--model" => {
+                options.model_path = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--model requires a value".to_string())?,
+                ));
+            }
+            "--chunk-seconds" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--chunk-seconds requires a value".to_string())?;
+                options.chunk_seconds = value
+                    .parse::<u64>()
+                    .map_err(|_| "--chunk-seconds must be a positive integer".to_string())?;
+                if options.chunk_seconds == 0 {
+                    return Err("--chunk-seconds must be greater than zero".to_string());
+                }
             }
             "--agent" => {
                 options.agent = Some(
@@ -401,6 +463,13 @@ fn tui_options_from_config(config: &RecallConfig) -> TuiOptions {
     if let Some(consent) = config.consent_default {
         options.consent_noted = !matches!(consent, ConsentMode::NotYet);
     }
+    options.storage_dir = config.storage_dir.clone();
+    options.ffmpeg_bin = config.transcription.ffmpeg_bin.clone();
+    options.whisper_bin = config.transcription.whisper_bin.clone();
+    options.model_path = config.transcription.model_path.clone();
+    if let Some(chunk_seconds) = config.transcription.chunk_seconds {
+        options.chunk_seconds = chunk_seconds;
+    }
     if let Some(agent) = &config.analysis.default_agent {
         options.agent = Some(agent.clone());
     }
@@ -413,9 +482,16 @@ fn tui_options_from_config(config: &RecallConfig) -> TuiOptions {
     options
 }
 
-fn parse_start_options(args: Vec<String>) -> Result<StartOptions, String> {
+fn parse_start_options(
+    args: Vec<String>,
+    tui_defaults: &TuiOptions,
+) -> Result<StartOptions, String> {
     let mut options = StartOptions::default_for_cwd()
         .map_err(|error| format!("Failed to resolve current directory: {error}"))?;
+    options.title = tui_defaults.title.clone();
+    if let Some(storage_dir) = &tui_defaults.storage_dir {
+        options.storage_dir = storage_dir.clone();
+    }
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
@@ -446,13 +522,17 @@ fn parse_start_options(args: Vec<String>) -> Result<StartOptions, String> {
     Ok(options)
 }
 
-fn parse_transcribe_options(args: Vec<String>) -> Result<TranscribeOptions, String> {
+fn parse_transcribe_options(
+    args: Vec<String>,
+    tui_defaults: &TuiOptions,
+) -> Result<TranscribeOptions, String> {
     let mut target: Option<TranscribeTarget> = None;
     let mut track = TrackSelection::Both;
-    let mut storage_dir = None;
-    let mut model_path = None;
-    let mut whisper_bin = None;
-    let mut chunk_seconds = transcription::TRANSCRIPTION_CHUNK_SECONDS;
+    let mut storage_dir = tui_defaults.storage_dir.clone();
+    let mut ffmpeg_bin = tui_defaults.ffmpeg_bin.clone();
+    let mut model_path = tui_defaults.model_path.clone();
+    let mut whisper_bin = tui_defaults.whisper_bin.clone();
+    let mut chunk_seconds = tui_defaults.chunk_seconds;
     let mut keep_wav = false;
     let mut iter = args.into_iter();
 
@@ -465,6 +545,12 @@ fn parse_transcribe_options(args: Vec<String>) -> Result<TranscribeOptions, Stri
                     .ok_or_else(|| "--track requires a value".to_string())?;
                 track = TrackSelection::parse(&value)
                     .ok_or_else(|| "Unknown track. Use both, call, or mic.".to_string())?;
+            }
+            "--ffmpeg" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--ffmpeg requires a value".to_string())?;
+                ffmpeg_bin = Some(PathBuf::from(value));
             }
             "--storage" => {
                 let value = iter
@@ -512,6 +598,7 @@ fn parse_transcribe_options(args: Vec<String>) -> Result<TranscribeOptions, Stri
         target: target.unwrap_or(TranscribeTarget::Latest),
         track,
         storage_dir,
+        ffmpeg_bin,
         model_path,
         whisper_bin,
         chunk_seconds,
@@ -524,7 +611,7 @@ fn parse_analyze_options(
     tui_defaults: &TuiOptions,
 ) -> Result<AnalyzeOptions, String> {
     let mut target: Option<AnalyzeTarget> = None;
-    let mut storage_dir = None;
+    let mut storage_dir = tui_defaults.storage_dir.clone();
     let mut agent = tui_defaults.agent.clone();
     let mut preset = tui_defaults.preset.clone();
     let mut dry_run = false;
@@ -583,9 +670,12 @@ fn parse_analyze_options(
     })
 }
 
-fn parse_storage_arg(args: Vec<String>) -> Result<Option<PathBuf>, String> {
+fn parse_storage_arg(
+    args: Vec<String>,
+    configured_storage_dir: Option<PathBuf>,
+) -> Result<Option<PathBuf>, String> {
     match args.as_slice() {
-        [] => Ok(None),
+        [] => Ok(configured_storage_dir),
         [flag, path] if flag == "--storage" => Ok(Some(PathBuf::from(path))),
         _ => Err("Usage: recall list [--storage <path>]".to_string()),
     }
@@ -596,29 +686,84 @@ fn print_spec_hint() {
 }
 
 fn print_doctor() {
+    let config = RecallConfig::load();
+    let storage_dir = config
+        .storage_dir
+        .clone()
+        .or_else(|| default_storage_dir().ok());
+    let model_path = env::var_os("RECALL_WHISPER_MODEL")
+        .map(PathBuf::from)
+        .or(config.transcription.model_path.clone())
+        .unwrap_or_else(|| PathBuf::from("models/ggml-base.en.bin"));
+    let whisper_bin = env::var_os("RECALL_WHISPER_BIN")
+        .map(PathBuf::from)
+        .or(config.transcription.whisper_bin.clone());
+    let ffmpeg_bin = env::var_os("RECALL_FFMPEG_BIN")
+        .map(PathBuf::from)
+        .or(config.transcription.ffmpeg_bin.clone());
+
     println!("Recall doctor");
     println!();
-    println!("Required now:");
-    println!("  - Rust + Cargo: run `rustc --version` and `cargo --version`");
-    println!("  - Swift toolchain: run `swift --version`");
-    println!("  - ffmpeg for transcription audio conversion: run `ffmpeg -version`");
+    println!("Core tools:");
+    print_binary_check("rustc", "Rust compiler");
+    print_binary_check("cargo", "Cargo package manager");
+    print_binary_check("swift", "Swift toolchain");
     println!();
-    println!("Recommended before transcription:");
-    println!("  - whisper.cpp CLI on PATH as `whisper-cli`");
-    println!("  - Whisper ggml model at `models/ggml-base.en.bin` or RECALL_WHISPER_MODEL");
+    println!("Capture:");
+    print_binary_check("swift", "Swift helper runner");
+    println!("  - CoreAudio process tap probe: run `recall audio-tap-probe`");
     println!();
-    println!("Recommended before capture work:");
-    println!("  - Update Rust with `rustup update stable`");
-    println!("  - Confirm Xcode command line tools are installed");
-    println!("  - Grant Microphone permission when prompted");
+    println!("Transcription:");
+    if let Some(path) = ffmpeg_bin {
+        print_path_check(&path, "ffmpeg");
+    } else {
+        print_binary_check("ffmpeg", "audio conversion/chunking");
+    }
+    if let Some(path) = whisper_bin {
+        print_path_check(&path, "whisper-cli");
+    } else {
+        print_binary_check("whisper-cli", "whisper.cpp CLI");
+    }
+    print_path_check(&model_path, "Whisper model");
+    println!();
+    println!("Storage:");
+    if let Some(path) = storage_dir {
+        println!("  - sessions: {}", path.display());
+    } else {
+        println!("  - sessions: unresolved");
+    }
     if let Some(path) = config_path() {
-        println!("  - Optional config path: {}", path.display());
+        println!("  - config: {}", path.display());
+    }
+    println!();
+    println!("Agents:");
+    for agent in known_agents() {
+        print_binary_check(agent, agent);
     }
 }
 
 fn binary_exists(name: &str) -> bool {
-    let Some(path) = env::var_os("PATH") else {
-        return false;
-    };
-    env::split_paths(&path).any(|dir| dir.join(name).exists())
+    binary_path(name).is_some()
+}
+
+fn binary_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|path| path.exists())
+}
+
+fn print_binary_check(name: &str, label: &str) {
+    match binary_path(name) {
+        Some(path) => println!("  ok   {label}: {}", path.display()),
+        None => println!("  miss {label}: `{name}` not found on PATH"),
+    }
+}
+
+fn print_path_check(path: &Path, label: &str) {
+    if path.exists() {
+        println!("  ok   {label}: {}", path.display());
+    } else {
+        println!("  miss {label}: {} not found", path.display());
+    }
 }

@@ -69,7 +69,7 @@ Recall should feel polished and calm, with a Claude Code-style terminal interfac
 
 ```text
 sessions/
-  20260508-234814-design-sync/
+  05-26-2026_7-21pm-et-design-sync/
     recall.json
     audio/
       mic.m4a
@@ -80,6 +80,8 @@ sessions/
     decisions.md
     questions.md
     followups.md
+    markers.md
+    notes.md
     transcription-debug/
       combined-timeline.md
       raw-tracks.md
@@ -94,7 +96,7 @@ sessions/
 
 ```json
 {
-  "id": "20260508-234814-design-sync",
+  "id": "05-26-2026_7-21pm-et-design-sync",
   "title": "Design sync",
   "created_at_unix": 1778281380,
   "status": "initialized",
@@ -105,3 +107,5 @@ sessions/
   }
 }
 ```
+
+`recall show latest`, `recall transcribe latest`, and `recall analyze latest` sort sessions by `created_at_unix` rather than folder name.

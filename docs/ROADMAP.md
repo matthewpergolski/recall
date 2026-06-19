@@ -46,12 +46,12 @@ v0 should include:
 
 - Flashy terminal dashboard: done
 - Keyboard controls: done
-- Session lifecycle: ready, recording, paused, ended: done
+- Session lifecycle: ready, recording, ended: done
 - Consent state shown in the UI: done
 - Source picker mock: done
 - Source detection: done
 - Local session folder creation: done
-- Session metadata and placeholder notes: done
+- Session metadata, markers, and typed notes: done
 
 Success criteria:
 

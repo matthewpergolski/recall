@@ -116,7 +116,13 @@ sessions/
       mic.m4a
 ```
 
-If you run the installed `recall` command from another directory, it will create `sessions/` in that current directory. Current config supports consent and analysis defaults; explicit storage-location config is still future work.
+If you run the installed `recall` command from another directory, it will create `sessions/` in that current directory unless `storage_dir` is set in `~/.config/recall/config.toml`.
+
+Example stable storage config:
+
+```toml
+storage_dir = "~/Documents/Recall/sessions"
+```
 
 Session IDs use Eastern Time for the timestamp prefix and include `et` in the folder name so names are stable for the user's preferred meeting timezone even when the project is run from another local timezone. If agent analysis returns a useful title, Recall can rename a generic folder such as `05-26-2026_7-21pm-et-quick-capture` to a topic-based name such as `05-26-2026_7-21pm-et-rain-birthdays-and-jersey-mikes-chat`.
 

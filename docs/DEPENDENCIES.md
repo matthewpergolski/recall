@@ -84,13 +84,13 @@ Where the files come from:
 Then point Recall at those files:
 
 ```sh
-export PATH="$PWD/tools/ffmpeg/bin:$PATH"
+export RECALL_FFMPEG_BIN="$PWD/tools/ffmpeg/bin/ffmpeg"
 export RECALL_WHISPER_BIN="$PWD/tools/whisper/bin/whisper-cli"
 export RECALL_WHISPER_MODEL="$PWD/models/ggml-base.en.bin"
 recall transcribe latest
 ```
 
-Recall currently finds `ffmpeg` through `PATH`. Put an approved `ffmpeg` binary on `PATH` until Recall replaces that dependency with native AVFoundation conversion.
+Recall also auto-detects `tools/ffmpeg/bin/ffmpeg` when present. `RECALL_FFMPEG_BIN` is useful when the binary lives somewhere else or you do not want to modify `PATH`.
 
 ## Manual Model Download
 
@@ -151,11 +151,18 @@ Or with local config:
 ```toml
 # ~/.config/recall/config.toml
 consent_default = "provided"
+storage_dir = "~/Documents/Recall/sessions"
 
 [analysis]
 default_agent = "grok"
 auto_analyze = true
 preset = "general"
+
+[transcription]
+ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
+whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
+model_path = "~/Documents/Recall/models/ggml-base.en.bin"
+chunk_seconds = 600
 ```
 
 Headless agents may call their own hosted services depending on the tool. Keep this optional when you need a fully local-only workflow.

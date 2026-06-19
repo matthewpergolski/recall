@@ -14,7 +14,10 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::analysis::{analyze, known_agents, AnalyzeOptions, AnalyzeTarget};
 use crate::capture_sources::{detect_sources, SourceSummary};
 use crate::mic_recorder::MicRecorder;
-use crate::session::{default_storage_dir, start_session, ConsentMode, StartOptions};
+use crate::session::{
+    append_session_marker, append_session_note, default_storage_dir, start_session, ConsentMode,
+    StartOptions,
+};
 use crate::system_recorder::SystemRecorder;
 use crate::transcription::{
     transcribe_with_progress, TrackSelection, TranscribeOptions, TranscribeTarget,
@@ -28,7 +31,6 @@ const SOURCE_REFRESH_TICKS: u64 = 50;
 enum CaptureState {
     Ready,
     Recording,
-    Paused,
     Ended,
 }
 
@@ -36,6 +38,11 @@ enum CaptureState {
 pub struct TuiOptions {
     pub consent_noted: bool,
     pub title: String,
+    pub storage_dir: Option<PathBuf>,
+    pub ffmpeg_bin: Option<PathBuf>,
+    pub whisper_bin: Option<PathBuf>,
+    pub model_path: Option<PathBuf>,
+    pub chunk_seconds: u64,
     pub agent: Option<String>,
     pub auto_analyze: bool,
     pub preset: String,
@@ -46,8 +53,13 @@ impl Default for TuiOptions {
         Self {
             consent_noted: false,
             title: "Quick Capture".to_string(),
+            storage_dir: None,
+            ffmpeg_bin: None,
+            whisper_bin: None,
+            model_path: None,
+            chunk_seconds: TRANSCRIPTION_CHUNK_SECONDS,
             agent: None,
-            auto_analyze: false,
+            auto_analyze: true,
             preset: "general".to_string(),
         }
     }
@@ -81,6 +93,7 @@ struct App {
     last_source_refresh_tick: u64,
     mic_recorder: Option<MicRecorder>,
     system_recorder: Option<SystemRecorder>,
+    default_title: String,
     title: String,
     mic_level_percent: u16,
     mic_level_db: Option<f32>,
@@ -91,13 +104,18 @@ struct App {
     call_level_db: Option<f32>,
     system_capture_failed: bool,
     system_capture_warning: Option<String>,
-    transcription_receiver: Option<Receiver<TranscriptionUiEvent>>,
+    transcription_jobs: Vec<TranscriptionJob>,
     transcription_status: TranscriptionStatus,
-    analysis_receiver: Option<Receiver<AnalysisUiEvent>>,
+    analysis_jobs: Vec<AnalysisJob>,
     analysis_status: AnalysisStatus,
     agent: Option<String>,
     auto_analyze: bool,
     preset: String,
+    ffmpeg_bin: Option<PathBuf>,
+    whisper_bin: Option<PathBuf>,
+    model_path: Option<PathBuf>,
+    chunk_seconds: u64,
+    note_draft: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,11 +126,24 @@ struct TranscriptionStatus {
     failed: bool,
 }
 
+struct TranscriptionJob {
+    receiver: Receiver<TranscriptionUiEvent>,
+}
+
 #[derive(Debug, Clone)]
 enum TranscriptionUiEvent {
-    Progress(TranscriptionProgress),
-    Complete(PathBuf),
-    Failed(String),
+    Progress {
+        session_path: PathBuf,
+        progress: TranscriptionProgress,
+    },
+    Complete {
+        session_path: PathBuf,
+        transcript_path: PathBuf,
+    },
+    Failed {
+        session_path: PathBuf,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -123,15 +154,24 @@ struct AnalysisStatus {
     failed: bool,
 }
 
+struct AnalysisJob {
+    session_path: PathBuf,
+    receiver: Receiver<AnalysisUiEvent>,
+}
+
 #[derive(Debug, Clone)]
 enum AnalysisUiEvent {
     Complete {
+        original_session_path: PathBuf,
         session_path: PathBuf,
         result_path: Option<PathBuf>,
         written_files: usize,
         generated_title: Option<String>,
     },
-    Failed(String),
+    Failed {
+        session_path: PathBuf,
+        message: String,
+    },
 }
 
 impl App {
@@ -144,11 +184,11 @@ impl App {
             started_at: None,
             accumulated: Duration::ZERO,
             session_path: None,
-            storage_dir: default_storage_dir()?,
+            storage_dir: options.storage_dir.unwrap_or(default_storage_dir()?),
             toast: if consent_noted {
-                "Ready with consent provided. Press Enter to start.".to_string()
+                "Ready with consent provided. Press Space or Enter to start.".to_string()
             } else {
-                "Ready. Press c after consent, then Enter to start.".to_string()
+                "Ready. Press c after consent, then Space or Enter to start.".to_string()
             },
             markers: Vec::new(),
             live_notes: vec![
@@ -160,6 +200,7 @@ impl App {
             last_source_refresh_tick: 0,
             mic_recorder: None,
             system_recorder: None,
+            default_title: options.title.clone(),
             title: options.title,
             mic_level_percent: 0,
             mic_level_db: None,
@@ -170,13 +211,18 @@ impl App {
             call_level_db: None,
             system_capture_failed: false,
             system_capture_warning: None,
-            transcription_receiver: None,
+            transcription_jobs: Vec::new(),
             transcription_status: TranscriptionStatus::idle(),
-            analysis_receiver: None,
+            analysis_jobs: Vec::new(),
             analysis_status: AnalysisStatus::idle(),
             agent: options.agent,
             auto_analyze: options.auto_analyze,
             preset: options.preset,
+            ffmpeg_bin: options.ffmpeg_bin,
+            whisper_bin: options.whisper_bin,
+            model_path: options.model_path,
+            chunk_seconds: options.chunk_seconds,
+            note_draft: None,
         })
     }
 
@@ -202,8 +248,13 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> io::Result<bool> {
+        if self.note_draft.is_some() {
+            self.handle_note_key(key);
+            return Ok(false);
+        }
+
         if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if self.transcription_receiver.is_some() || self.analysis_receiver.is_some() {
+            if self.has_background_jobs() {
                 self.toast =
                     "Background work is running; wait for Recall to finish before quitting."
                         .to_string();
@@ -215,7 +266,7 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => {
-                if self.transcription_receiver.is_some() || self.analysis_receiver.is_some() {
+                if self.has_background_jobs() {
                     self.toast =
                         "Background work is running; wait for Recall to finish before quitting."
                             .to_string();
@@ -224,12 +275,15 @@ impl App {
                 self.stop_recorders();
                 return Ok(true);
             }
-            KeyCode::Enter => self.start_capture()?,
+            KeyCode::Enter | KeyCode::Char(' ') => self.primary_recording_action()?,
             KeyCode::Char('c') => self.toggle_consent(),
-            KeyCode::Char(' ') | KeyCode::Char('p') => self.toggle_pause(),
+            KeyCode::Char('p') => {
+                self.toast = "Pause is disabled for real recording. Press Space or Enter to end."
+                    .to_string();
+            }
             KeyCode::Char('e') => self.end_capture(),
             KeyCode::Char('m') => self.add_marker(),
-            KeyCode::Char('n') => self.add_manual_note(),
+            KeyCode::Char('n') => self.start_manual_note(),
             KeyCode::Char('r') => self.refresh_sources(),
             KeyCode::Char('a') => self.toggle_auto_analyze(),
             KeyCode::Char('A') => self.cycle_agent(),
@@ -239,19 +293,77 @@ impl App {
         Ok(false)
     }
 
+    fn primary_recording_action(&mut self) -> io::Result<()> {
+        match self.state {
+            CaptureState::Ready | CaptureState::Ended => self.start_capture(),
+            CaptureState::Recording => {
+                self.end_capture();
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_note_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.save_manual_note(),
+            KeyCode::Esc => {
+                self.note_draft = None;
+                self.toast = "Note cancelled.".to_string();
+            }
+            KeyCode::Backspace => {
+                if let Some(draft) = &mut self.note_draft {
+                    draft.pop();
+                }
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.note_draft = None;
+                self.toast = "Note cancelled.".to_string();
+            }
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                if let Some(draft) = &mut self.note_draft {
+                    draft.push(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         self.start_source_refresh_if_due();
     }
 
+    fn has_background_jobs(&self) -> bool {
+        !self.transcription_jobs.is_empty() || !self.analysis_jobs.is_empty()
+    }
+
+    fn is_current_session(&self, session_path: &PathBuf) -> bool {
+        self.session_path.as_ref() == Some(session_path)
+    }
+
+    fn session_label(session_path: &std::path::Path) -> String {
+        session_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("previous session")
+            .to_string()
+    }
+
     fn start_capture(&mut self) -> io::Result<()> {
-        if matches!(self.state, CaptureState::Recording | CaptureState::Paused) {
+        if matches!(self.state, CaptureState::Recording) {
             self.toast = "Session is already active.".to_string();
             return Ok(());
         }
 
+        let capture_title = self.default_title.clone();
+        self.title = capture_title.clone();
+        self.transcription_status = TranscriptionStatus::idle();
+        self.analysis_status = AnalysisStatus::idle();
+
         let options = StartOptions {
-            title: self.title.clone(),
+            title: capture_title,
             consent: if self.consent_noted {
                 ConsentMode::Noted
             } else {
@@ -312,7 +424,7 @@ impl App {
             "Microphone recording writes audio/mic.m4a.".to_string(),
             "Mic source changes are detected while recording.".to_string(),
             "System audio capture writes audio/call.m4a via CoreAudio process taps.".to_string(),
-            "Press e to end and finalize active audio files.".to_string(),
+            "Press Space or Enter to end and start transcription.".to_string(),
         ];
         for failure in failures {
             self.live_notes.push(failure);
@@ -330,42 +442,12 @@ impl App {
         };
     }
 
-    fn toggle_pause(&mut self) {
-        if self.mic_recorder.is_some() || self.system_recorder.is_some() {
-            self.toast = "Pause is not wired for real recording yet. Press e to end.".to_string();
-            return;
-        }
-
-        match self.state {
-            CaptureState::Recording => {
-                if let Some(started_at) = self.started_at.take() {
-                    self.accumulated += started_at.elapsed();
-                }
-                self.state = CaptureState::Paused;
-                self.toast = "Paused.".to_string();
-            }
-            CaptureState::Paused => {
-                self.started_at = Some(Instant::now());
-                self.state = CaptureState::Recording;
-                self.toast = "Recording resumed.".to_string();
-            }
-            _ => {
-                self.toast = "Start a session before pausing.".to_string();
-            }
-        }
-    }
-
     fn end_capture(&mut self) {
         match self.state {
             CaptureState::Recording => {
                 if let Some(started_at) = self.started_at.take() {
                     self.accumulated += started_at.elapsed();
                 }
-                self.stop_recorders();
-                self.state = CaptureState::Ended;
-                self.start_transcription_job();
-            }
-            CaptureState::Paused => {
                 self.stop_recorders();
                 self.state = CaptureState::Ended;
                 self.start_transcription_job();
@@ -377,25 +459,51 @@ impl App {
     }
 
     fn add_marker(&mut self) {
-        if !matches!(self.state, CaptureState::Recording | CaptureState::Paused) {
+        if !matches!(self.state, CaptureState::Recording) {
             self.toast = "Start a session before adding markers.".to_string();
             return;
         }
 
         let marker = format!("{} marker dropped", self.elapsed_label());
+        if let Some(session_path) = &self.session_path {
+            if let Err(error) = append_session_marker(session_path, &self.elapsed_label()) {
+                self.toast = format!("Marker created in memory, but failed to save: {error}");
+                return;
+            }
+        }
         self.markers.push(marker.clone());
-        self.toast = marker;
+        self.live_notes.push(marker.clone());
+        self.toast = format!("{marker} and saved to markers.md");
     }
 
-    fn add_manual_note(&mut self) {
-        if !matches!(self.state, CaptureState::Recording | CaptureState::Paused) {
+    fn start_manual_note(&mut self) {
+        if !matches!(self.state, CaptureState::Recording) {
             self.toast = "Start a session before adding notes.".to_string();
             return;
         }
 
-        let note = format!("{} manual note placeholder", self.elapsed_label());
+        self.note_draft = Some(String::new());
+        self.toast = "Type a note, then press Enter to save or Esc to cancel.".to_string();
+    }
+
+    fn save_manual_note(&mut self) {
+        let note_text = self.note_draft.take().unwrap_or_default();
+        let note_text = note_text.trim();
+        if note_text.is_empty() {
+            self.toast = "Empty note discarded.".to_string();
+            return;
+        }
+
+        let note = format!("{} {note_text}", self.elapsed_label());
+        if let Some(session_path) = &self.session_path {
+            if let Err(error) = append_session_note(session_path, &self.elapsed_label(), note_text)
+            {
+                self.toast = format!("Note created in memory, but failed to save: {error}");
+                return;
+            }
+        }
         self.live_notes.push(note.clone());
-        self.toast = note;
+        self.toast = format!("{note} saved to notes.md");
     }
 
     fn refresh_sources(&mut self) {
@@ -404,10 +512,7 @@ impl App {
     }
 
     fn start_source_refresh_if_due(&mut self) {
-        if !matches!(
-            self.state,
-            CaptureState::Ready | CaptureState::Recording | CaptureState::Paused
-        ) {
+        if !matches!(self.state, CaptureState::Ready | CaptureState::Recording) {
             return;
         }
 
@@ -661,123 +766,171 @@ impl App {
     }
 
     fn start_transcription_job(&mut self) {
-        if self.transcription_receiver.is_some() {
-            self.toast = "Transcription is already running.".to_string();
-            return;
-        }
-
         let Some(session_path) = self.session_path.clone() else {
             self.toast = "Session ended, but no session path was available.".to_string();
             return;
         };
 
         let (sender, receiver) = mpsc::channel();
-        self.transcription_receiver = Some(receiver);
-        self.transcription_status = TranscriptionStatus::queued();
+        self.transcription_jobs.push(TranscriptionJob { receiver });
+        if self.is_current_session(&session_path) {
+            self.transcription_status = TranscriptionStatus::queued();
+        }
         self.toast = "Session ended. Audio finalized; transcription queued.".to_string();
         self.live_notes
             .push("Transcription queued for this session.".to_string());
 
+        let ffmpeg_bin = self.ffmpeg_bin.clone();
+        let whisper_bin = self.whisper_bin.clone();
+        let model_path = self.model_path.clone();
+        let chunk_seconds = self.chunk_seconds;
+
         thread::spawn(move || {
+            let event_session_path = session_path.clone();
             let options = TranscribeOptions {
                 target: TranscribeTarget::Session(session_path),
                 track: TrackSelection::Both,
                 storage_dir: None,
-                model_path: None,
-                whisper_bin: None,
-                chunk_seconds: TRANSCRIPTION_CHUNK_SECONDS,
+                ffmpeg_bin,
+                model_path,
+                whisper_bin,
+                chunk_seconds,
                 keep_wav: false,
             };
 
             let progress_sender = sender.clone();
+            let progress_session_path = event_session_path.clone();
             let result = transcribe_with_progress(&options, |progress| {
-                let _ = progress_sender.send(TranscriptionUiEvent::Progress(progress));
+                let _ = progress_sender.send(TranscriptionUiEvent::Progress {
+                    session_path: progress_session_path.clone(),
+                    progress,
+                });
             });
 
             match result {
                 Ok(result) => {
-                    let _ = sender.send(TranscriptionUiEvent::Complete(result.transcript_path));
+                    let _ = sender.send(TranscriptionUiEvent::Complete {
+                        session_path: event_session_path,
+                        transcript_path: result.transcript_path,
+                    });
                 }
                 Err(error) => {
-                    let _ = sender.send(TranscriptionUiEvent::Failed(error.to_string()));
+                    let _ = sender.send(TranscriptionUiEvent::Failed {
+                        session_path: event_session_path,
+                        message: error.to_string(),
+                    });
                 }
             }
         });
     }
 
     fn process_transcription_events(&mut self) {
-        let mut finished = false;
         let mut events = Vec::new();
 
-        if let Some(receiver) = &self.transcription_receiver {
-            while let Ok(event) = receiver.try_recv() {
-                events.push(event);
+        for (index, job) in self.transcription_jobs.iter().enumerate() {
+            while let Ok(event) = job.receiver.try_recv() {
+                events.push((index, event));
             }
         }
 
-        for event in events {
+        let mut finished_jobs = Vec::new();
+
+        for (job_index, event) in events {
             match event {
-                TranscriptionUiEvent::Progress(progress) => {
-                    self.apply_transcription_progress(progress);
-                }
-                TranscriptionUiEvent::Complete(path) => {
-                    self.transcription_status.label = "Transcript ready".to_string();
-                    self.transcription_status.percent = 100;
-                    self.transcription_status.transcript_path = Some(path.clone());
-                    self.transcription_status.failed = false;
-                    self.toast = format!("Transcript ready: {}", path.display());
-                    self.live_notes
-                        .push(format!("Transcript ready: {}", path.display()));
-                    if self.auto_analyze {
-                        self.start_analysis_job();
+                TranscriptionUiEvent::Progress {
+                    session_path,
+                    progress,
+                } => {
+                    if self.is_current_session(&session_path) {
+                        self.apply_transcription_progress(progress);
                     }
-                    finished = true;
                 }
-                TranscriptionUiEvent::Failed(message) => {
-                    self.transcription_status.label = "Transcription failed".to_string();
-                    self.transcription_status.percent = 0;
-                    self.transcription_status.failed = true;
-                    self.toast = format!("Transcription failed: {message}");
-                    self.live_notes
-                        .push(format!("Transcription failed: {message}"));
-                    finished = true;
+                TranscriptionUiEvent::Complete {
+                    session_path,
+                    transcript_path,
+                } => {
+                    if self.is_current_session(&session_path) {
+                        self.transcription_status.label = "Transcript ready".to_string();
+                        self.transcription_status.percent = 100;
+                        self.transcription_status.transcript_path = Some(transcript_path.clone());
+                        self.transcription_status.failed = false;
+                        self.toast = format!("Transcript ready: {}", transcript_path.display());
+                        self.live_notes
+                            .push(format!("Transcript ready: {}", transcript_path.display()));
+                    } else {
+                        self.live_notes.push(format!(
+                            "Transcript ready for {}.",
+                            Self::session_label(&session_path)
+                        ));
+                    }
+                    if self.auto_analyze {
+                        self.start_analysis_job(session_path);
+                    }
+                    finished_jobs.push(job_index);
+                }
+                TranscriptionUiEvent::Failed {
+                    session_path,
+                    message,
+                } => {
+                    if self.is_current_session(&session_path) {
+                        self.transcription_status.label = "Transcription failed".to_string();
+                        self.transcription_status.percent = 0;
+                        self.transcription_status.failed = true;
+                        self.toast = format!("Transcription failed: {message}");
+                    }
+                    self.live_notes.push(format!(
+                        "Transcription failed for {}: {message}",
+                        Self::session_label(&session_path)
+                    ));
+                    finished_jobs.push(job_index);
                 }
             }
         }
 
-        if finished {
-            self.transcription_receiver = None;
+        finished_jobs.sort_unstable();
+        finished_jobs.dedup();
+        for index in finished_jobs.into_iter().rev() {
+            self.transcription_jobs.remove(index);
         }
     }
 
-    fn start_analysis_job(&mut self) {
-        if self.analysis_receiver.is_some() {
+    fn start_analysis_job(&mut self, session_path: PathBuf) {
+        if self
+            .analysis_jobs
+            .iter()
+            .any(|job| job.session_path == session_path)
+        {
             return;
         }
 
         let Some(agent) = self.agent.clone() else {
-            self.analysis_status.label = "Analysis skipped: no agent".to_string();
-            self.analysis_status.percent = 0;
-            self.toast = "Analysis skipped because no agent is selected.".to_string();
-            self.live_notes
-                .push("Analysis skipped: no agent selected.".to_string());
-            return;
-        };
-
-        let Some(session_path) = self.session_path.clone() else {
-            self.toast = "Analysis skipped because no session path was available.".to_string();
+            if self.is_current_session(&session_path) {
+                self.analysis_status.label = "Analysis skipped: no agent".to_string();
+                self.analysis_status.percent = 0;
+                self.toast = "Analysis skipped because no agent is selected.".to_string();
+            }
+            self.live_notes.push(format!(
+                "Analysis skipped for {}: no agent selected.",
+                Self::session_label(&session_path)
+            ));
             return;
         };
 
         let preset = self.preset.clone();
         let (sender, receiver) = mpsc::channel();
-        self.analysis_receiver = Some(receiver);
-        self.analysis_status = AnalysisStatus::running(&agent);
+        self.analysis_jobs.push(AnalysisJob {
+            session_path: session_path.clone(),
+            receiver,
+        });
+        if self.is_current_session(&session_path) {
+            self.analysis_status = AnalysisStatus::running(&agent);
+        }
         self.toast = format!("Analysis queued with {agent}.");
         self.live_notes
             .push(format!("Analysis queued with {agent}."));
 
         thread::spawn(move || {
+            let original_session_path = session_path.clone();
             let options = AnalyzeOptions {
                 target: AnalyzeTarget::Session(session_path),
                 storage_dir: None,
@@ -788,6 +941,7 @@ impl App {
             match analyze(&options) {
                 Ok(result) => {
                     let _ = sender.send(AnalysisUiEvent::Complete {
+                        original_session_path,
                         session_path: result.session_path,
                         result_path: result.result_path,
                         written_files: result.written_files.len(),
@@ -795,65 +949,94 @@ impl App {
                     });
                 }
                 Err(error) => {
-                    let _ = sender.send(AnalysisUiEvent::Failed(error.to_string()));
+                    let _ = sender.send(AnalysisUiEvent::Failed {
+                        session_path: original_session_path,
+                        message: error.to_string(),
+                    });
                 }
             }
         });
     }
 
     fn process_analysis_events(&mut self) {
-        let mut finished = false;
         let mut events = Vec::new();
 
-        if let Some(receiver) = &self.analysis_receiver {
-            while let Ok(event) = receiver.try_recv() {
-                events.push(event);
+        for (index, job) in self.analysis_jobs.iter().enumerate() {
+            while let Ok(event) = job.receiver.try_recv() {
+                events.push((index, event));
             }
         }
 
-        for event in events {
+        let mut finished_jobs = Vec::new();
+
+        for (job_index, event) in events {
             match event {
                 AnalysisUiEvent::Complete {
+                    original_session_path,
                     session_path,
                     result_path,
                     written_files,
                     generated_title,
                 } => {
-                    self.session_path = Some(session_path.clone());
-                    if self.transcription_status.transcript_path.is_some() {
-                        self.transcription_status.transcript_path =
-                            Some(session_path.join("transcript.md"));
+                    let is_current = self.is_current_session(&original_session_path);
+                    if is_current {
+                        self.session_path = Some(session_path.clone());
+                        if self.transcription_status.transcript_path.is_some() {
+                            self.transcription_status.transcript_path =
+                                Some(session_path.join("transcript.md"));
+                        }
+                        self.analysis_status.label =
+                            format!("Analysis ready ({written_files} files)");
+                        self.analysis_status.percent = 100;
+                        self.analysis_status.result_path = result_path.clone();
+                        self.analysis_status.failed = false;
+                        self.toast = "Analysis ready: summary/actions updated.".to_string();
+                        if let Some(title) = generated_title {
+                            self.title = title.clone();
+                            self.live_notes.push(format!("Session titled: {title}"));
+                        }
                     }
-                    self.analysis_status.label = format!("Analysis ready ({written_files} files)");
-                    self.analysis_status.percent = 100;
-                    self.analysis_status.result_path = result_path.clone();
-                    self.analysis_status.failed = false;
-                    self.toast = "Analysis ready: summary/actions updated.".to_string();
                     if let Some(path) = result_path {
-                        self.live_notes
-                            .push(format!("Analysis JSON ready: {}", path.display()));
+                        if is_current {
+                            self.live_notes
+                                .push(format!("Analysis JSON ready: {}", path.display()));
+                        } else {
+                            self.live_notes.push(format!(
+                                "Analysis ready for {}.",
+                                Self::session_label(&session_path)
+                            ));
+                        }
                     } else {
-                        self.live_notes.push("Analysis ready.".to_string());
+                        self.live_notes.push(format!(
+                            "Analysis ready for {}.",
+                            Self::session_label(&session_path)
+                        ));
                     }
-                    if let Some(title) = generated_title {
-                        self.title = title.clone();
-                        self.live_notes.push(format!("Session titled: {title}"));
-                    }
-                    finished = true;
+                    finished_jobs.push(job_index);
                 }
-                AnalysisUiEvent::Failed(message) => {
-                    self.analysis_status.label = "Analysis failed".to_string();
-                    self.analysis_status.percent = 0;
-                    self.analysis_status.failed = true;
-                    self.toast = format!("Analysis failed: {message}");
-                    self.live_notes.push(format!("Analysis failed: {message}"));
-                    finished = true;
+                AnalysisUiEvent::Failed {
+                    session_path,
+                    message,
+                } => {
+                    if self.is_current_session(&session_path) {
+                        self.analysis_status.label = "Analysis failed".to_string();
+                        self.analysis_status.percent = 0;
+                        self.analysis_status.failed = true;
+                        self.toast = format!("Analysis failed: {message}");
+                    }
+                    self.live_notes.push(format!(
+                        "Analysis failed for {}: {message}",
+                        Self::session_label(&session_path)
+                    ));
+                    finished_jobs.push(job_index);
                 }
             }
         }
 
-        if finished {
-            self.analysis_receiver = None;
+        finished_jobs.sort_unstable();
+        finished_jobs.dedup();
+        for index in finished_jobs.into_iter().rev() {
+            self.analysis_jobs.remove(index);
         }
     }
 
@@ -948,7 +1131,6 @@ impl App {
         match self.state {
             CaptureState::Ready => "READY",
             CaptureState::Recording => "REC",
-            CaptureState::Paused => "PAUSED",
             CaptureState::Ended => "ENDED",
         }
     }
@@ -957,7 +1139,6 @@ impl App {
         match self.state {
             CaptureState::Ready => Color::Cyan,
             CaptureState::Recording => Color::Red,
-            CaptureState::Paused => Color::Yellow,
             CaptureState::Ended => Color::Green,
         }
     }
@@ -968,7 +1149,6 @@ impl App {
                 let wave = ((self.tick + offset) * 17) % 64;
                 26 + wave as u16
             }
-            CaptureState::Paused => 8,
             _ => 0,
         }
     }
@@ -1198,7 +1378,7 @@ impl App {
             Color::Red
         } else if self.transcription_status.percent >= 100 {
             Color::Green
-        } else if self.transcription_receiver.is_some() {
+        } else if !self.transcription_jobs.is_empty() {
             Color::Yellow
         } else {
             Color::Gray
@@ -1210,7 +1390,7 @@ impl App {
             Color::Red
         } else if self.analysis_status.percent >= 100 {
             Color::Green
-        } else if self.analysis_receiver.is_some() {
+        } else if !self.analysis_jobs.is_empty() {
             Color::Yellow
         } else {
             Color::Gray
@@ -1233,10 +1413,13 @@ impl App {
                 Span::raw(session),
             ]),
             self.capture_health_line(),
-            Line::raw(""),
         ];
+        if self.has_background_jobs() {
+            lines.push(self.background_jobs_line());
+        }
+        lines.push(Line::raw(""));
 
-        if self.transcription_receiver.is_some()
+        if !self.transcription_jobs.is_empty()
             || self.transcription_status.percent > 0
             || self.transcription_status.failed
         {
@@ -1268,7 +1451,7 @@ impl App {
             Span::raw(self.preset.clone()),
         ]));
 
-        if self.analysis_receiver.is_some()
+        if !self.analysis_jobs.is_empty()
             || self.analysis_status.percent > 0
             || self.analysis_status.failed
         {
@@ -1288,6 +1471,15 @@ impl App {
                     Span::raw(path.display().to_string()),
                 ]));
             }
+            lines.push(Line::raw(""));
+        }
+
+        if let Some(draft) = &self.note_draft {
+            lines.push(Line::from(vec![
+                Span::styled("Note draft: ", Style::default().fg(Color::Blue)),
+                Span::raw(draft.clone()),
+                Span::styled("_", Style::default().fg(Color::Blue)),
+            ]));
             lines.push(Line::raw(""));
         }
 
@@ -1366,16 +1558,34 @@ impl App {
         ])
     }
 
+    fn background_jobs_line(&self) -> Line<'static> {
+        let transcript_count = self.transcription_jobs.len();
+        let analysis_count = self.analysis_jobs.len();
+        let label = match (transcript_count, analysis_count) {
+            (0, 0) => "idle".to_string(),
+            (transcripts, 0) => format!("{transcripts} transcript job(s)"),
+            (0, analyses) => format!("{analyses} analysis job(s)"),
+            (transcripts, analyses) => {
+                format!("{transcripts} transcript job(s), {analyses} analysis job(s)")
+            }
+        };
+        Line::from(vec![
+            Span::styled("Processing: ", Style::default().fg(Color::Gray)),
+            Span::styled(label, Style::default().fg(Color::Yellow)),
+        ])
+    }
+
     fn render_decisions(&self, frame: &mut Frame, area: Rect) {
         let items = match self.state {
             CaptureState::Ready => vec![
                 "No session yet".to_string(),
                 "Press c after consent".to_string(),
+                "Press Space or Enter to start".to_string(),
             ],
-            CaptureState::Recording | CaptureState::Paused => vec![
+            CaptureState::Recording => vec![
                 "Microphone recording targets audio/mic.m4a".to_string(),
                 "System audio targets audio/call.m4a".to_string(),
-                "Transcription starts after session end".to_string(),
+                "Space or Enter ends and starts transcription".to_string(),
                 format!("Analysis agent: {}", self.agent_label()),
             ],
             CaptureState::Ended => vec![
@@ -1395,7 +1605,7 @@ impl App {
     fn render_actions(&self, frame: &mut Frame, area: Rect) {
         let mut items = vec![
             "Review Clean Conversation for remaining mic bleed".to_string(),
-            "Persist markers/notes into session files".to_string(),
+            "Use typed notes for important context during calls".to_string(),
             "Review generated summary/actions before relying on them".to_string(),
         ];
         if let Some(path) = &self.transcription_status.transcript_path {
@@ -1412,19 +1622,46 @@ impl App {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        if let Some(draft) = &self.note_draft {
+            let text = vec![
+                Line::from(vec![
+                    Span::styled(
+                        " Note > ",
+                        Style::default().fg(Color::Black).bg(Color::Blue),
+                    ),
+                    Span::raw(draft.clone()),
+                    Span::styled("_", Style::default().fg(Color::Blue)),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        " Enter ",
+                        Style::default().fg(Color::Black).bg(Color::Green),
+                    ),
+                    Span::raw(" save  "),
+                    Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                    Span::raw(" cancel  "),
+                    Span::styled(
+                        " Backspace ",
+                        Style::default().fg(Color::Black).bg(Color::Yellow),
+                    ),
+                    Span::raw(" edit"),
+                ]),
+            ];
+            frame.render_widget(
+                Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
+                area,
+            );
+            return;
+        }
+
         let help = Line::from(vec![
             Span::styled(
-                " Enter ",
+                " Space/Enter ",
                 Style::default().fg(Color::Black).bg(Color::Green),
             ),
-            Span::raw(" start  "),
+            Span::raw(" start/end  "),
             Span::styled(" c ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::raw(" consent  "),
-            Span::styled(
-                " space/p ",
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            ),
-            Span::raw(" pause  "),
             Span::styled(" m ", Style::default().fg(Color::Black).bg(Color::Magenta)),
             Span::raw(" marker  "),
             Span::styled(" n ", Style::default().fg(Color::Black).bg(Color::Blue)),
@@ -1435,8 +1672,6 @@ impl App {
             Span::raw(" auto-ai  "),
             Span::styled(" A ", Style::default().fg(Color::Black).bg(Color::Green)),
             Span::raw(" agent  "),
-            Span::styled(" e ", Style::default().fg(Color::Black).bg(Color::Red)),
-            Span::raw(" end  "),
             Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(" quit  "),
             Span::styled(
@@ -1503,4 +1738,120 @@ fn signal_gauge(label: &'static str, percent: u16, color: Color) -> Gauge<'stati
 fn db_to_percent(level_db: f32) -> u16 {
     let normalized = ((level_db + 60.0) / 60.0).clamp(0.0, 1.0);
     (normalized * 100.0) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app(current_session: PathBuf) -> App {
+        App {
+            state: CaptureState::Ended,
+            consent_noted: true,
+            tick: 0,
+            started_at: None,
+            accumulated: Duration::ZERO,
+            session_path: Some(current_session),
+            storage_dir: std::env::temp_dir(),
+            toast: String::new(),
+            markers: Vec::new(),
+            live_notes: Vec::new(),
+            sources: SourceSummary::fallback("test sources"),
+            source_receiver: None,
+            last_source_refresh_tick: 0,
+            mic_recorder: None,
+            system_recorder: None,
+            default_title: "Quick Capture".to_string(),
+            title: "Current Session".to_string(),
+            mic_level_percent: 0,
+            mic_level_db: None,
+            mic_device_label: None,
+            mic_device_id: None,
+            mic_capture_warning: None,
+            call_level_percent: 0,
+            call_level_db: None,
+            system_capture_failed: false,
+            system_capture_warning: None,
+            transcription_jobs: Vec::new(),
+            transcription_status: TranscriptionStatus::idle(),
+            analysis_jobs: Vec::new(),
+            analysis_status: AnalysisStatus::idle(),
+            agent: None,
+            auto_analyze: false,
+            preset: "general".to_string(),
+            ffmpeg_bin: None,
+            whisper_bin: None,
+            model_path: None,
+            chunk_seconds: TRANSCRIPTION_CHUNK_SECONDS,
+            note_draft: None,
+        }
+    }
+
+    #[test]
+    fn stale_transcription_completion_does_not_replace_current_session_status() {
+        let current_session = PathBuf::from("/tmp/recall-current-session");
+        let previous_session = PathBuf::from("/tmp/recall-previous-session");
+        let previous_transcript = previous_session.join("transcript.md");
+        let (sender, receiver) = mpsc::channel();
+        let mut app = test_app(current_session.clone());
+        app.transcription_jobs.push(TranscriptionJob { receiver });
+
+        sender
+            .send(TranscriptionUiEvent::Complete {
+                session_path: previous_session.clone(),
+                transcript_path: previous_transcript,
+            })
+            .unwrap();
+
+        app.process_transcription_events();
+
+        assert_eq!(app.session_path.as_ref(), Some(&current_session));
+        assert_eq!(app.transcription_status.label, "Transcript idle");
+        assert_eq!(app.transcription_status.percent, 0);
+        assert!(app.transcription_status.transcript_path.is_none());
+        assert!(app.transcription_jobs.is_empty());
+        assert!(app
+            .live_notes
+            .iter()
+            .any(|note| note.contains("Transcript ready for recall-previous-session.")));
+    }
+
+    #[test]
+    fn stale_analysis_completion_does_not_replace_current_session_path_or_title() {
+        let current_session = PathBuf::from("/tmp/recall-current-session");
+        let previous_session = PathBuf::from("/tmp/recall-previous-session");
+        let renamed_previous = PathBuf::from("/tmp/recall-renamed-previous-session");
+        let (sender, receiver) = mpsc::channel();
+        let mut app = test_app(current_session.clone());
+        app.transcription_status.transcript_path = Some(current_session.join("transcript.md"));
+        app.analysis_jobs.push(AnalysisJob {
+            session_path: previous_session.clone(),
+            receiver,
+        });
+
+        sender
+            .send(AnalysisUiEvent::Complete {
+                original_session_path: previous_session,
+                session_path: renamed_previous,
+                result_path: None,
+                written_files: 7,
+                generated_title: Some("Previous Generated Title".to_string()),
+            })
+            .unwrap();
+
+        app.process_analysis_events();
+
+        assert_eq!(app.session_path.as_ref(), Some(&current_session));
+        assert_eq!(
+            app.transcription_status.transcript_path.as_ref(),
+            Some(&current_session.join("transcript.md"))
+        );
+        assert_eq!(app.title, "Current Session");
+        assert_eq!(app.analysis_status.label, "Analysis idle");
+        assert!(app.analysis_jobs.is_empty());
+        assert!(app
+            .live_notes
+            .iter()
+            .any(|note| note.contains("Analysis ready for recall-renamed-previous-session.")));
+    }
 }
