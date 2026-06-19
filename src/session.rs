@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -118,15 +118,38 @@ pub fn default_storage_dir() -> io::Result<PathBuf> {
     Ok(env::current_dir()?.join("sessions"))
 }
 
+pub fn append_session_marker(session_path: &Path, elapsed: &str) -> io::Result<()> {
+    append_session_entry(session_path, "markers.md", elapsed, "Marker")
+}
+
+pub fn append_session_note(session_path: &Path, elapsed: &str, note: &str) -> io::Result<()> {
+    append_session_entry(session_path, "notes.md", elapsed, note)
+}
+
 fn write_session_files(session: &Session) -> io::Result<()> {
     fs::write(session.path.join("recall.json"), session_json(session))?;
     fs::write(session.path.join("summary.md"), summary_markdown(session))?;
     fs::write(session.path.join("actions.md"), actions_markdown(session))?;
+    fs::write(session.path.join("markers.md"), markers_markdown(session))?;
+    fs::write(session.path.join("notes.md"), notes_markdown(session))?;
     fs::write(
         session.path.join("transcript.md"),
         transcript_markdown(session),
     )?;
     Ok(())
+}
+
+fn append_session_entry(
+    session_path: &Path,
+    file_name: &str,
+    elapsed: &str,
+    text: &str,
+) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(session_path.join(file_name))?;
+    writeln!(file, "- `{}` {}", elapsed, text)
 }
 
 fn read_session_created_at_unix(session_path: &Path) -> Option<u64> {
@@ -153,6 +176,8 @@ fn session_json(session: &Session) -> String {
     "summary": "summary.md",
     "actions": "actions.md",
     "transcript": "transcript.md",
+    "markers": "markers.md",
+    "notes": "notes.md",
     "audio_dir": "audio"
   }}
 }}
@@ -175,6 +200,20 @@ fn summary_markdown(session: &Session) -> String {
 fn actions_markdown(session: &Session) -> String {
     format!(
         "# Action Items: {}\n\n- [ ] Pending audio capture and transcription\n",
+        session.title
+    )
+}
+
+fn markers_markdown(session: &Session) -> String {
+    format!(
+        "# Markers: {}\n\nMarkers dropped during capture will appear here.\n\n",
+        session.title
+    )
+}
+
+fn notes_markdown(session: &Session) -> String {
+    format!(
+        "# Notes: {}\n\nManual notes captured during the session will appear here.\n\n",
         session.title
     )
 }
@@ -316,8 +355,8 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        eastern_offset_hours, escape_json, list_sessions, readable_eastern_timestamp_for, slugify,
-        ConsentMode,
+        append_session_marker, append_session_note, eastern_offset_hours, escape_json,
+        list_sessions, readable_eastern_timestamp_for, slugify, ConsentMode,
     };
     use std::fs;
     use time::{Date, Month};
@@ -403,5 +442,26 @@ mod tests {
         assert_eq!(sessions.get(1), Some(&older));
 
         let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn appends_markers_and_notes_to_session_files() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "recall-session-event-test-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        fs::create_dir_all(&session_dir).unwrap();
+
+        append_session_marker(&session_dir, "00:42").unwrap();
+        append_session_note(&session_dir, "00:43", "Follow up on budget").unwrap();
+
+        let markers = fs::read_to_string(session_dir.join("markers.md")).unwrap();
+        let notes = fs::read_to_string(session_dir.join("notes.md")).unwrap();
+
+        assert!(markers.contains("- `00:42` Marker"));
+        assert!(notes.contains("- `00:43` Follow up on budget"));
+
+        let _ = fs::remove_dir_all(session_dir);
     }
 }

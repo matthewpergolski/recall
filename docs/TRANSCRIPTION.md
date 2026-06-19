@@ -134,7 +134,9 @@ Larger models cost more local compute time but should improve transcript quality
 
 ## Current Behavior
 
-The TUI now starts transcription automatically after the user presses `e` to end a recording. The status area shows current transcript progress, including the active track/chunk, and shows the final `transcript.md` path when complete.
+The TUI starts transcription automatically after the user presses Space or Enter to end a recording. The status area shows current transcript progress, including the active track/chunk, and shows the final `transcript.md` path when complete.
+
+Recall can keep processing a finished session while the user starts another recording. Background transcription and analysis jobs are session-scoped, so a previous session finishing should not overwrite the currently active session display.
 
 The direct command still exists for re-running or debugging transcription:
 
@@ -194,11 +196,18 @@ Config defaults:
 ```toml
 # ~/.config/recall/config.toml
 consent_default = "provided"
+storage_dir = "~/Documents/Recall/sessions"
 
 [analysis]
 default_agent = "grok"
 auto_analyze = true
 preset = "general"
+
+[transcription]
+ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
+whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
+model_path = "~/Documents/Recall/models/ggml-base.en.bin"
+chunk_seconds = 600
 ```
 
 Analysis outputs:
@@ -227,7 +236,15 @@ Recall currently expects:
 
 See `docs/DEPENDENCIES.md` for the full dependency map, including no-Brew corporate setup.
 
-`ffmpeg` must be available on `PATH` for the current implementation. This is a temporary dependency; the intended no-Brew direction is to replace it with Swift/AVFoundation audio conversion.
+Recall finds `ffmpeg` in this order:
+
+1. `--ffmpeg <path>`
+2. `RECALL_FFMPEG_BIN`
+3. `[transcription].ffmpeg_bin` in `~/.config/recall/config.toml`
+4. `tools/ffmpeg/bin/ffmpeg`
+5. `ffmpeg` on `PATH`
+
+`ffmpeg` is still a temporary dependency; the intended no-Brew direction is to replace it with Swift/AVFoundation audio conversion.
 
 If `whisper-cli` is not on `PATH`, set:
 
@@ -257,6 +274,7 @@ models/
 Then point Recall at those files:
 
 ```sh
+export RECALL_FFMPEG_BIN="$PWD/tools/ffmpeg/bin/ffmpeg"
 export RECALL_WHISPER_BIN="$PWD/tools/whisper/bin/whisper-cli"
 export RECALL_WHISPER_MODEL="$PWD/models/ggml-base.en.bin"
 recall transcribe latest

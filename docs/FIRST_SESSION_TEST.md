@@ -41,10 +41,10 @@ Test flow:
 recall --consent provided
 ```
 
-6. Press Enter in Recall to start recording.
+6. Press Space or Enter in Recall to start recording.
 7. In the Teams test call, say a short phrase out loud.
 8. Let Teams play your phrase back.
-9. Press `e` in Recall to end the session.
+9. Press Space or Enter in Recall to end the session and start transcription.
 10. Press `q` to quit Recall.
 
 The important part is that the test includes both:
@@ -83,7 +83,7 @@ If Teams test call is not available, use a short call with a second device or an
 recall --consent provided
 ```
 
-4. Press Enter to start recording.
+4. Press Space or Enter to start recording.
 5. Have both sides say short test phrases:
 
 ```text
@@ -91,7 +91,7 @@ Local mic: "This is my microphone test."
 Remote audio: "This is the call audio test."
 ```
 
-6. Press `e` to end the session.
+6. Press Space or Enter to end the session.
 7. Press `q` to quit.
 
 ## Quick System-Audio Test

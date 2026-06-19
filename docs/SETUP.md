@@ -137,6 +137,24 @@ alias recall='command recall --consent provided --agent grok --auto-analyze'
 
 Recall parses leading defaults before subcommands, so `recall list`, `recall sources`, and `recall transcribe latest` still work. For persistent defaults without shell aliases, use `~/.config/recall/config.toml`; see `docs/AGENT_ANALYSIS.md`.
 
+Example persistent config:
+
+```toml
+consent_default = "provided"
+storage_dir = "~/Documents/Recall/sessions"
+
+[analysis]
+default_agent = "grok"
+auto_analyze = true
+preset = "general"
+
+[transcription]
+ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
+whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
+model_path = "~/Documents/Recall/models/ggml-base.en.bin"
+chunk_seconds = 600
+```
+
 ## macOS Permissions
 
 The real capture implementation will need macOS permissions:

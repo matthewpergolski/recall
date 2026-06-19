@@ -559,6 +559,18 @@ fn update_session_title_files(session_path: &Path, title: &str) -> io::Result<Ve
         }
     }
 
+    for (file_name, prefix) in [("markers.md", "# Markers: "), ("notes.md", "# Notes: ")] {
+        let path = session_path.join(file_name);
+        if path.exists() {
+            let content = fs::read_to_string(&path)?;
+            if content.starts_with(prefix) {
+                let updated = replace_first_line(&content, &format!("{prefix}{title}"));
+                fs::write(&path, updated)?;
+                written.push(path);
+            }
+        }
+    }
+
     Ok(written)
 }
 

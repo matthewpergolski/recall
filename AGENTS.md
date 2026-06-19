@@ -2,11 +2,41 @@
 
 These instructions are for Codex and other coding agents working on Recall.
 
+## Purpose
+
+Recall is a local-first macOS terminal app for meeting memory. It captures microphone and system/call audio, transcribes locally when possible, and can optionally generate summaries/actions with a headless CLI agent.
+
+## Always Follow
+
+- Keep Recall local-first and free-first.
+- Do not add stealth recording behavior, permission bypasses, disguised capture flows, or hidden background capture.
+- Do not commit private meeting data, model files, local tool binaries, build output, or memory-bank files.
+- Use `rg` / `rg --files` for search.
+- Use `apply_patch` for manual edits.
+- Do not revert user changes unless explicitly asked.
+- Keep changes scoped and incremental.
+
+## Progressive Context
+
+Read only the docs relevant to the task:
+
+- Product scope: `docs/SPEC.md`
+- Setup and first run: `docs/SETUP.md`
+- Dependency sources and no-Brew setup: `docs/DEPENDENCIES.md`
+- macOS audio capture: `docs/AUDIO_CAPTURE.md`
+- Transcription behavior and limits: `docs/TRANSCRIPTION.md`
+- Headless agent summaries/actions: `docs/AGENT_ANALYSIS.md`
+- Moving the repo or installed binary: `docs/PORTABILITY.md`
+- First real-call validation: `docs/FIRST_SESSION_TEST.md`
+- Current roadmap: `docs/ROADMAP.md`
+
+Public/user-facing documentation belongs in `README.md` and `docs/`.
+
 ## Memory Bank
 
-Agents should maintain a local memory bank for project continuity. The memory bank is intentionally ignored by Git because it can contain local testing details, private session IDs, and user-specific context.
+The local `memory-bank/` is ignored by Git. It may contain private testing details and project-continuity state.
 
-Before making changes, read all core memory bank files if they exist:
+Before non-trivial code changes, read these files if they exist:
 
 - `memory-bank/projectbrief.md`
 - `memory-bank/productContext.md`
@@ -15,82 +45,45 @@ Before making changes, read all core memory bank files if they exist:
 - `memory-bank/techContext.md`
 - `memory-bank/progress.md`
 
-If they do not exist, initialize them when project continuity would benefit from it. Keep them focused and factual.
+Update the memory bank after major implementation, architecture, setup, dependency, or product-direction changes.
 
-Treat the memory bank as durable local project state. Update it after:
+## Architecture
 
-- significant implementation changes
-- major product or architecture decisions
-- dependency/setup changes
-- explicit user requests to update memory
-- discoveries that future agents would otherwise have to rediscover
-
-Do not rely on the memory bank as public documentation. Public/user-facing documentation belongs in `README.md` and `docs/`.
-
-## Project Direction
-
-Recall is a local-first macOS terminal app for meeting memory.
-
-Core direction:
-
-- Rust owns CLI, TUI, session state, and local storage.
+- Rust owns CLI, TUI, session state, config, transcription orchestration, and analysis orchestration.
 - Swift helper owns macOS-specific capture APIs.
 - `ratatui` + `crossterm` power the terminal UI.
-- Meeting artifacts should remain understandable local files.
-- Keep the product useful for general users, not only developers.
-- Keep developer/repo-aware behavior optional and later.
-
-## Cost Policy
-
-Build free-first.
-
-- Prefer local capture.
-- Prefer local files.
-- Prefer local/open-source transcription options.
-- Do not make paid cloud transcription or hosted LLM summarization required.
-- Any paid service integration must be optional.
-
-## Skills
-
-Codex skills are reusable capabilities installed outside this repo, commonly under the user's Codex skills directory. They are not the same thing as `AGENTS.md` and do not belong in `.agents/` by default.
-
-Use relevant installed skills when the task matches them. For this project, likely useful skills include:
-
-- `skill-creator`: only if the user wants to create a new reusable Codex skill.
-- `skill-installer`: only if the user wants to install a Codex skill.
-- `browser-use:browser`: if validating a local web UI or browser target. This project is currently terminal-native, so it is usually not needed.
-
-If this project later needs a custom reusable skill, create it intentionally as a Codex skill, not as ad hoc project documentation. Keep project-specific continuity in `memory-bank/`.
-
-## Repo Conventions
-
-- Use `rg` / `rg --files` for searching.
-- Use `apply_patch` for manual edits.
-- Do not revert user changes.
-- Keep generated session output under `sessions/`; these are ignored by git.
-- Keep implementation scoped and incremental.
+- Session artifacts are plain local files.
+- Generated private artifacts live under `sessions/`.
+- Local models and tool binaries live under `models/` and `tools/`.
 
 ## Verification
 
 For Rust changes, run:
 
 ```sh
-cargo fmt
+cargo fmt --check
 cargo check
 cargo test
+cargo clippy -- -D warnings
 ```
 
-Run `cargo clippy` when changing non-trivial Rust logic.
+For docs-only changes, run:
 
-For the Swift helper, run from `capture-helper/`:
+```sh
+git diff --check
+```
+
+For Swift helper changes, run from `capture-helper/`:
 
 ```sh
 swift build
 swift run recall-capture list-sources
 ```
 
-In Codex sandboxed sessions, SwiftPM may need elevated execution because it uses normal macOS sandbox/cache paths.
+In sandboxed Codex sessions, SwiftPM may need elevated execution because it uses normal macOS sandbox/cache paths.
 
-## Portability
+## Skills
 
-If the project is moved to a new directory, read `docs/PORTABILITY.md`. Re-run `cargo check`, `swift build`, and reinstall with `cargo install --path .` if the user relies on a global `recall` command.
+Codex skills are reusable capabilities installed outside this repo, commonly under the user's Codex skills directory. They are not the same thing as `AGENTS.md` and do not belong in `.agents/` by default.
+
+Use relevant installed skills only when the task matches them. If this project later needs a custom reusable skill, create it intentionally as a Codex skill and keep project-specific continuity in `memory-bank/`.

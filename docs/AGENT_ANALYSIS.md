@@ -46,20 +46,22 @@ recall analyze latest --agent grok --dry-run
 
 ## TUI Auto-Analysis
 
-Start Recall with an agent and automatic analysis:
+Start Recall with an agent. TUI auto-analysis is on by default when an agent is selected:
 
 ```sh
-recall --agent grok --auto-analyze
+recall --agent grok
 ```
 
 Flow:
 
 1. Start recording.
-2. Press `e` to end.
+2. Press Space or Enter to end.
 3. Recall finalizes audio.
 4. Recall transcribes locally.
 5. Recall runs the selected agent.
 6. Recall writes summary/action files.
+
+If another recording starts before analysis finishes, the previous session keeps processing in the background. Agent results are written back to that session folder and do not retarget the active recording.
 
 Disable auto-analysis for a run:
 
@@ -70,7 +72,7 @@ recall --agent grok --no-auto-analyze
 Choose a prompt preset:
 
 ```sh
-recall --agent claude --auto-analyze --preset work
+recall --agent claude --preset work
 ```
 
 ## Alias Setup
@@ -107,14 +109,21 @@ Example:
 
 ```toml
 consent_default = "provided"
+storage_dir = "~/Documents/Recall/sessions"
 
 [analysis]
 default_agent = "grok"
 auto_analyze = true
 preset = "general"
+
+[transcription]
+ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
+whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
+model_path = "~/Documents/Recall/models/ggml-base.en.bin"
+chunk_seconds = 600
 ```
 
-With this config, plain `recall` starts with consent noted and auto-analysis enabled.
+With this config, plain `recall` starts with consent noted, writes sessions to the configured directory, uses explicit local transcription tools, and auto-analysis is enabled.
 
 CLI flags override config:
 

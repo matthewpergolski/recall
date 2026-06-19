@@ -24,7 +24,7 @@
 - Headless agent analysis command: `recall analyze latest --agent <name>`.
 - Mic input device-change detection and TUI warnings for early mic recorder exits.
 - Built-in agent profiles for Grok, Cline, Codex, and Claude.
-- Optional TUI auto-analysis via `--agent <name> --auto-analyze`.
+- Optional TUI auto-analysis via `--agent <name>` or configured default agent.
 - Config defaults via `~/.config/recall/config.toml`.
 - TUI session title option and readable Eastern Time session IDs.
 - Agent-generated session titles replace generic "Quick Capture" headings and folder slugs after analysis.
