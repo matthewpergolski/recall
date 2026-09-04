@@ -18,7 +18,7 @@ Required to build and run Recall from source:
 Install the Recall command from this repo:
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
 ```
 
 ## Audio Capture
@@ -53,7 +53,7 @@ Use this on a personal machine where Homebrew is allowed:
 brew install whisper-cpp
 mkdir -p models
 curl -L -o models/ggml-base.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
-cargo install --path .
+cargo install --path . --locked
 recall transcribe latest
 ```
 
@@ -123,7 +123,7 @@ Recall should not assume Homebrew in corporate environments. It should accept ex
 
 Agent analysis is optional. Recording and local transcription work without it.
 
-If you want Recall to generate summary/action files, install and authenticate at least one supported headless CLI agent:
+If you want Recall to generate a complete `meeting.md`, install and authenticate at least one supported headless CLI agent:
 
 | Agent | Command Recall Expects |
 | --- | --- |

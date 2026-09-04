@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use crate::session::state_dir;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SystemEvent {
     #[serde(rename = "type")]
@@ -28,7 +30,9 @@ pub struct SystemRecorder {
 
 impl SystemRecorder {
     pub fn start(session_dir: &Path) -> io::Result<Self> {
-        let stop_file = session_dir.join(".recall-stop-system");
+        let state_dir = state_dir(session_dir);
+        fs::create_dir_all(&state_dir)?;
+        let stop_file = state_dir.join("stop-system");
         if stop_file.exists() {
             fs::remove_file(&stop_file)?;
         }
@@ -70,6 +74,7 @@ impl SystemRecorder {
 
     pub fn stop(&mut self) -> io::Result<()> {
         if self.child.try_wait()?.is_some() {
+            let _ = fs::remove_file(&self.stop_file);
             return Ok(());
         }
 
@@ -78,6 +83,7 @@ impl SystemRecorder {
 
         while Instant::now() < deadline {
             if self.child.try_wait()?.is_some() {
+                let _ = fs::remove_file(&self.stop_file);
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(50));
@@ -85,6 +91,7 @@ impl SystemRecorder {
 
         self.child.kill()?;
         let _ = self.child.wait();
+        let _ = fs::remove_file(&self.stop_file);
         Ok(())
     }
 }

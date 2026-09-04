@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use crate::session::state_dir;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MicEvent {
     #[serde(rename = "type")]
@@ -32,7 +34,9 @@ pub struct MicRecorder {
 
 impl MicRecorder {
     pub fn start(session_dir: &Path) -> io::Result<Self> {
-        let stop_file = session_dir.join(".recall-stop-mic");
+        let state_dir = state_dir(session_dir);
+        fs::create_dir_all(&state_dir)?;
+        let stop_file = state_dir.join("stop-mic");
         if stop_file.exists() {
             fs::remove_file(&stop_file)?;
         }
@@ -74,6 +78,7 @@ impl MicRecorder {
 
     pub fn stop(&mut self) -> io::Result<()> {
         if self.child.try_wait()?.is_some() {
+            let _ = fs::remove_file(&self.stop_file);
             return Ok(());
         }
 
@@ -82,6 +87,7 @@ impl MicRecorder {
 
         while Instant::now() < deadline {
             if self.child.try_wait()?.is_some() {
+                let _ = fs::remove_file(&self.stop_file);
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(50));
@@ -89,6 +95,7 @@ impl MicRecorder {
 
         self.child.kill()?;
         let _ = self.child.wait();
+        let _ = fs::remove_file(&self.stop_file);
         Ok(())
     }
 }

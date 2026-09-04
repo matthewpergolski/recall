@@ -8,6 +8,7 @@ use crate::session::ConsentMode;
 pub struct RecallConfig {
     pub consent_default: Option<ConsentMode>,
     pub storage_dir: Option<PathBuf>,
+    pub source_dir: Option<PathBuf>,
     pub analysis: AnalysisConfig,
     pub transcription: TranscriptionConfig,
 }
@@ -76,6 +77,9 @@ impl RecallConfig {
                 ("", "storage_dir") => {
                     config.storage_dir = parse_string(value).map(expand_path);
                 }
+                ("", "source_dir") => {
+                    config.source_dir = parse_string(value).map(expand_path);
+                }
                 ("analysis", "default_agent") => {
                     config.analysis.default_agent = parse_string(value);
                 }
@@ -134,7 +138,7 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn expand_path(value: String) -> PathBuf {
+pub(crate) fn expand_path(value: String) -> PathBuf {
     if value == "~" {
         return env::var_os("HOME")
             .map(PathBuf::from)
@@ -159,6 +163,7 @@ mod tests {
             r#"
             consent_default = "provided"
             storage_dir = "~/Recall/Sessions"
+            source_dir = "~/Projects/recall"
 
             [analysis]
             default_agent = "grok"
@@ -175,6 +180,7 @@ mod tests {
 
         assert!(matches!(config.consent_default, Some(ConsentMode::Noted)));
         assert!(config.storage_dir.is_some());
+        assert!(config.source_dir.is_some());
         assert_eq!(config.analysis.default_agent.as_deref(), Some("grok"));
         assert_eq!(config.analysis.auto_analyze, Some(true));
         assert_eq!(config.analysis.preset.as_deref(), Some("work"));

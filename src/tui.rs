@@ -164,8 +164,7 @@ enum AnalysisUiEvent {
     Complete {
         original_session_path: PathBuf,
         session_path: PathBuf,
-        result_path: Option<PathBuf>,
-        written_files: usize,
+        meeting_path: PathBuf,
         generated_title: Option<String>,
     },
     Failed {
@@ -473,7 +472,7 @@ impl App {
         }
         self.markers.push(marker.clone());
         self.live_notes.push(marker.clone());
-        self.toast = format!("{marker} and saved to markers.md");
+        self.toast = format!("{marker} saved with the session");
     }
 
     fn start_manual_note(&mut self) {
@@ -503,7 +502,7 @@ impl App {
             }
         }
         self.live_notes.push(note.clone());
-        self.toast = format!("{note} saved to notes.md");
+        self.toast = format!("{note} saved with the session");
     }
 
     fn refresh_sources(&mut self) {
@@ -940,11 +939,11 @@ impl App {
             };
             match analyze(&options) {
                 Ok(result) => {
+                    let meeting_path = result.session_path.join("meeting.md");
                     let _ = sender.send(AnalysisUiEvent::Complete {
                         original_session_path,
                         session_path: result.session_path,
-                        result_path: result.result_path,
-                        written_files: result.written_files.len(),
+                        meeting_path,
                         generated_title: result.generated_title,
                     });
                 }
@@ -974,8 +973,7 @@ impl App {
                 AnalysisUiEvent::Complete {
                     original_session_path,
                     session_path,
-                    result_path,
-                    written_files,
+                    meeting_path,
                     generated_title,
                 } => {
                     let is_current = self.is_current_session(&original_session_path);
@@ -985,27 +983,19 @@ impl App {
                             self.transcription_status.transcript_path =
                                 Some(session_path.join("transcript.md"));
                         }
-                        self.analysis_status.label =
-                            format!("Analysis ready ({written_files} files)");
+                        self.analysis_status.label = "Meeting notes ready".to_string();
                         self.analysis_status.percent = 100;
-                        self.analysis_status.result_path = result_path.clone();
+                        self.analysis_status.result_path = Some(meeting_path.clone());
                         self.analysis_status.failed = false;
-                        self.toast = "Analysis ready: summary/actions updated.".to_string();
+                        self.toast = "Meeting notes ready.".to_string();
                         if let Some(title) = generated_title {
                             self.title = title.clone();
                             self.live_notes.push(format!("Session titled: {title}"));
                         }
                     }
-                    if let Some(path) = result_path {
-                        if is_current {
-                            self.live_notes
-                                .push(format!("Analysis JSON ready: {}", path.display()));
-                        } else {
-                            self.live_notes.push(format!(
-                                "Analysis ready for {}.",
-                                Self::session_label(&session_path)
-                            ));
-                        }
+                    if is_current {
+                        self.live_notes
+                            .push(format!("Meeting ready: {}", meeting_path.display()));
                     } else {
                         self.live_notes.push(format!(
                             "Analysis ready for {}.",
@@ -1467,7 +1457,7 @@ impl App {
             ]));
             if let Some(path) = &self.analysis_status.result_path {
                 lines.push(Line::from(vec![
-                    Span::styled("Analysis JSON: ", Style::default().fg(Color::Gray)),
+                    Span::styled("Meeting: ", Style::default().fg(Color::Gray)),
                     Span::raw(path.display().to_string()),
                 ]));
             }
@@ -1606,7 +1596,7 @@ impl App {
         let mut items = vec![
             "Review Clean Conversation for remaining mic bleed".to_string(),
             "Use typed notes for important context during calls".to_string(),
-            "Review generated summary/actions before relying on them".to_string(),
+            "Review meeting.md before relying on generated notes".to_string(),
         ];
         if let Some(path) = &self.transcription_status.transcript_path {
             items.insert(0, format!("Transcript: {}", path.display()));
@@ -1832,9 +1822,8 @@ mod tests {
         sender
             .send(AnalysisUiEvent::Complete {
                 original_session_path: previous_session,
+                meeting_path: renamed_previous.join("meeting.md"),
                 session_path: renamed_previous,
-                result_path: None,
-                written_files: 7,
                 generated_title: Some("Previous Generated Title".to_string()),
             })
             .unwrap();

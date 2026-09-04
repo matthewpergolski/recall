@@ -163,7 +163,7 @@ recall transcribe latest
 
 This requires `ffmpeg`, a local `whisper.cpp` CLI, and a local ggml Whisper model.
 
-If agent analysis is configured, Recall can also generate summary/action files after transcription:
+If agent analysis is configured, Recall can also generate a complete `meeting.md` after transcription:
 
 ```sh
 recall analyze latest --agent grok
@@ -171,5 +171,12 @@ recall analyze latest --agent grok --dry-run
 ```
 
 See `docs/AGENT_ANALYSIS.md` for alias and config setup.
+
+Open the finished meeting record or create a portable all-in-one export:
+
+```sh
+recall open latest
+recall export latest
+```
 
 Source: [Microsoft Teams test call documentation](https://support.microsoft.com/en-gb/office/manage-your-call-settings-in-microsoft-teams-456cb611-3477-496f-b31a-6ab752a7595f).

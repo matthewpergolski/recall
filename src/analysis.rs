@@ -6,7 +6,10 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::session::{default_storage_dir, list_sessions};
+use crate::session::{
+    analysis_dir, default_storage_dir, list_sessions, markers_path, metadata_path, notes_path,
+    read_session_title,
+};
 
 #[derive(Debug, Clone)]
 pub struct AnalyzeOptions {
@@ -95,7 +98,7 @@ pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
         ));
     }
 
-    let debug_dir = session_path.join("analysis-debug");
+    let debug_dir = analysis_dir(&session_path);
     if debug_dir.exists() {
         fs::remove_dir_all(&debug_dir)?;
     }
@@ -153,13 +156,10 @@ pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
         session_path = rename_session_dir_for_title(&session_path, title)?;
     }
 
-    let prompt_path = session_path.join("analysis-debug").join("prompt.md");
-    let raw_output_path = session_path
-        .join("analysis-debug")
-        .join(profile.raw_output_file);
-    let result_path = session_path
-        .join("analysis-debug")
-        .join("agent-result.json");
+    let debug_dir = analysis_dir(&session_path);
+    let prompt_path = debug_dir.join("prompt.md");
+    let raw_output_path = debug_dir.join(profile.raw_output_file);
+    let result_path = debug_dir.join("agent-result.json");
     let written_files =
         write_analysis_markdown(&session_path, &result, generated_title.as_deref())?;
 
@@ -261,7 +261,7 @@ Read this clean transcript file from disk:
 
 Preset: {preset}
 
-Use only the clean transcript as the source of truth. Do not use transcription-debug files unless explicitly asked.
+Use only the clean transcript as the source of truth. Do not use files under .recall/transcription unless explicitly asked.
 
 Return exactly one JSON object and no prose outside JSON. Use this schema:
 
@@ -483,58 +483,17 @@ fn write_analysis_markdown(
         Vec::new()
     };
 
-    let files = [
-        (
-            "summary.md",
-            format!(
-                "# {title}\n\n## Summary\n\n{}\n",
-                result
-                    .summary
-                    .as_deref()
-                    .unwrap_or("_No summary returned._")
-            ),
-        ),
-        ("actions.md", actions_markdown(&title, &result.action_items)),
-        (
-            "decisions.md",
-            decisions_markdown(&title, &result.decisions),
-        ),
-        (
-            "questions.md",
-            questions_markdown(&title, &result.questions),
-        ),
-        (
-            "followups.md",
-            followups_markdown(&title, &result.followups),
-        ),
-    ];
-
-    for (file_name, content) in files {
-        let path = session_path.join(file_name);
-        fs::write(&path, content)?;
-        written.push(path);
-    }
+    let path = session_path.join("meeting.md");
+    fs::write(&path, meeting_markdown(session_path, &title, result)?)?;
+    written.push(path);
 
     Ok(written)
-}
-
-fn read_session_title(session_path: &Path) -> io::Result<String> {
-    let metadata_path = session_path.join("recall.json");
-    let metadata = fs::read_to_string(metadata_path)?;
-    let value = serde_json::from_str::<Value>(&metadata)?;
-    let title = value
-        .get("title")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .unwrap_or("Meeting Analysis");
-    Ok(title.to_string())
 }
 
 fn update_session_title_files(session_path: &Path, title: &str) -> io::Result<Vec<PathBuf>> {
     let mut written = Vec::new();
 
-    let metadata_path = session_path.join("recall.json");
+    let metadata_path = metadata_path(session_path);
     if metadata_path.exists() {
         let metadata = fs::read_to_string(&metadata_path)?;
         if let Ok(mut value) = serde_json::from_str::<Value>(&metadata) {
@@ -559,8 +518,10 @@ fn update_session_title_files(session_path: &Path, title: &str) -> io::Result<Ve
         }
     }
 
-    for (file_name, prefix) in [("markers.md", "# Markers: "), ("notes.md", "# Notes: ")] {
-        let path = session_path.join(file_name);
+    for (path, prefix) in [
+        (markers_path(session_path), "# Markers: "),
+        (notes_path(session_path), "# Notes: "),
+    ] {
         if path.exists() {
             let content = fs::read_to_string(&path)?;
             if content.starts_with(prefix) {
@@ -597,10 +558,59 @@ fn normalized_title(value: Option<&str>) -> Option<String> {
     Some(title.chars().take(80).collect())
 }
 
-fn actions_markdown(title: &str, items: &[ActionItem]) -> String {
-    let mut markdown = format!("# Action Items: {title}\n\n");
+fn meeting_markdown(
+    session_path: &Path,
+    title: &str,
+    result: &AgentMeetingResult,
+) -> io::Result<String> {
+    let notes = read_session_entries(&notes_path(session_path))?;
+    let markers = read_session_entries(&markers_path(session_path))?;
+    let mut markdown = format!(
+        "# {title}\n\n> Analysis generated from the [clean transcript](transcript.md).\n\n## Summary\n\n{}\n\n",
+        result
+            .summary
+            .as_deref()
+            .unwrap_or("_No summary returned._")
+    );
+    markdown.push_str(&decisions_markdown(&result.decisions));
+    markdown.push_str(&actions_markdown(&result.action_items));
+    markdown.push_str(&questions_markdown(&result.questions));
+    markdown.push_str(&followups_markdown(&result.followups));
+    markdown.push_str("## Notes and Markers\n\n");
+    append_captured_entries(&mut markdown, "Notes", &notes);
+    append_captured_entries(&mut markdown, "Markers", &markers);
+    markdown.push_str(
+        "## Source Material\n\n- [Transcript](transcript.md)\n- [Microphone audio](audio/mic.m4a)\n- [System audio](audio/call.m4a)\n",
+    );
+    Ok(markdown)
+}
+
+fn read_session_entries(path: &Path) -> io::Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("- `"))
+        .map(str::to_string)
+        .collect())
+}
+
+fn append_captured_entries(markdown: &mut String, heading: &str, entries: &[String]) {
+    markdown.push_str(&format!("### {heading}\n\n"));
+    if entries.is_empty() {
+        markdown.push_str("_None captured._\n\n");
+    } else {
+        markdown.push_str(&entries.join("\n"));
+        markdown.push_str("\n\n");
+    }
+}
+
+fn actions_markdown(items: &[ActionItem]) -> String {
+    let mut markdown = "## Action Items\n\n".to_string();
     if items.is_empty() {
-        markdown.push_str("_No action items returned._\n");
+        markdown.push_str("_No action items identified._\n\n");
         return markdown;
     }
 
@@ -612,13 +622,14 @@ fn actions_markdown(title: &str, items: &[ActionItem]) -> String {
         append_detail(&mut markdown, "Evidence", item.evidence.as_deref());
         markdown.push('\n');
     }
+    markdown.push('\n');
     markdown
 }
 
-fn decisions_markdown(title: &str, items: &[Decision]) -> String {
-    let mut markdown = format!("# Decisions: {title}\n\n");
+fn decisions_markdown(items: &[Decision]) -> String {
+    let mut markdown = "## Decisions\n\n".to_string();
     if items.is_empty() {
-        markdown.push_str("_No decisions returned._\n");
+        markdown.push_str("_No decisions identified._\n\n");
         return markdown;
     }
 
@@ -628,13 +639,14 @@ fn decisions_markdown(title: &str, items: &[Decision]) -> String {
         append_detail(&mut markdown, "Evidence", item.evidence.as_deref());
         markdown.push('\n');
     }
+    markdown.push('\n');
     markdown
 }
 
-fn questions_markdown(title: &str, items: &[Question]) -> String {
-    let mut markdown = format!("# Questions: {title}\n\n");
+fn questions_markdown(items: &[Question]) -> String {
+    let mut markdown = "## Open Questions\n\n".to_string();
     if items.is_empty() {
-        markdown.push_str("_No open questions returned._\n");
+        markdown.push_str("_No open questions identified._\n\n");
         return markdown;
     }
 
@@ -644,13 +656,14 @@ fn questions_markdown(title: &str, items: &[Question]) -> String {
         append_detail(&mut markdown, "Context", item.context.as_deref());
         markdown.push('\n');
     }
+    markdown.push('\n');
     markdown
 }
 
-fn followups_markdown(title: &str, items: &[Followup]) -> String {
-    let mut markdown = format!("# Follow-ups: {title}\n\n");
+fn followups_markdown(items: &[Followup]) -> String {
+    let mut markdown = "## Follow-ups\n\n".to_string();
     if items.is_empty() {
-        markdown.push_str("_No follow-ups returned._\n");
+        markdown.push_str("_No follow-ups identified._\n\n");
         return markdown;
     }
 
@@ -659,6 +672,7 @@ fn followups_markdown(title: &str, items: &[Followup]) -> String {
         append_detail(&mut markdown, "Reason", item.reason.as_deref());
         markdown.push('\n');
     }
+    markdown.push('\n');
     markdown
 }
 
@@ -674,7 +688,11 @@ fn append_detail(markdown: &mut String, label: &str, value: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_agent_result_json, known_agents, session_timestamp_prefix, title_slug};
+    use super::{
+        extract_agent_result_json, known_agents, meeting_markdown, session_timestamp_prefix,
+        title_slug, ActionItem, AgentMeetingResult, Decision,
+    };
+    use std::fs;
 
     #[test]
     fn extracts_direct_agent_json() {
@@ -723,5 +741,52 @@ mod tests {
             title_slug("Rain, Birthdays and Jersey Mike's Chat"),
             "rain-birthdays-and-jersey-mikes-chat"
         );
+    }
+
+    #[test]
+    fn renders_one_complete_meeting_document() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "recall-meeting-markdown-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(session_dir.join(".recall")).unwrap();
+        fs::write(
+            session_dir.join(".recall/notes.md"),
+            "# Notes\n\n- `00:10` Check the budget\n",
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join(".recall/markers.md"),
+            "# Markers\n\n- `00:20` Marker\n",
+        )
+        .unwrap();
+        let result = AgentMeetingResult {
+            title: Some("Project Sync".to_string()),
+            summary: Some("The team agreed on the launch plan.".to_string()),
+            decisions: vec![Decision {
+                decision: "Launch Friday".to_string(),
+                evidence: None,
+                timestamp: Some("00:30".to_string()),
+            }],
+            action_items: vec![ActionItem {
+                task: "Publish the checklist".to_string(),
+                owner: Some("Sam".to_string()),
+                due: None,
+                evidence: None,
+                timestamp: None,
+            }],
+            ..AgentMeetingResult::default()
+        };
+
+        let markdown = meeting_markdown(&session_dir, "Project Sync", &result).unwrap();
+        assert!(markdown.contains("## Summary"));
+        assert!(markdown.contains("## Decisions"));
+        assert!(markdown.contains("Launch Friday"));
+        assert!(markdown.contains("## Action Items"));
+        assert!(markdown.contains("Publish the checklist"));
+        assert!(markdown.contains("Check the budget"));
+        assert!(markdown.contains("[Transcript](transcript.md)"));
+
+        let _ = fs::remove_dir_all(session_dir);
     }
 }

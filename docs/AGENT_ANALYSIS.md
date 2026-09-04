@@ -1,6 +1,6 @@
 # Agent Analysis
 
-Recall can pass the clean `transcript.md` to a headless CLI agent and write structured meeting memory files.
+Recall can pass the clean `transcript.md` to a headless CLI agent and write one complete meeting record.
 
 This is optional. Recording and local transcription still work without an agent.
 
@@ -59,7 +59,7 @@ Flow:
 3. Recall finalizes audio.
 4. Recall transcribes locally.
 5. Recall runs the selected agent.
-6. Recall writes summary/action files.
+6. Recall writes `meeting.md` with the summary, decisions, actions, questions, follow-ups, notes, and markers.
 
 If another recording starts before analysis finishes, the previous session keeps processing in the background. Agent results are written back to that session folder and do not retarget the active recording.
 
@@ -137,18 +137,14 @@ recall --agent grok --no-auto-analyze
 Analysis writes:
 
 ```text
-summary.md
-actions.md
-decisions.md
-questions.md
-followups.md
-analysis-debug/
+meeting.md
+.recall/analysis/
   prompt.md
   agent-raw-output.json or agent-raw-output.jsonl
   agent-result.json
 ```
 
-`transcript.md` is the clean source of truth. Agents are instructed not to use `transcription-debug/` unless explicitly asked.
+`meeting.md` is the primary human-facing result. `transcript.md` is the clean source of truth and remains separate so long meetings do not make the meeting record unwieldy. Agents are instructed not to use `.recall/transcription/` unless explicitly asked.
 
 ## JSON Contract
 
@@ -165,7 +161,7 @@ Recall asks agents to return one JSON object:
 }
 ```
 
-Recall keeps control of file layout. It parses the agent response, saves the raw output under `analysis-debug/`, stores normalized JSON as `agent-result.json`, renames generic session folders such as `quick-capture` when the agent returns a useful title, updates session metadata/headings, and renders Markdown files from that normalized result.
+Recall keeps control of file layout. It parses the agent response, saves raw and normalized output under `.recall/analysis/`, renames generic session folders such as `quick-capture` when the agent returns a useful title, updates session metadata/headings, and renders `meeting.md` from that normalized result.
 
 ## Current Limits
 

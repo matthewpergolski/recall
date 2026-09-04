@@ -6,6 +6,7 @@ mod session;
 mod system_recorder;
 mod transcription;
 mod tui;
+mod update;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -13,12 +14,16 @@ use std::path::{Path, PathBuf};
 use analysis::{analyze, known_agents, AnalyzeOptions, AnalyzeTarget};
 use capture_sources::{detect_sources, probe_audio_tap};
 use config::{config_path, RecallConfig};
-use session::{default_storage_dir, list_sessions, start_session, ConsentMode, StartOptions};
+use session::{
+    default_storage_dir, export_session, latest_session, list_sessions, primary_document_path,
+    start_session, ConsentMode, StartOptions,
+};
 use transcription::{
     transcribe_with_progress, TrackSelection, TranscribeOptions, TranscribeTarget,
     TranscriptionProgress,
 };
 use tui::TuiOptions;
+use update::{update, UpdateOptions};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -40,11 +45,14 @@ fn main() {
         Some("start") => run_start(args.collect(), &tui_defaults),
         Some("list") => run_list(args.collect(), &tui_defaults),
         Some("show") => run_show(args.collect(), &tui_defaults),
+        Some("open") => run_open(args.collect(), &tui_defaults),
+        Some("export") => run_export(args.collect(), &tui_defaults),
         Some("sources") => run_sources(),
         Some("audio-tap-probe") => run_audio_tap_probe(),
         Some("transcribe") => run_transcribe(args.collect(), &tui_defaults),
         Some("analyze") => run_analyze(args.collect(), &tui_defaults),
         Some("agents") => run_agents(args.collect()),
+        Some("update") => run_update(args.collect()),
         Some("doctor") => print_doctor(),
         Some("spec") => print_spec_hint(),
         Some("-h") | Some("--help") | Some("help") => print_help(),
@@ -72,11 +80,14 @@ USAGE:
     recall start --title "Design Sync"    Create a local session folder
     recall list                           List local sessions
     recall show latest                    Show the latest session path
+    recall open latest                    Open the latest meeting document
+    recall export latest                  Build one portable Markdown export
     recall sources                        List detected app and microphone sources
     recall audio-tap-probe                Probe CoreAudio process-tap availability
     recall transcribe latest              Transcribe the newest session locally
     recall analyze latest --agent grok    Generate summary/actions with an agent
     recall agents list                    List supported headless agent profiles
+    recall update                         Safely update and reinstall Recall
     recall doctor                         Check local development prerequisites
     recall spec                           Show where the product spec lives
 
@@ -115,10 +126,33 @@ TUI ANALYSIS OPTIONS:
     --no-auto-analyze                     Disable analysis after transcription
     --preset <name>                       Analysis prompt preset
 
-NEXT MILESTONE:
-    Add local transcription, then generate summaries and actions
-    from transcript text."#
+EXPORT OPTIONS:
+    recall export latest [options]
+    recall export <session-path> [options]
+    --output <path>                       Output path, default: meeting-export.md in session
+    --storage <path>                      Storage directory for latest lookup
+
+UPDATE OPTIONS:
+    recall update [--repo <path>]
+    --repo <path>                         Explicit Recall source checkout"#
     );
+}
+
+fn run_update(args: Vec<String>) {
+    let config = RecallConfig::load();
+    let options = match UpdateOptions::parse(args, config.source_dir) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("{message}");
+            eprintln!("Usage: recall update [--repo <path>]");
+            std::process::exit(2);
+        }
+    };
+
+    if let Err(error) = update(&options) {
+        eprintln!("Recall update failed: {error}");
+        std::process::exit(1);
+    }
 }
 
 fn run_tui_with_options(options: TuiOptions) {
@@ -367,6 +401,111 @@ fn run_show(args: Vec<String>, tui_defaults: &TuiOptions) {
         Err(error) => {
             eprintln!("Failed to show latest session: {error}");
             std::process::exit(1);
+        }
+    }
+}
+
+fn run_open(args: Vec<String>, tui_defaults: &TuiOptions) {
+    let (session_path, _) = match parse_session_document_args(args, tui_defaults, false) {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+    let document_path = primary_document_path(&session_path);
+    if !document_path.exists() {
+        eprintln!("No meeting document found in {}", session_path.display());
+        std::process::exit(1);
+    }
+
+    match std::process::Command::new("open")
+        .arg(&document_path)
+        .status()
+    {
+        Ok(status) if status.success() => println!("Opened {}", document_path.display()),
+        Ok(status) => {
+            eprintln!("Failed to open {} ({status})", document_path.display());
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("Failed to open {}: {error}", document_path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_export(args: Vec<String>, tui_defaults: &TuiOptions) {
+    let (session_path, output_path) = match parse_session_document_args(args, tui_defaults, true) {
+        Ok(value) => value,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
+    match export_session(&session_path, output_path.as_deref()) {
+        Ok(path) => println!("Recall export written to {}", path.display()),
+        Err(error) => {
+            eprintln!("Export failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_session_document_args(
+    args: Vec<String>,
+    tui_defaults: &TuiOptions,
+    allow_output: bool,
+) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let mut target = None;
+    let mut storage_dir = tui_defaults.storage_dir.clone();
+    let mut output_path = None;
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "latest" => {
+                if target.is_some() {
+                    return Err("Only one session target is allowed.".to_string());
+                }
+                target = Some(None);
+            }
+            "--storage" => {
+                storage_dir = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--storage requires a value".to_string())?,
+                ));
+            }
+            "--output" if allow_output => {
+                output_path = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--output requires a value".to_string())?,
+                ));
+            }
+            value if value.starts_with("--") => {
+                return Err(format!("Unknown option: {value}"));
+            }
+            path => {
+                if target.is_some() {
+                    return Err("Only one session target is allowed.".to_string());
+                }
+                target = Some(Some(PathBuf::from(path)));
+            }
+        }
+    }
+
+    match target.unwrap_or(None) {
+        Some(path) => Ok((path, output_path)),
+        None => {
+            let storage_dir =
+                storage_dir
+                    .unwrap_or(default_storage_dir().map_err(|error| {
+                        format!("Failed to resolve storage directory: {error}")
+                    })?);
+            latest_session(&storage_dir)
+                .map(|path| (path, output_path))
+                .map_err(|error| error.to_string())
         }
     }
 }

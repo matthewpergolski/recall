@@ -15,7 +15,7 @@ Recall should feel polished and calm, with a Claude Code-style terminal interfac
 5. User confirms sources and marks consent as obtained.
 6. Recall records microphone and call audio locally.
 7. User ends the session.
-8. Recall saves audio, metadata, transcript-ready files, and notes.
+8. Recall saves audio, a clean transcript, one complete meeting document, and internal supporting artifacts.
 
 ## v0 Features
 
@@ -24,6 +24,9 @@ Recall should feel polished and calm, with a Claude Code-style terminal interfac
 - Start session command
 - List sessions command
 - Show latest session command
+- Open latest meeting command
+- Portable single-file Markdown export command
+- Safe source-checkout update and reinstall command
 - Visible recording state
 - Consent metadata field
 - Source picker shell
@@ -70,27 +73,26 @@ Recall should feel polished and calm, with a Claude Code-style terminal interfac
 ```text
 sessions/
   05-26-2026_7-21pm-et-design-sync/
-    recall.json
+    meeting.md
+    transcript.md
     audio/
       mic.m4a
       call.m4a
-    transcript.md
-    summary.md
-    actions.md
-    decisions.md
-    questions.md
-    followups.md
-    markers.md
-    notes.md
-    transcription-debug/
-      combined-timeline.md
-      raw-tracks.md
-      full-debug-transcript.md
-    analysis-debug/
-      prompt.md
-      agent-raw-output.json or agent-raw-output.jsonl
-      agent-result.json
+    .recall/
+      metadata.json
+      markers.md
+      notes.md
+      transcription/
+        combined-timeline.md
+        raw-tracks.md
+        full-debug-transcript.md
+      analysis/
+        prompt.md
+        agent-raw-output.json or agent-raw-output.jsonl
+        agent-result.json
 ```
+
+`meeting.md` is the primary human-facing artifact. `transcript.md` remains separate because it may be very large. `.recall/` retains metadata, capture notes, structured agent results, and diagnostics. Older expanded session layouts remain readable for compatibility.
 
 ## Metadata Sketch
 
