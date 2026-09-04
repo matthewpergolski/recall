@@ -8,6 +8,7 @@ use std::process::{Command, Output};
 use crate::config::expand_path;
 
 const RECALL_REMOTE: &str = "github.com/matthewpergolski/recall";
+const BUILD_COMMIT: &str = env!("RECALL_BUILD_COMMIT");
 
 #[derive(Debug, Clone)]
 pub struct UpdateOptions {
@@ -44,38 +45,64 @@ impl UpdateOptions {
 
 pub fn update(options: &UpdateOptions) -> io::Result<()> {
     let checkout = discover_checkout(options)?;
-    let details = validate_checkout(&checkout)?;
+    validate_checkout(&checkout)?;
     ensure_clean(&checkout)?;
     ensure_update_branch(&checkout)?;
 
-    let previous_commit = git_output(&checkout, &["rev-parse", "--short", "HEAD"])?;
-
-    println!("Recall update");
-    println!("  Checkout: {}", checkout.display());
-    println!("  Remote: {}", details.remote);
-    println!("  Current commit: {previous_commit}");
-    println!();
-
-    run_step(
-        "Pulling origin/main (fast-forward only)",
-        Command::new("git")
-            .arg("-C")
-            .arg(&checkout)
-            .args(["pull", "--ff-only", "origin", "main"]),
+    let previous_commit = git_output(&checkout, &["rev-parse", "HEAD"])?;
+    run_quiet_command(
+        Command::new("git").arg("-C").arg(&checkout).args([
+            "fetch",
+            "--quiet",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ]),
+        "fetch origin/main",
     )?;
+    let remote_commit = git_output(&checkout, &["rev-parse", "refs/remotes/origin/main"])?;
+
+    if previous_commit == remote_commit && build_matches(&previous_commit, BUILD_COMMIT) {
+        println!("Already up to date ({}).", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    if previous_commit != remote_commit {
+        run_quiet_command(
+            Command::new("git").arg("-C").arg(&checkout).args([
+                "merge",
+                "--ff-only",
+                "--quiet",
+                "refs/remotes/origin/main",
+            ]),
+            "fast-forward to origin/main",
+        )?;
+    }
+
     validate_checkout(&checkout)?;
     ensure_clean(&checkout)?;
     ensure_at_origin_main(&checkout)?;
-    run_step(
-        "Running Rust tests",
+
+    let current_commit = git_output(&checkout, &["rev-parse", "HEAD"])?;
+    if previous_commit == current_commit {
+        println!("Refreshing Recall {}...", env!("CARGO_PKG_VERSION"));
+    } else {
+        println!(
+            "Updating Recall {} -> {}...",
+            short_commit(&previous_commit),
+            short_commit(&current_commit)
+        );
+    }
+
+    run_quiet_step(
+        "Tests",
         Command::new("cargo")
             .arg("test")
             .arg("--locked")
             .arg("--manifest-path")
             .arg(checkout.join("Cargo.toml")),
     )?;
-    run_step(
-        "Building the macOS capture helper",
+    run_quiet_step(
+        "Capture helper",
         Command::new("swift")
             .arg("build")
             .arg("--package-path")
@@ -83,8 +110,8 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     )?;
     ensure_clean(&checkout)?;
     ensure_at_origin_main(&checkout)?;
-    run_step(
-        "Installing the Recall command",
+    run_quiet_step(
+        "Install",
         Command::new("cargo")
             .arg("install")
             .arg("--path")
@@ -93,12 +120,14 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             .arg("--force"),
     )?;
 
-    let current_commit = git_output(&checkout, &["rev-parse", "--short", "HEAD"])?;
-    println!();
     if previous_commit == current_commit {
-        println!("Recall was already current and has been reinstalled.");
+        println!("Recall refreshed ({}).", env!("CARGO_PKG_VERSION"));
     } else {
-        println!("Recall updated from {previous_commit} to {current_commit}.");
+        println!(
+            "Recall updated to {} ({}).",
+            env!("CARGO_PKG_VERSION"),
+            short_commit(&current_commit)
+        );
     }
 
     Ok(())
@@ -172,12 +201,7 @@ fn require_checkout(path: &Path, source: &str) -> io::Result<PathBuf> {
     canonical_path(path)
 }
 
-#[derive(Debug)]
-struct CheckoutDetails {
-    remote: String,
-}
-
-fn validate_checkout(path: &Path) -> io::Result<CheckoutDetails> {
+fn validate_checkout(path: &Path) -> io::Result<()> {
     if !path.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -235,7 +259,7 @@ fn validate_checkout(path: &Path) -> io::Result<CheckoutDetails> {
         ));
     }
 
-    Ok(CheckoutDetails { remote })
+    Ok(())
 }
 
 fn ensure_clean(checkout: &Path) -> io::Result<()> {
@@ -306,25 +330,44 @@ fn command_output(command: &mut Command, description: &str) -> io::Result<Output
         return Ok(output);
     }
 
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(io::Error::other(if stderr.is_empty() {
-        format!("Failed to {description} ({})", output.status)
-    } else {
-        format!("Failed to {description}: {stderr}")
-    }))
+    let details = match (stderr.is_empty(), stdout.is_empty()) {
+        (false, false) => format!("{stderr}\n{stdout}"),
+        (false, true) => stderr,
+        (true, false) => stdout,
+        (true, true) => output.status.to_string(),
+    };
+    Err(io::Error::other(format!(
+        "Failed to {description}: {details}"
+    )))
 }
 
-fn run_step(label: &str, command: &mut Command) -> io::Result<()> {
-    println!("==> {label}");
+fn run_quiet_command(command: &mut Command, description: &str) -> io::Result<()> {
+    command_output(command, description).map(|_| ())
+}
+
+fn run_quiet_step(label: &str, command: &mut Command) -> io::Result<()> {
+    print!("  {label}... ");
     io::stdout().flush()?;
-    let status = command.status().map_err(|error| {
-        io::Error::new(error.kind(), format!("Could not run '{label}': {error}"))
-    })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("{label} failed ({status})")))
+    match run_quiet_command(command, label) {
+        Ok(()) => {
+            println!("done");
+            Ok(())
+        }
+        Err(error) => {
+            println!("failed");
+            Err(error)
+        }
     }
+}
+
+fn build_matches(source_commit: &str, build_commit: &str) -> bool {
+    build_commit != "unknown" && source_commit == build_commit
+}
+
+fn short_commit(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
 }
 
 fn canonical_path(path: &Path) -> io::Result<PathBuf> {
@@ -391,8 +434,8 @@ fn normalized_remote(remote: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        deduplicate_paths, ensure_at_origin_main, ensure_clean, normalized_remote,
-        validate_checkout, UpdateOptions, RECALL_REMOTE,
+        build_matches, deduplicate_paths, ensure_at_origin_main, ensure_clean, normalized_remote,
+        short_commit, validate_checkout, UpdateOptions, RECALL_REMOTE,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -511,15 +554,25 @@ mod tests {
     }
 
     #[test]
+    fn skips_install_only_when_binary_and_source_commits_match() {
+        let commit = "231cef6f6ff98638943ed5df694d3199c3ee07f1";
+
+        assert!(build_matches(commit, commit));
+        assert!(!build_matches(commit, "unknown"));
+        assert!(!build_matches(commit, "different"));
+    }
+
+    #[test]
+    fn formats_short_commits_without_assuming_the_input_length() {
+        assert_eq!(short_commit("231cef6f6ff9"), "231cef6");
+        assert_eq!(short_commit("abc"), "abc");
+    }
+
+    #[test]
     fn validates_an_official_recall_checkout() {
         let fixture = CheckoutFixture::new();
 
-        let details = validate_checkout(&fixture.path).unwrap();
-
-        assert_eq!(
-            details.remote,
-            "https://github.com/matthewpergolski/recall.git"
-        );
+        assert!(validate_checkout(&fixture.path).is_ok());
     }
 
     #[test]

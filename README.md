@@ -89,7 +89,7 @@ After this first installation, update the source checkout and installed command 
 recall update
 ```
 
-Recall locates its verified source checkout, refuses dirty or non-`main` branches, pulls `origin/main` with fast-forward-only behavior, runs the Rust tests, builds the Swift helper, and reinstalls the command. Use `recall update --repo /path/to/recall` if automatic discovery cannot find the checkout.
+Recall locates its verified source checkout and checks `origin/main`. If the checkout and installed executable already match, it exits with one short message. When an update exists, it fast-forwards safely, runs the Rust tests, builds the Swift helper, and reinstalls the command with compact progress output. Use `recall update --repo /path/to/recall` if automatic discovery cannot find the checkout.
 
 ## Transcription Setup
 

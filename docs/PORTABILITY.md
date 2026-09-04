@@ -127,7 +127,7 @@ To select a checkout explicitly:
 recall update --repo /path/to/recall
 ```
 
-The command pulls with `git pull --ff-only`, runs the Rust tests, builds the Swift helper, and replaces the installed Cargo binary. It refuses to modify a dirty checkout and never resets or stashes changes.
+The command quietly fetches `origin/main`. If both the checkout and installed executable are current, it exits without rebuilding. Otherwise it fast-forwards, runs the Rust tests, builds the Swift helper, and replaces the installed Cargo binary using compact progress output. It refuses to modify a dirty checkout and never resets or stashes changes.
 
 ## Session Output
 
