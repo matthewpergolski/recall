@@ -19,7 +19,7 @@
 - Combined transcript timeline across call and mic tracks.
 - Initial clean conversation timeline with conservative mic-bleed dedupe.
 - Summary-ready `transcript.md` now contains only the clean transcript.
-- Raw combined/per-track transcript material moved to `transcription-debug/`.
+- Raw combined/per-track transcript material moved to `.recall/transcription/`.
 - Automatic TUI transcription after ending a session, with progress/status display.
 - Headless agent analysis command: `recall analyze latest --agent <name>`.
 - Mic input device-change detection and TUI warnings for early mic recorder exits.
@@ -30,6 +30,11 @@
 - Agent-generated session titles replace generic "Quick Capture" headings and folder slugs after analysis.
 - Memory bank and repo agent instructions are in place.
 - Portability docs and first-session testing docs are in place.
+- Session roots now present one complete `meeting.md`, one clean `transcript.md`, and `audio/`.
+- Metadata, notes, markers, agent output, and diagnostics are organized under `.recall/`.
+- `recall open latest` opens the primary meeting record.
+- `recall export latest` creates a portable meeting-plus-transcript Markdown file on demand.
+- `recall update` safely discovers, verifies, updates, tests, and reinstalls a clean official checkout.
 
 ## Current Focus
 
@@ -44,7 +49,6 @@
 - Consider a stricter "prefer call on overlap" transcript merge mode.
 - Investigate macOS voice-processing / echo-cancellation input for microphone capture.
 - Add automatic mic recorder restart and segmented mic stitching after route changes.
-- Persist TUI markers and notes into session files.
 - Validate real agent outputs from Grok/Cline/Claude/Codex and tune JSON extraction as needed.
 - Improve generated summary/action prompts after transcript quality is reliable.
 
@@ -57,7 +61,7 @@ The free-first path should be:
 1. Convert or feed captured audio into a local transcription backend.
 2. Write timestamped text into `transcript.md`.
 3. Preserve links from transcript timestamps back to source audio.
-4. Generate `summary.md` and `actions.md` from the transcript.
+4. Generate one complete `meeting.md` from the transcript.
 
 Likely local transcription options:
 

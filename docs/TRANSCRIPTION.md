@@ -23,7 +23,7 @@ sessions/<session-id>/transcript.md
 Debug and audit artifacts are written separately:
 
 ```text
-sessions/<session-id>/transcription-debug/
+sessions/<session-id>/.recall/transcription/
   combined-timeline.md
   raw-tracks.md
   full-debug-transcript.md
@@ -36,7 +36,7 @@ The debug files include:
 - the microphone transcript section
 - a full debug transcript containing clean, combined, and raw track sections
 
-The clean conversation timeline is not full speaker diarization. It starts from the combined timestamped segments, suppresses likely duplicate mic segments, and trims obvious call-audio phrases from mixed mic segments. The raw combined timeline is kept in `transcription-debug/` for audit/debugging.
+The clean conversation timeline is not full speaker diarization. It starts from the combined timestamped segments, suppresses likely duplicate mic segments, and trims obvious call-audio phrases from mixed mic segments. The raw combined timeline is kept in `.recall/transcription/` for audit/debugging.
 
 ## Multi-Hour Calls
 
@@ -151,11 +151,11 @@ End-state behavior should be:
 2. Recall finalizes `audio/mic.m4a` and `audio/call.m4a`.
 3. Recall automatically starts transcription.
 4. Recall writes `transcript.md`.
-5. If auto-analysis is enabled, Recall runs the selected headless agent and writes summary/action files from the transcript.
+5. If auto-analysis is enabled, Recall runs the selected headless agent and writes one complete `meeting.md` from the transcript.
 
 ## Agent Analysis
 
-Recall can pass the clean `transcript.md` to a headless CLI agent and write structured meeting memory files.
+Recall can pass the clean `transcript.md` to a headless CLI agent and write one complete meeting record.
 
 Manual analysis:
 
@@ -213,12 +213,8 @@ chunk_seconds = 600
 Analysis outputs:
 
 ```text
-summary.md
-actions.md
-decisions.md
-questions.md
-followups.md
-analysis-debug/
+meeting.md
+.recall/analysis/
   prompt.md
   agent-raw-output.json or agent-raw-output.jsonl
   agent-result.json
@@ -304,6 +300,6 @@ Recall records two files:
 - `audio/call.m4a`: meeting/app/system audio
 - `audio/mic.m4a`: local microphone
 
-Recall transcribes both tracks separately, then writes a clean merged `transcript.md` for normal use. The separate per-track transcripts are kept in `transcription-debug/raw-tracks.md`.
+Recall transcribes both tracks separately, then writes a clean merged `transcript.md` for normal use. The separate per-track transcripts are kept in `.recall/transcription/raw-tracks.md`.
 
 This preserves source separation while still giving future summarization code one obvious input file. Later work can add stronger speaker labels.

@@ -5,7 +5,7 @@
 ```sh
 git clone https://github.com/matthewpergolski/recall.git
 cd recall
-cargo install --path .
+cargo install --path . --locked
 ```
 
 Or run without installing:
@@ -94,6 +94,8 @@ cargo run -- --title "Project sync"
 cargo run -- start --title "Design Sync" --consent verbal
 cargo run -- list
 cargo run -- show latest
+cargo run -- open latest
+cargo run -- export latest
 cargo run -- sources
 cargo run -- audio-tap-probe
 cargo run -- transcribe latest
@@ -110,16 +112,37 @@ recall --title "Project sync"
 recall start --title "Design Sync" --consent verbal
 recall list
 recall show latest
+recall open latest
+recall export latest
 recall sources
 recall audio-tap-probe
 recall transcribe latest
+recall update
 ```
 
 Install the local binary:
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
 ```
+
+## Updating An Installed Checkout
+
+After the initial clone and install, run this from any directory:
+
+```sh
+recall update
+```
+
+The updater uses the checkout embedded in the installed binary, then falls back to `RECALL_REPO`, configured `source_dir`, the current directory, and common source-code locations. It verifies the official Git remote, requires a clean `main` branch tracking `origin/main`, pulls with `--ff-only`, runs Rust tests, builds the Swift helper, and reinstalls `recall`.
+
+If the checkout moved or Recall finds more than one valid clone, identify it explicitly:
+
+```sh
+recall update --repo ~/Projects/recall
+```
+
+Recall never resets, stashes, or discards local changes during an update.
 
 Optional shell shortcut:
 
@@ -142,6 +165,7 @@ Example persistent config:
 ```toml
 consent_default = "provided"
 storage_dir = "~/Documents/Recall/sessions"
+source_dir = "~/Projects/recall"
 
 [analysis]
 default_agent = "grok"

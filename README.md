@@ -23,8 +23,9 @@ Recall is usable as a macOS prototype:
 - automatic transcription after ending a TUI session
 - clean timestamped transcript for summary input
 - debug transcript artifacts for raw timelines and per-track text
-- optional headless agent analysis for summaries/actions
-- typed TUI notes and timestamped markers written into session files
+- optional headless agent analysis that produces one complete `meeting.md`
+- typed TUI notes and timestamped markers retained with session internals
+- one-command meeting opening and portable Markdown export
 - configurable storage and transcription binary/model paths
 
 Still in progress:
@@ -65,7 +66,7 @@ cd recall
 Install the local `recall` command:
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
 ```
 
 Or run from the repo without installing:
@@ -81,6 +82,14 @@ recall doctor
 recall sources
 recall audio-tap-probe
 ```
+
+After this first installation, update the source checkout and installed command from any directory:
+
+```sh
+recall update
+```
+
+Recall locates its verified source checkout, refuses dirty or non-`main` branches, pulls `origin/main` with fast-forward-only behavior, runs the Rust tests, builds the Swift helper, and reinstalls the command. Use `recall update --repo /path/to/recall` if automatic discovery cannot find the checkout.
 
 ## Transcription Setup
 
@@ -146,7 +155,7 @@ recall transcribe latest
 
 ## Agent Analysis
 
-Recall can hand the clean `transcript.md` to a headless coding agent and write summary/action files.
+Recall can hand the clean `transcript.md` to a headless coding agent and write one complete `meeting.md` containing the summary, decisions, action items, questions, follow-ups, notes, and markers.
 
 See [docs/AGENT_ANALYSIS.md](docs/AGENT_ANALYSIS.md) for all setup modes: CLI flags, alias, and config defaults.
 
@@ -182,12 +191,8 @@ recall --agent grok
 Outputs:
 
 ```text
-summary.md
-actions.md
-decisions.md
-questions.md
-followups.md
-analysis-debug/
+meeting.md
+.recall/analysis/
   prompt.md
   agent-raw-output.json or agent-raw-output.jsonl
   agent-result.json
@@ -205,6 +210,7 @@ Optional config file:
 # ~/.config/recall/config.toml
 consent_default = "provided"
 storage_dir = "~/Documents/Recall/sessions"
+source_dir = "~/Projects/recall"
 
 [analysis]
 default_agent = "grok"
@@ -224,10 +230,17 @@ For long recordings, Recall chunks each audio track before transcription. The de
 recall transcribe latest --chunk-seconds 600
 ```
 
-Open the latest session folder:
+Open the latest meeting document:
 
 ```sh
-open "$(recall show latest)"
+recall open latest
+```
+
+Create one portable Markdown file containing the meeting record and full transcript:
+
+```sh
+recall export latest
+recall export latest --output ~/Desktop/project-sync.md
 ```
 
 ## TUI Keys
@@ -236,8 +249,8 @@ open "$(recall show latest)"
 - `Space` or `Enter`: start recording when idle; end and finalize when recording
 - transcript progress starts after recording ends
 - `r`: refresh detected sources
-- `m`: add timestamped marker to `markers.md`
-- `n`: type a timestamped note, then `Enter` saves it to `notes.md`
+- `m`: add a timestamped marker to the session
+- `n`: type a timestamped note, then `Enter` saves it with the session
 - `q` or `Ctrl+C`: quit
 
 Pause/resume is intentionally disabled for real recording until segmented audio capture is implemented.
@@ -249,27 +262,26 @@ Recall writes sessions under `sessions/`:
 ```text
 sessions/
   05-26-2026_7-21pm-et-project-sync/
-    recall.json
+    meeting.md
     transcript.md
-    summary.md
-    actions.md
-    decisions.md
-    questions.md
-    followups.md
-    markers.md
-    notes.md
     audio/
       mic.m4a
       call.m4a
-    transcription-debug/
-      combined-timeline.md
-      raw-tracks.md
-      full-debug-transcript.md
-    analysis-debug/
-      prompt.md
-      agent-raw-output.json or agent-raw-output.jsonl
-      agent-result.json
+    .recall/
+      metadata.json
+      markers.md
+      notes.md
+      transcription/
+        combined-timeline.md
+        raw-tracks.md
+        full-debug-transcript.md
+      analysis/
+        prompt.md
+        agent-raw-output.json or agent-raw-output.jsonl
+        agent-result.json
 ```
+
+`meeting.md` is the normal reading view. `transcript.md` is the clean source record. Audio and internal/debug artifacts remain available without crowding the session root. Recall continues to recognize sessions created with the older expanded layout.
 
 `sessions/` is ignored by Git because it contains private meeting data.
 
@@ -280,6 +292,8 @@ recall
 recall --title "Project sync"
 recall list
 recall show latest
+recall open latest
+recall export latest
 recall sources
 recall audio-tap-probe
 recall transcribe latest
@@ -288,6 +302,7 @@ recall transcribe latest --track mic
 recall analyze latest --agent grok
 recall agents list
 recall agents doctor
+recall update
 recall doctor
 ```
 

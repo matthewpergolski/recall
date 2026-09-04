@@ -19,8 +19,8 @@ Implemented:
 - `recall audio-tap-probe` command
 - `recall transcribe latest` command
 - Local `sessions/` folder structure
-- `recall.json` metadata
-- `summary.md`, `actions.md`, and initial `transcript.md` files
+- internal `.recall/metadata.json` metadata
+- consolidated `meeting.md` plus clean `transcript.md`
 - Basic tests for session naming and metadata helpers
 - Swift helper source listing
 - Swift helper microphone recording
@@ -31,6 +31,9 @@ Implemented:
 - automatic TUI transcription after session end
 - headless agent analysis command and TUI auto-analysis option
 - chunked local Whisper transcription with clean primary transcript and debug transcript artifacts
+- compact session roots with internal artifacts organized under `.recall/`
+- `recall open latest` and portable `recall export latest`
+- `recall update` with safe checkout discovery and fast-forward-only Git updates
 
 Not implemented yet:
 

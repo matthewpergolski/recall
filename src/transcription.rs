@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
-
-use crate::session::{default_storage_dir, list_sessions};
+use crate::session::{
+    default_storage_dir, list_sessions, mark_transcript_ready, read_session_title,
+    transcription_dir, transcription_work_dir,
+};
 
 pub const TRANSCRIPTION_CHUNK_SECONDS: u64 = 600;
 
@@ -74,11 +75,6 @@ pub enum TranscriptionProgress {
     Finished {
         transcript_path: PathBuf,
     },
-}
-
-#[derive(Debug, Deserialize)]
-struct RecallMetadata {
-    title: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,7 +157,7 @@ where
     let whisper = resolve_whisper_binary(options)?;
     let model = resolve_model_path(options)?;
     let title = read_session_title(&session_path)?;
-    let work_dir = session_path.join("transcription-work");
+    let work_dir = transcription_work_dir(&session_path);
     fs::create_dir_all(&work_dir)?;
 
     progress(TranscriptionProgress::Started {
@@ -247,7 +243,7 @@ where
     }
 
     let transcript_path = session_path.join("transcript.md");
-    let debug_dir = session_path.join("transcription-debug");
+    let debug_dir = transcription_dir(&session_path);
     write_transcription_outputs(
         &transcript_path,
         &debug_dir,
@@ -256,6 +252,7 @@ where
         &segments,
         &sections,
     )?;
+    mark_transcript_ready(&session_path)?;
 
     progress(TranscriptionProgress::Finished {
         transcript_path: transcript_path.clone(),
@@ -604,16 +601,6 @@ fn path_with_added_extension(path: &Path, extension: &str) -> PathBuf {
     value.push(".");
     value.push(extension);
     PathBuf::from(value)
-}
-
-fn read_session_title(session_path: &Path) -> io::Result<String> {
-    let metadata_path = session_path.join("recall.json");
-    let metadata = fs::read_to_string(metadata_path)?;
-    let metadata =
-        serde_json::from_str::<RecallMetadata>(&metadata).unwrap_or(RecallMetadata { title: None });
-    Ok(metadata
-        .title
-        .unwrap_or_else(|| "Recall Session".to_string()))
 }
 
 fn write_transcription_outputs(

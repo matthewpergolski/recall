@@ -82,6 +82,12 @@ swift run recall-capture list-sources
 
 In sandboxed Codex sessions, SwiftPM may need elevated execution because it uses normal macOS sandbox/cache paths.
 
+## Installed Command
+
+Source edits do not automatically replace the user's installed `~/.cargo/bin/recall` command. Do not install, commit, push, or run the networked updater unless the user requests it.
+
+For a clean end-user checkout after approved changes have been pushed, `recall update` verifies and updates `origin/main`, runs tests, builds the Swift helper, and reinstalls the command. During active development in a dirty checkout, verify normally and use `cargo install --path . --locked` only when the user asks to refresh the installed binary.
+
 ## Skills
 
 Codex skills are reusable capabilities installed outside this repo, commonly under the user's Codex skills directory. They are not the same thing as `AGENTS.md` and do not belong in `.agents/` by default.

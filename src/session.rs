@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use time::{Duration, Month, OffsetDateTime, Weekday};
 
+pub const INTERNAL_DIR: &str = ".recall";
+
 #[derive(Debug, Clone)]
 pub struct StartOptions {
     pub title: String,
@@ -77,6 +79,7 @@ pub fn start_session(options: &StartOptions) -> io::Result<Session> {
         .to_string();
 
     fs::create_dir_all(path.join("audio"))?;
+    fs::create_dir_all(path.join(INTERNAL_DIR))?;
 
     let session = Session {
         id,
@@ -100,7 +103,7 @@ pub fn list_sessions(storage_dir: &Path) -> io::Result<Vec<PathBuf>> {
     for entry in fs::read_dir(storage_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() && path.join("recall.json").exists() {
+        if path.is_dir() && metadata_path(&path).exists() {
             let created_at = read_session_created_at_unix(&path).unwrap_or(0);
             sessions.push((created_at, path));
         }
@@ -119,19 +122,20 @@ pub fn default_storage_dir() -> io::Result<PathBuf> {
 }
 
 pub fn append_session_marker(session_path: &Path, elapsed: &str) -> io::Result<()> {
-    append_session_entry(session_path, "markers.md", elapsed, "Marker")
+    append_session_entry(&markers_path(session_path), elapsed, "Marker")?;
+    refresh_meeting_capture_context(session_path)
 }
 
 pub fn append_session_note(session_path: &Path, elapsed: &str, note: &str) -> io::Result<()> {
-    append_session_entry(session_path, "notes.md", elapsed, note)
+    append_session_entry(&notes_path(session_path), elapsed, note)?;
+    refresh_meeting_capture_context(session_path)
 }
 
 fn write_session_files(session: &Session) -> io::Result<()> {
-    fs::write(session.path.join("recall.json"), session_json(session))?;
-    fs::write(session.path.join("summary.md"), summary_markdown(session))?;
-    fs::write(session.path.join("actions.md"), actions_markdown(session))?;
-    fs::write(session.path.join("markers.md"), markers_markdown(session))?;
-    fs::write(session.path.join("notes.md"), notes_markdown(session))?;
+    fs::write(metadata_path(&session.path), session_json(session))?;
+    fs::write(session.path.join("meeting.md"), meeting_markdown(session))?;
+    fs::write(markers_path(&session.path), markers_markdown(session))?;
+    fs::write(notes_path(&session.path), notes_markdown(session))?;
     fs::write(
         session.path.join("transcript.md"),
         transcript_markdown(session),
@@ -139,21 +143,19 @@ fn write_session_files(session: &Session) -> io::Result<()> {
     Ok(())
 }
 
-fn append_session_entry(
-    session_path: &Path,
-    file_name: &str,
-    elapsed: &str,
-    text: &str,
-) -> io::Result<()> {
+fn append_session_entry(path: &Path, elapsed: &str, text: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(session_path.join(file_name))?;
+        .open(path)?;
     writeln!(file, "- `{}` {}", elapsed, text)
 }
 
 fn read_session_created_at_unix(session_path: &Path) -> Option<u64> {
-    let metadata = fs::read_to_string(session_path.join("recall.json")).ok()?;
+    let metadata = fs::read_to_string(metadata_path(session_path)).ok()?;
     let value = serde_json::from_str::<Value>(&metadata).ok()?;
     value.get("created_at_unix")?.as_u64()
 }
@@ -173,11 +175,12 @@ fn session_json(session: &Session) -> String {
     "call_audio": null
   }},
   "files": {{
-    "summary": "summary.md",
-    "actions": "actions.md",
+    "meeting": "meeting.md",
     "transcript": "transcript.md",
-    "markers": "markers.md",
-    "notes": "notes.md",
+    "markers": ".recall/markers.md",
+    "notes": ".recall/notes.md",
+    "analysis": ".recall/analysis",
+    "transcription": ".recall/transcription",
     "audio_dir": "audio"
   }}
 }}
@@ -189,18 +192,11 @@ fn session_json(session: &Session) -> String {
     )
 }
 
-fn summary_markdown(session: &Session) -> String {
+fn meeting_markdown(session: &Session) -> String {
     format!(
-        "# {}\n\nStatus: initialized\nConsent: {}\n\n## Summary\n\nPending audio capture and transcription.\n\n## Decisions\n\n- Pending\n\n## Questions\n\n- Pending\n",
+        "# {}\n\n> Status: Awaiting capture and transcription  \n> Consent: {}\n\n## Summary\n\n_Pending transcription and analysis._\n\n## Decisions\n\n_None identified yet._\n\n## Action Items\n\n_None identified yet._\n\n## Open Questions\n\n_None identified yet._\n\n## Follow-ups\n\n_None identified yet._\n\n## Notes and Markers\n\n_No notes or markers captured yet._\n\n## Source Material\n\n- [Transcript](transcript.md)\n- [Microphone audio](audio/mic.m4a)\n- [System audio](audio/call.m4a)\n",
         session.title,
         session.consent.as_str()
-    )
-}
-
-fn actions_markdown(session: &Session) -> String {
-    format!(
-        "# Action Items: {}\n\n- [ ] Pending audio capture and transcription\n",
-        session.title
     )
 }
 
@@ -223,6 +219,222 @@ fn transcript_markdown(session: &Session) -> String {
         "# Transcript: {}\n\nTranscript will appear here after audio capture and transcription are wired in.\n",
         session.title
     )
+}
+
+pub fn internal_dir(session_path: &Path) -> PathBuf {
+    session_path.join(INTERNAL_DIR)
+}
+
+pub fn metadata_path(session_path: &Path) -> PathBuf {
+    prefer_current_or_legacy(
+        &internal_dir(session_path).join("metadata.json"),
+        &session_path.join("recall.json"),
+    )
+}
+
+pub fn markers_path(session_path: &Path) -> PathBuf {
+    prefer_current_or_legacy(
+        &internal_dir(session_path).join("markers.md"),
+        &session_path.join("markers.md"),
+    )
+}
+
+pub fn notes_path(session_path: &Path) -> PathBuf {
+    prefer_current_or_legacy(
+        &internal_dir(session_path).join("notes.md"),
+        &session_path.join("notes.md"),
+    )
+}
+
+pub fn analysis_dir(session_path: &Path) -> PathBuf {
+    internal_dir(session_path).join("analysis")
+}
+
+pub fn transcription_dir(session_path: &Path) -> PathBuf {
+    internal_dir(session_path).join("transcription")
+}
+
+pub fn transcription_work_dir(session_path: &Path) -> PathBuf {
+    internal_dir(session_path).join("work/transcription")
+}
+
+pub fn state_dir(session_path: &Path) -> PathBuf {
+    internal_dir(session_path).join("state")
+}
+
+pub fn primary_document_path(session_path: &Path) -> PathBuf {
+    for file_name in ["meeting.md", "summary.md", "transcript.md"] {
+        let path = session_path.join(file_name);
+        if path.exists() {
+            return path;
+        }
+    }
+    session_path.join("meeting.md")
+}
+
+pub fn read_session_title(session_path: &Path) -> io::Result<String> {
+    let metadata = fs::read_to_string(metadata_path(session_path))?;
+    let value = serde_json::from_str::<Value>(&metadata)?;
+    Ok(value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("Recall Session")
+        .to_string())
+}
+
+pub fn latest_session(storage_dir: &Path) -> io::Result<PathBuf> {
+    list_sessions(storage_dir)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("No Recall sessions found in {}", storage_dir.display()),
+            )
+        })
+}
+
+pub fn export_session(session_path: &Path, output_path: Option<&Path>) -> io::Result<PathBuf> {
+    let meeting_path = primary_document_path(session_path);
+    if !meeting_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Missing meeting document at {}", meeting_path.display()),
+        ));
+    }
+
+    let transcript_path = session_path.join("transcript.md");
+    if !transcript_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Missing transcript at {}", transcript_path.display()),
+        ));
+    }
+
+    let meeting = meeting_content_for_export(session_path, &meeting_path)?;
+    let transcript = fs::read_to_string(&transcript_path)?;
+    let meeting = meeting
+        .split_once("\n## Source Material\n")
+        .map(|(content, _)| content)
+        .unwrap_or(meeting.as_str());
+    let transcript_body = transcript
+        .split_once('\n')
+        .map(|(_, body)| body.trim_start())
+        .unwrap_or(transcript.as_str());
+    let export = format!(
+        "{}\n\n> Exported by Recall. Audio remains in the original local session.\n\n---\n\n# Full Transcript\n\n{}",
+        meeting.trim_end(),
+        transcript_body
+    );
+
+    let output_path = output_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| session_path.join("meeting-export.md"));
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&output_path, export)?;
+    Ok(output_path)
+}
+
+pub fn mark_transcript_ready(session_path: &Path) -> io::Result<()> {
+    let meeting_path = session_path.join("meeting.md");
+    if !meeting_path.exists() {
+        return Ok(());
+    }
+
+    let meeting = fs::read_to_string(&meeting_path)?;
+    let meeting = meeting
+        .replace(
+            "> Status: Awaiting capture and transcription",
+            "> Status: Transcript ready; analysis pending",
+        )
+        .replace(
+            "_Pending transcription and analysis._",
+            "_Transcript ready. Run agent analysis to generate meeting notes._",
+        );
+    fs::write(meeting_path, meeting)
+}
+
+fn refresh_meeting_capture_context(session_path: &Path) -> io::Result<()> {
+    let meeting_path = session_path.join("meeting.md");
+    if !meeting_path.exists() {
+        return Ok(());
+    }
+
+    let meeting = fs::read_to_string(&meeting_path)?;
+    let Some((before, remainder)) = meeting.split_once("## Notes and Markers\n") else {
+        return Ok(());
+    };
+    let Some((_, after)) = remainder.split_once("## Source Material\n") else {
+        return Ok(());
+    };
+
+    let notes = session_entries(&notes_path(session_path))?;
+    let markers = session_entries(&markers_path(session_path))?;
+    let mut context = String::from("## Notes and Markers\n\n");
+    append_entry_section(&mut context, "Notes", &notes);
+    append_entry_section(&mut context, "Markers", &markers);
+    let updated = format!("{before}{context}## Source Material\n{after}");
+    fs::write(meeting_path, updated)
+}
+
+fn session_entries(path: &Path) -> io::Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("- `"))
+        .map(str::to_string)
+        .collect())
+}
+
+fn append_entry_section(output: &mut String, heading: &str, entries: &[String]) {
+    output.push_str(&format!("### {heading}\n\n"));
+    if entries.is_empty() {
+        output.push_str("_None captured._\n\n");
+    } else {
+        output.push_str(&entries.join("\n"));
+        output.push_str("\n\n");
+    }
+}
+
+fn prefer_current_or_legacy(current: &Path, legacy: &Path) -> PathBuf {
+    if current.exists() || !legacy.exists() {
+        current.to_path_buf()
+    } else {
+        legacy.to_path_buf()
+    }
+}
+
+fn meeting_content_for_export(session_path: &Path, meeting_path: &Path) -> io::Result<String> {
+    if meeting_path
+        .file_name()
+        .is_some_and(|name| name == "meeting.md")
+    {
+        return fs::read_to_string(meeting_path);
+    }
+
+    let mut sections = Vec::new();
+    for file_name in [
+        "summary.md",
+        "actions.md",
+        "decisions.md",
+        "questions.md",
+        "followups.md",
+        "notes.md",
+        "markers.md",
+    ] {
+        let path = session_path.join(file_name);
+        if path.exists() {
+            sections.push(fs::read_to_string(path)?);
+        }
+    }
+    Ok(sections.join("\n\n"))
 }
 
 fn unix_timestamp() -> u64 {
@@ -356,7 +568,8 @@ fn escape_json(value: &str) -> String {
 mod tests {
     use super::{
         append_session_marker, append_session_note, eastern_offset_hours, escape_json,
-        list_sessions, readable_eastern_timestamp_for, slugify, ConsentMode,
+        export_session, list_sessions, mark_transcript_ready, readable_eastern_timestamp_for,
+        slugify, start_session, ConsentMode, StartOptions,
     };
     use std::fs;
     use time::{Date, Month};
@@ -456,11 +669,137 @@ mod tests {
         append_session_marker(&session_dir, "00:42").unwrap();
         append_session_note(&session_dir, "00:43", "Follow up on budget").unwrap();
 
-        let markers = fs::read_to_string(session_dir.join("markers.md")).unwrap();
-        let notes = fs::read_to_string(session_dir.join("notes.md")).unwrap();
+        let markers = fs::read_to_string(session_dir.join(".recall/markers.md")).unwrap();
+        let notes = fs::read_to_string(session_dir.join(".recall/notes.md")).unwrap();
 
         assert!(markers.contains("- `00:42` Marker"));
         assert!(notes.contains("- `00:43` Follow up on budget"));
+
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn new_sessions_keep_only_primary_documents_visible() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "recall-session-layout-test-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        let session = start_session(&StartOptions {
+            title: "Layout Test".to_string(),
+            consent: ConsentMode::Noted,
+            storage_dir: storage_dir.clone(),
+        })
+        .unwrap();
+
+        assert!(session.path.join("meeting.md").exists());
+        assert!(session.path.join("transcript.md").exists());
+        assert!(session.path.join("audio").is_dir());
+        assert!(session.path.join(".recall/metadata.json").exists());
+        assert!(session.path.join(".recall/markers.md").exists());
+        assert!(session.path.join(".recall/notes.md").exists());
+        assert!(!session.path.join("summary.md").exists());
+        assert!(!session.path.join("actions.md").exists());
+        assert!(!session.path.join("recall.json").exists());
+
+        append_session_note(&session.path, "00:12", "Capture this detail").unwrap();
+        append_session_marker(&session.path, "00:20").unwrap();
+        let meeting = fs::read_to_string(session.path.join("meeting.md")).unwrap();
+        assert!(meeting.contains("### Notes"));
+        assert!(meeting.contains("Capture this detail"));
+        assert!(meeting.contains("### Markers"));
+        assert!(meeting.contains("`00:20` Marker"));
+
+        mark_transcript_ready(&session.path).unwrap();
+        let meeting = fs::read_to_string(session.path.join("meeting.md")).unwrap();
+        assert!(meeting.contains("Transcript ready; analysis pending"));
+
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn lists_current_and_legacy_session_layouts() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "recall-mixed-layout-test-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        let legacy = storage_dir.join("legacy");
+        let current = storage_dir.join("current");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(current.join(".recall")).unwrap();
+        fs::write(legacy.join("recall.json"), r#"{"created_at_unix": 100}"#).unwrap();
+        fs::write(
+            current.join(".recall/metadata.json"),
+            r#"{"created_at_unix": 200}"#,
+        )
+        .unwrap();
+
+        let sessions = list_sessions(&storage_dir).unwrap();
+        assert_eq!(sessions, vec![current, legacy]);
+
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn exports_meeting_and_transcript_as_one_markdown_file() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "recall-export-test-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("meeting.md"),
+            "# Project Sync\n\n## Summary\n\nDone.",
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("transcript.md"),
+            "# Transcript: Project Sync\n\n## Clean Conversation\n\nHello.",
+        )
+        .unwrap();
+
+        let output = export_session(&session_dir, None).unwrap();
+        let exported = fs::read_to_string(&output).unwrap();
+        assert!(exported.contains("# Project Sync"));
+        assert!(exported.contains("# Full Transcript"));
+        assert!(exported.contains("## Clean Conversation"));
+        assert!(!exported.contains("# Transcript: Project Sync"));
+        assert!(exported.contains("Audio remains in the original local session"));
+
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn export_preserves_split_files_from_legacy_sessions() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "recall-legacy-export-test-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("summary.md"),
+            "# Summary\n\nLaunch planning.",
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("actions.md"),
+            "# Actions\n\n- [ ] Publish the plan",
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("transcript.md"),
+            "# Transcript\n\nThe launch is Friday.",
+        )
+        .unwrap();
+
+        let output = export_session(&session_dir, None).unwrap();
+        let exported = fs::read_to_string(&output).unwrap();
+        assert!(exported.contains("Launch planning."));
+        assert!(exported.contains("Publish the plan"));
+        assert!(exported.contains("The launch is Friday."));
 
         let _ = fs::remove_dir_all(session_dir);
     }
