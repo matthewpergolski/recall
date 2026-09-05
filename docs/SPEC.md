@@ -43,7 +43,7 @@ Recall should feel polished and calm, with a Claude Code-style terminal interfac
 - ScreenCaptureKit fallback path remains available
 - Audio level meters: mic real, call real through CoreAudio tap events
 - Separate local/user track and call/system track where possible: `mic.m4a` and `call.m4a`
-- Manual transcription pipeline: `recall transcribe latest`
+- Manual transcription pipeline: `recall transcribe latest` (default `parakeet-mlx`; `--engine whisper` fallback)
 - Combined timestamped transcript timeline
 - Summary generation
 - Decisions

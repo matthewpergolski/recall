@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::session::ConsentMode;
+use crate::transcription::TranscriptionEngine;
 
 #[derive(Debug, Clone, Default)]
 pub struct RecallConfig {
@@ -23,10 +24,15 @@ pub struct AnalysisConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptionConfig {
+    pub engine: TranscriptionEngine,
     pub ffmpeg_bin: Option<PathBuf>,
     pub whisper_bin: Option<PathBuf>,
     pub model_path: Option<PathBuf>,
+    pub parakeet_bin: Option<PathBuf>,
+    pub parakeet_model: Option<String>,
+    pub parakeet_cache_dir: Option<PathBuf>,
     pub chunk_seconds: Option<u64>,
+    pub invalid_engine: Option<String>,
 }
 
 impl RecallConfig {
@@ -93,6 +99,15 @@ impl RecallConfig {
                 ("analysis", "preset") => {
                     config.analysis.preset = parse_string(value);
                 }
+                ("transcription", "engine") => {
+                    if let Some(raw) = parse_string(value) {
+                        if let Some(engine) = TranscriptionEngine::parse(&raw) {
+                            config.transcription.engine = engine;
+                        } else {
+                            config.transcription.invalid_engine = Some(raw);
+                        }
+                    }
+                }
                 ("transcription", "ffmpeg_bin") => {
                     config.transcription.ffmpeg_bin = parse_string(value).map(expand_path);
                 }
@@ -101,6 +116,15 @@ impl RecallConfig {
                 }
                 ("transcription", "model_path") => {
                     config.transcription.model_path = parse_string(value).map(expand_path);
+                }
+                ("transcription", "parakeet_bin") => {
+                    config.transcription.parakeet_bin = parse_string(value).map(expand_path);
+                }
+                ("transcription", "parakeet_model") => {
+                    config.transcription.parakeet_model = parse_string(value);
+                }
+                ("transcription", "parakeet_cache_dir") => {
+                    config.transcription.parakeet_cache_dir = parse_string(value).map(expand_path);
                 }
                 ("transcription", "chunk_seconds") => {
                     config.transcription.chunk_seconds = value.trim().parse::<u64>().ok();
@@ -160,6 +184,22 @@ pub(crate) fn expand_path(value: String) -> PathBuf {
 mod tests {
     use super::RecallConfig;
     use crate::session::ConsentMode;
+    use crate::transcription::TranscriptionEngine;
+
+    #[test]
+    fn transcription_engine_defaults_to_parakeet() {
+        let config = RecallConfig::parse(
+            r#"
+            [transcription]
+            ffmpeg_bin = "~/tools/ffmpeg"
+            whisper_bin = "~/tools/whisper-cli"
+            "#,
+        );
+
+        assert_eq!(config.transcription.engine, TranscriptionEngine::Parakeet);
+        assert!(config.transcription.parakeet_bin.is_none());
+        assert!(config.transcription.parakeet_model.is_none());
+    }
 
     #[test]
     fn parses_recall_config() {
@@ -176,9 +216,13 @@ mod tests {
             preset = "work"
 
             [transcription]
+            engine = "whisper"
             ffmpeg_bin = "~/tools/ffmpeg"
             whisper_bin = "~/tools/whisper-cli"
             model_path = "~/models/ggml-base.en.bin"
+            parakeet_bin = "parakeet-mlx"
+            parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
+            parakeet_cache_dir = "~/Recall/models/parakeet"
             chunk_seconds = 300
             "#,
         );
@@ -190,9 +234,47 @@ mod tests {
         assert_eq!(config.analysis.default_agent.as_deref(), Some("grok"));
         assert_eq!(config.analysis.auto_analyze, Some(true));
         assert_eq!(config.analysis.preset.as_deref(), Some("work"));
+        assert_eq!(config.transcription.engine, TranscriptionEngine::Whisper);
         assert!(config.transcription.ffmpeg_bin.is_some());
         assert!(config.transcription.whisper_bin.is_some());
         assert!(config.transcription.model_path.is_some());
+        assert!(config.transcription.parakeet_bin.is_some());
+        assert_eq!(
+            config.transcription.parakeet_model.as_deref(),
+            Some("mlx-community/parakeet-tdt-0.6b-v3")
+        );
+        assert!(config.transcription.parakeet_cache_dir.is_some());
         assert_eq!(config.transcription.chunk_seconds, Some(300));
+    }
+
+    #[test]
+    fn parses_parakeet_engine_without_replacing_whisper_paths() {
+        let config = RecallConfig::parse(
+            r#"
+            [transcription]
+            engine = "parakeet"
+            whisper_bin = "~/tools/whisper-cli"
+            model_path = "~/models/ggml-base.en.bin"
+            parakeet_bin = "~/tools/parakeet-mlx"
+            "#,
+        );
+
+        assert_eq!(config.transcription.engine, TranscriptionEngine::Parakeet);
+        assert!(config.transcription.whisper_bin.is_some());
+        assert!(config.transcription.model_path.is_some());
+        assert!(config.transcription.parakeet_bin.is_some());
+    }
+
+    #[test]
+    fn records_invalid_transcription_engine_without_changing_the_default() {
+        let config = RecallConfig::parse(
+            r#"
+            [transcription]
+            engine = "nemo"
+            "#,
+        );
+
+        assert_eq!(config.transcription.engine, TranscriptionEngine::default());
+        assert_eq!(config.transcription.invalid_engine.as_deref(), Some("nemo"));
     }
 }

@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::session::{
     default_storage_dir, list_sessions, mark_transcript_ready, read_session_title,
@@ -12,17 +12,103 @@ use crate::session::{
 };
 
 pub const TRANSCRIPTION_CHUNK_SECONDS: u64 = 600;
+pub const DEFAULT_PARAKEET_BIN: &str = "parakeet-mlx";
+pub const DEFAULT_PARAKEET_MODEL: &str = "mlx-community/parakeet-tdt-0.6b-v3";
+pub const PARAKEET_CHUNK_SECONDS: u64 = 120;
+pub const PARAKEET_OVERLAP_SECONDS: u64 = 15;
+pub const PARAKEET_INSTALL_HINT: &str =
+    "Install with `uv tool install parakeet-mlx`. Whisper fallback: --engine whisper";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptionEngine {
+    Whisper,
+    Parakeet,
+}
+
+impl Default for TranscriptionEngine {
+    fn default() -> Self {
+        default_transcription_engine()
+    }
+}
+
+pub fn default_transcription_engine() -> TranscriptionEngine {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        TranscriptionEngine::Parakeet
+    } else {
+        TranscriptionEngine::Whisper
+    }
+}
+
+impl TranscriptionEngine {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "whisper" => Some(Self::Whisper),
+            "parakeet" => Some(Self::Parakeet),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Whisper => "whisper",
+            Self::Parakeet => "parakeet",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Whisper => "Whisper",
+            Self::Parakeet => "Parakeet",
+        }
+    }
+}
+
+pub fn engine_status_parts(
+    engine: TranscriptionEngine,
+    parakeet_model: Option<&str>,
+    whisper_model: Option<&Path>,
+) -> (String, String) {
+    let model = match engine {
+        TranscriptionEngine::Parakeet => {
+            let env_model = env_parakeet_model();
+            short_model_label(&resolve_parakeet_model_id(
+                parakeet_model,
+                env_model.as_deref(),
+            ))
+        }
+        TranscriptionEngine::Whisper => whisper_model
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "ggml (auto)".to_string()),
+    };
+    (engine.as_str().to_string(), model)
+}
+
+fn short_model_label(model: &str) -> String {
+    model
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(model)
+        .to_string()
+}
 
 #[derive(Debug, Clone)]
 pub struct TranscribeOptions {
     pub target: TranscribeTarget,
     pub track: TrackSelection,
     pub storage_dir: Option<PathBuf>,
+    pub engine: TranscriptionEngine,
     pub ffmpeg_bin: Option<PathBuf>,
     pub model_path: Option<PathBuf>,
     pub whisper_bin: Option<PathBuf>,
+    pub parakeet_bin: Option<PathBuf>,
+    pub parakeet_model: Option<String>,
+    pub parakeet_cache_dir: Option<PathBuf>,
     pub chunk_seconds: u64,
     pub keep_wav: bool,
+    pub require_parakeet: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -57,23 +143,30 @@ pub struct TrackResult {
 pub enum TranscriptionProgress {
     Started {
         session_path: PathBuf,
+        engine: TranscriptionEngine,
+        model: String,
+        note: Option<String>,
     },
     TrackStarted {
         track: &'static str,
         chunks: usize,
+        elapsed_secs: u64,
     },
     ChunkStarted {
         track: &'static str,
         index: usize,
         total: usize,
+        elapsed_secs: u64,
     },
     TrackFinished {
         track: &'static str,
         text_len: usize,
         chunks: usize,
+        elapsed_secs: u64,
     },
     Finished {
         transcript_path: PathBuf,
+        elapsed_secs: u64,
     },
 }
 
@@ -140,6 +233,109 @@ impl Track {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorCheckLevel {
+    Ok,
+    Warn,
+    Miss,
+}
+
+#[derive(Debug, Clone)]
+enum AsrEngine {
+    Whisper {
+        bin: PathBuf,
+        model: PathBuf,
+        fallback_from_parakeet: bool,
+    },
+    Parakeet {
+        bin: PathBuf,
+        model: String,
+        cache_dir: Option<PathBuf>,
+    },
+}
+
+impl AsrEngine {
+    fn kind(&self) -> TranscriptionEngine {
+        match self {
+            Self::Whisper { .. } => TranscriptionEngine::Whisper,
+            Self::Parakeet { .. } => TranscriptionEngine::Parakeet,
+        }
+    }
+
+    fn model_label(&self) -> String {
+        match self {
+            Self::Whisper { model, .. } => model.display().to_string(),
+            Self::Parakeet { model, .. } => model.clone(),
+        }
+    }
+
+    fn fallback_note(&self) -> Option<String> {
+        match self {
+            Self::Whisper {
+                fallback_from_parakeet: true,
+                ..
+            } => Some(format!(
+                "Parakeet CLI missing; falling back to Whisper. {PARAKEET_INSTALL_HINT}"
+            )),
+            _ => None,
+        }
+    }
+
+    fn transcribe_chunk(&self, wav: &Path, output_base: &Path) -> io::Result<()> {
+        match self {
+            Self::Whisper { bin, model, .. } => run_whisper(bin, model, wav, output_base),
+            Self::Parakeet {
+                bin,
+                model,
+                cache_dir,
+            } => {
+                let output_dir = output_base.parent().unwrap_or(Path::new("."));
+                run_parakeet(
+                    bin,
+                    model,
+                    &[wav.to_path_buf()],
+                    output_dir,
+                    cache_dir.as_deref(),
+                )
+            }
+        }
+    }
+
+    fn transcribe_track(&self, chunks: &[AudioChunk]) -> io::Result<()> {
+        match self {
+            Self::Whisper { .. } => Ok(()),
+            Self::Parakeet {
+                bin,
+                model,
+                cache_dir,
+            } => {
+                let Some(first) = chunks.first() else {
+                    return Ok(());
+                };
+                let output_dir = first.output_base.parent().unwrap_or(Path::new("."));
+                let wavs = chunks
+                    .iter()
+                    .map(|chunk| chunk.wav_path.clone())
+                    .collect::<Vec<_>>();
+                run_parakeet(bin, model, &wavs, output_dir, cache_dir.as_deref())
+            }
+        }
+    }
+
+    fn read_text(&self, output_base: &Path, wav: &Path) -> io::Result<String> {
+        match self {
+            Self::Whisper { .. } => {
+                let text = read_whisper_output(output_base, wav)?;
+                Ok(clean_whisper_text_block(&text))
+            }
+            Self::Parakeet { .. } => Ok(clean_whisper_text_block(&read_parakeet_text(
+                output_base,
+                wav,
+            )?)),
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub fn transcribe(options: &TranscribeOptions) -> io::Result<TranscribeResult> {
     transcribe_with_progress(options, |_| {})
@@ -152,16 +348,52 @@ pub fn transcribe_with_progress<F>(
 where
     F: FnMut(TranscriptionProgress),
 {
+    let started = Instant::now();
+    let mut stages: Vec<(String, Duration)> = Vec::new();
+    let mut stage_started = started;
+    let mark_stage =
+        |name: &str, stages: &mut Vec<(String, Duration)>, stage_started: &mut Instant| {
+            let now = Instant::now();
+            stages.push((
+                name.to_string(),
+                now.saturating_duration_since(*stage_started),
+            ));
+            *stage_started = now;
+        };
+    let elapsed_secs = || started.elapsed().as_secs();
+
     let session_path = resolve_session_path(options)?;
     let ffmpeg = resolve_ffmpeg_binary(options)?;
-    let whisper = resolve_whisper_binary(options)?;
-    let model = resolve_model_path(options)?;
+    let engine = resolve_asr_engine(options)?;
     let title = read_session_title(&session_path)?;
     let work_dir = transcription_work_dir(&session_path);
     fs::create_dir_all(&work_dir)?;
+    mark_stage("setup", &mut stages, &mut stage_started);
+
+    let mut start_note = engine.fallback_note();
+    if matches!(engine.kind(), TranscriptionEngine::Parakeet)
+        && !parakeet_model_is_cached(
+            &engine.model_label(),
+            match &engine {
+                AsrEngine::Parakeet { cache_dir, .. } => cache_dir.as_deref(),
+                AsrEngine::Whisper { .. } => None,
+            },
+        )
+    {
+        let download =
+            "Parakeet model is not cached yet; first run may download weights from Hugging Face."
+                .to_string();
+        start_note = Some(match start_note {
+            Some(existing) => format!("{existing} {download}"),
+            None => download,
+        });
+    }
 
     progress(TranscriptionProgress::Started {
         session_path: session_path.clone(),
+        engine: engine.kind(),
+        model: engine.model_label(),
+        note: start_note,
     });
 
     let mut sections = Vec::new();
@@ -178,28 +410,70 @@ where
         cleanup_legacy_track_outputs(&work_dir, track);
         let chunks =
             convert_to_wav_chunks(&ffmpeg, &audio_path, &chunks_dir, options.chunk_seconds)?;
+        mark_stage(
+            &format!("{} ffmpeg", track.label()),
+            &mut stages,
+            &mut stage_started,
+        );
         let mut track_text_parts = Vec::new();
 
         progress(TranscriptionProgress::TrackStarted {
             track: track.label(),
             chunks: chunks.len(),
+            elapsed_secs: elapsed_secs(),
         });
 
-        for (index, chunk) in chunks.iter().enumerate() {
-            progress(TranscriptionProgress::ChunkStarted {
-                track: track.label(),
-                index: index + 1,
-                total: chunks.len(),
-            });
-            run_whisper(&whisper, &model, &chunk.wav_path, &chunk.output_base)?;
-            let text = read_whisper_output(&chunk.output_base, &chunk.wav_path)?;
-            let text = clean_whisper_text_block(&text);
+        match engine.kind() {
+            TranscriptionEngine::Parakeet => {
+                progress(TranscriptionProgress::ChunkStarted {
+                    track: track.label(),
+                    index: 1,
+                    total: chunks.len(),
+                    elapsed_secs: elapsed_secs(),
+                });
+                engine.transcribe_track(&chunks)?;
+                mark_stage(
+                    &format!("{} parakeet-mlx ({} file(s))", track.label(), chunks.len()),
+                    &mut stages,
+                    &mut stage_started,
+                );
+            }
+            TranscriptionEngine::Whisper => {
+                for (index, chunk) in chunks.iter().enumerate() {
+                    progress(TranscriptionProgress::ChunkStarted {
+                        track: track.label(),
+                        index: index + 1,
+                        total: chunks.len(),
+                        elapsed_secs: elapsed_secs(),
+                    });
+                    engine.transcribe_chunk(&chunk.wav_path, &chunk.output_base)?;
+                    mark_stage(
+                        &format!(
+                            "{} whisper chunk {}/{}",
+                            track.label(),
+                            index + 1,
+                            chunks.len()
+                        ),
+                        &mut stages,
+                        &mut stage_started,
+                    );
+                }
+            }
+        }
+
+        for chunk in &chunks {
+            let text = engine.read_text(&chunk.output_base, &chunk.wav_path)?;
             if !text.is_empty() {
                 track_text_parts.push(text);
             }
             segments.extend(
-                read_whisper_segments(&chunk.output_base, track.label(), chunk.start_ms)
-                    .unwrap_or_default(),
+                read_vtt_segments(
+                    &chunk.output_base,
+                    &chunk.wav_path,
+                    track.label(),
+                    chunk.start_ms,
+                )
+                .unwrap_or_default(),
             );
 
             if !options.keep_wav {
@@ -229,6 +503,7 @@ where
             track: track.label(),
             text_len: clean_text.len(),
             chunks: chunks.len(),
+            elapsed_secs: elapsed_secs(),
         });
     }
 
@@ -248,14 +523,24 @@ where
         &transcript_path,
         &debug_dir,
         &title,
-        &model,
+        engine.kind(),
+        &engine.model_label(),
         &segments,
         &sections,
+    )?;
+    mark_stage("write outputs", &mut stages, &mut stage_started);
+    write_transcription_timing(
+        &debug_dir,
+        engine.kind(),
+        &engine.model_label(),
+        &stages,
+        started.elapsed(),
     )?;
     mark_transcript_ready(&session_path)?;
 
     progress(TranscriptionProgress::Finished {
         transcript_path: transcript_path.clone(),
+        elapsed_secs: elapsed_secs(),
     });
 
     Ok(TranscribeResult {
@@ -356,6 +641,184 @@ fn resolve_model_path(options: &TranscribeOptions) -> io::Result<PathBuf> {
             "Missing Whisper model. Put a ggml model at `models/ggml-base.en.bin` or set RECALL_WHISPER_MODEL=/path/to/model.bin.",
         )
     })
+}
+
+fn resolve_asr_engine(options: &TranscribeOptions) -> io::Result<AsrEngine> {
+    match options.engine {
+        TranscriptionEngine::Whisper => Ok(AsrEngine::Whisper {
+            bin: resolve_whisper_binary(options)?,
+            model: resolve_model_path(options)?,
+            fallback_from_parakeet: false,
+        }),
+        TranscriptionEngine::Parakeet => {
+            if let Some(bin) = find_parakeet_binary(options.parakeet_bin.as_deref())
+                .filter(|path| parakeet_binary_is_present(path))
+            {
+                return Ok(AsrEngine::Parakeet {
+                    bin,
+                    model: resolve_parakeet_model(options),
+                    cache_dir: resolve_parakeet_cache_dir(options),
+                });
+            }
+
+            if options.require_parakeet {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "Missing Parakeet CLI (`{DEFAULT_PARAKEET_BIN}`). {PARAKEET_INSTALL_HINT}"
+                    ),
+                ));
+            }
+
+            match (
+                resolve_whisper_binary(options),
+                resolve_model_path(options),
+            ) {
+                (Ok(bin), Ok(model)) => Ok(AsrEngine::Whisper {
+                    bin,
+                    model,
+                    fallback_from_parakeet: true,
+                }),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "Missing Parakeet CLI (`{DEFAULT_PARAKEET_BIN}`) and Whisper is not available either. {PARAKEET_INSTALL_HINT}"
+                    ),
+                )),
+            }
+        }
+    }
+}
+
+pub fn find_parakeet_binary(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return Some(path.to_path_buf());
+    }
+
+    if let Some(path) = env::var_os("RECALL_PARAKEET_BIN").map(PathBuf::from) {
+        return Some(path);
+    }
+
+    find_binary(DEFAULT_PARAKEET_BIN)
+}
+
+pub fn resolve_parakeet_model_id(explicit: Option<&str>, configured: Option<&str>) -> String {
+    if let Some(model) = explicit.filter(|value| !value.trim().is_empty()) {
+        return model.to_string();
+    }
+    if let Some(model) = configured.filter(|value| !value.trim().is_empty()) {
+        return model.to_string();
+    }
+    DEFAULT_PARAKEET_MODEL.to_string()
+}
+
+fn env_parakeet_model() -> Option<String> {
+    env::var("RECALL_PARAKEET_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_parakeet_model(options: &TranscribeOptions) -> String {
+    resolve_parakeet_model_id(
+        options.parakeet_model.as_deref(),
+        env_parakeet_model().as_deref(),
+    )
+}
+
+pub fn resolve_parakeet_cache_dir_for_options(
+    explicit: Option<&Path>,
+    configured: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return Some(path.to_path_buf());
+    }
+    if let Some(path) = env::var_os("RECALL_PARAKEET_CACHE").map(PathBuf::from) {
+        return Some(path);
+    }
+    if let Some(path) = configured {
+        return Some(path.to_path_buf());
+    }
+
+    let local_candidates = [
+        PathBuf::from("models/parakeet"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/parakeet"),
+    ];
+    if let Some(path) = local_candidates.into_iter().find(|path| path.exists()) {
+        return Some(path);
+    }
+
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        let default = home.join("Library/Application Support/recall/models/parakeet");
+        if default.exists() {
+            return Some(default);
+        }
+    }
+
+    None
+}
+
+fn resolve_parakeet_cache_dir(options: &TranscribeOptions) -> Option<PathBuf> {
+    resolve_parakeet_cache_dir_for_options(options.parakeet_cache_dir.as_deref(), None)
+}
+
+pub fn parakeet_binary_doctor_level(
+    explicit: Option<&Path>,
+    selected_engine: TranscriptionEngine,
+) -> DoctorCheckLevel {
+    match find_parakeet_binary(explicit) {
+        Some(path) if parakeet_binary_is_present(&path) => DoctorCheckLevel::Ok,
+        _ if selected_engine == TranscriptionEngine::Parakeet => DoctorCheckLevel::Miss,
+        _ => DoctorCheckLevel::Warn,
+    }
+}
+
+fn parakeet_binary_is_present(path: &Path) -> bool {
+    path.exists()
+        || (path.components().count() == 1 && find_binary(&path.to_string_lossy()).is_some())
+}
+
+pub fn parakeet_model_is_cached(model: &str, cache_dir: Option<&Path>) -> bool {
+    parakeet_model_cache_roots(cache_dir)
+        .into_iter()
+        .any(|root| huggingface_snapshot_present(&root, model))
+}
+
+fn parakeet_model_cache_roots(cache_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(dir) = cache_dir {
+        roots.push(dir.to_path_buf());
+        roots.push(dir.join("hub"));
+    }
+    if let Some(hf_home) = env::var_os("HF_HOME").map(PathBuf::from) {
+        roots.push(hf_home.join("hub"));
+        roots.push(hf_home);
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home.join("Library/Application Support/recall/models/parakeet"));
+        roots.push(home.join(".cache/huggingface/hub"));
+        roots.push(home.join(".cache/huggingface"));
+    }
+    roots
+}
+
+fn huggingface_snapshot_present(root: &Path, model: &str) -> bool {
+    let encoded = format!("models--{}", model.replace('/', "--"));
+    let snapshots = root.join(encoded).join("snapshots");
+    snapshots.is_dir()
+        && fs::read_dir(&snapshots)
+            .map(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    let path = entry.path();
+                    path.is_dir()
+                        && (path.join("config.json").exists()
+                            || path.join("model.safetensors").exists()
+                            || fs::read_dir(&path)
+                                .map(|mut files| files.next().is_some())
+                                .unwrap_or(false))
+                })
+            })
+            .unwrap_or(false)
 }
 
 fn find_required_binary(name: &str, hint: &str) -> io::Result<PathBuf> {
@@ -488,17 +951,130 @@ fn run_whisper_once(
     Ok(status.success())
 }
 
-fn read_whisper_segments(
+fn run_parakeet(
+    parakeet: &Path,
+    model: &str,
+    wavs: &[PathBuf],
+    output_dir: &Path,
+    cache_dir: Option<&Path>,
+) -> io::Result<()> {
+    if wavs.is_empty() {
+        return Ok(());
+    }
+    if let Some(cache_dir) = cache_dir {
+        fs::create_dir_all(cache_dir)?;
+    }
+
+    let mut command = Command::new(parakeet);
+    for wav in wavs {
+        command.arg(wav);
+    }
+    command
+        .arg("--output-format")
+        .arg("vtt")
+        .arg("--output-dir")
+        .arg(output_dir)
+        .arg("--model")
+        .arg(model)
+        .arg("--chunk-duration")
+        .arg(PARAKEET_CHUNK_SECONDS.to_string())
+        .arg("--overlap-duration")
+        .arg(PARAKEET_OVERLAP_SECONDS.to_string())
+        .stdin(Stdio::null());
+
+    if let Some(cache_dir) = cache_dir {
+        command.arg("--cache-dir").arg(cache_dir);
+    }
+
+    let output = command.output().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Missing Parakeet CLI (`{DEFAULT_PARAKEET_BIN}`). {PARAKEET_INSTALL_HINT}"),
+            )
+        } else {
+            error
+        }
+    })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut detail = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if detail.len() > 4_000 {
+        detail.truncate(4_000);
+        detail.push('…');
+    }
+    let labels = wavs
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if detail.is_empty() {
+        Err(io::Error::other(format!(
+            "Parakeet transcription failed for {labels}"
+        )))
+    } else {
+        Err(io::Error::other(format!(
+            "Parakeet transcription failed for {labels}: {detail}"
+        )))
+    }
+}
+
+fn read_vtt_segments(
     output_base: &Path,
+    wav: &Path,
     track: &'static str,
     offset_ms: u64,
 ) -> io::Result<Vec<TranscriptSegment>> {
-    let vtt_path = path_with_added_extension(output_base, "vtt");
-    if !vtt_path.exists() {
+    let Some(vtt_path) = find_vtt_output(output_base, wav) else {
         return Ok(Vec::new());
-    }
+    };
 
     parse_vtt_segments_with_offset(track, &fs::read_to_string(vtt_path)?, offset_ms)
+}
+
+fn read_parakeet_text(output_base: &Path, wav: &Path) -> io::Result<String> {
+    let txt_candidates = [
+        path_with_added_extension(output_base, "txt"),
+        path_with_added_extension(wav, "txt"),
+        wav.with_extension("txt"),
+    ];
+    for candidate in txt_candidates {
+        if candidate.exists() {
+            return fs::read_to_string(candidate);
+        }
+    }
+
+    let Some(vtt_path) = find_vtt_output(output_base, wav) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Parakeet finished but no .vtt output file was found.",
+        ));
+    };
+
+    let segments = parse_vtt_segments_with_offset("parakeet", &fs::read_to_string(vtt_path)?, 0)?;
+    Ok(segments
+        .into_iter()
+        .map(|segment| segment.text)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn find_vtt_output(output_base: &Path, wav: &Path) -> Option<PathBuf> {
+    let candidates = [
+        path_with_added_extension(output_base, "vtt"),
+        wav.with_extension("vtt"),
+        path_with_added_extension(wav, "vtt"),
+    ];
+    candidates.into_iter().find(|path| path.exists())
 }
 
 fn parse_vtt_segments_with_offset(
@@ -523,7 +1099,7 @@ fn parse_vtt_segments_with_offset(
             text_lines.push(lines.next().unwrap_or_default().trim().to_string());
         }
 
-        let text = clean_transcript_text(&text_lines.join(" "));
+        let text = clean_transcript_text(&strip_vtt_markup(&text_lines.join(" ")));
         if !text.is_empty() {
             segments.push(TranscriptSegment {
                 start_ms: start + offset_ms,
@@ -543,6 +1119,20 @@ fn clean_transcript_text(text: &str) -> String {
         clean = stripped.trim_start();
     }
     clean.to_string()
+}
+
+fn strip_vtt_markup(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => stripped.push(ch),
+            _ => {}
+        }
+    }
+    stripped
 }
 
 fn clean_whisper_text_block(text: &str) -> String {
@@ -607,7 +1197,8 @@ fn write_transcription_outputs(
     transcript_path: &Path,
     debug_dir: &Path,
     title: &str,
-    model: &Path,
+    engine: TranscriptionEngine,
+    model_label: &str,
     segments: &[TranscriptSegment],
     sections: &[String],
 ) -> io::Result<()> {
@@ -616,29 +1207,94 @@ fn write_transcription_outputs(
     }
     fs::create_dir_all(debug_dir)?;
 
-    fs::write(transcript_path, transcript_markdown(title, model, segments))?;
+    fs::write(
+        transcript_path,
+        transcript_markdown(title, engine, model_label, segments),
+    )?;
     fs::write(
         debug_dir.join("combined-timeline.md"),
-        combined_timeline_debug_markdown(title, model, segments),
+        combined_timeline_debug_markdown(title, engine, model_label, segments),
     )?;
     fs::write(
         debug_dir.join("raw-tracks.md"),
-        raw_tracks_debug_markdown(title, model, sections),
+        raw_tracks_debug_markdown(title, engine, model_label, sections),
     )?;
     fs::write(
         debug_dir.join("full-debug-transcript.md"),
-        full_debug_transcript_markdown(title, model, segments, sections),
+        full_debug_transcript_markdown(title, engine, model_label, segments, sections),
     )?;
 
     Ok(())
 }
 
-fn transcript_markdown(title: &str, model: &Path, segments: &[TranscriptSegment]) -> String {
+fn write_transcription_timing(
+    debug_dir: &Path,
+    engine: TranscriptionEngine,
+    model_label: &str,
+    stages: &[(String, Duration)],
+    total: Duration,
+) -> io::Result<()> {
+    let mut markdown = format!(
+        "# Transcription timing\n\nEngine: `{}`\nModel: `{model_label}`\n\n",
+        engine.as_str()
+    );
+    for (name, duration) in stages {
+        markdown.push_str(&format!("- {name}: {}\n", format_duration(*duration)));
+    }
+    markdown.push_str(&format!("- total: {}\n", format_duration(total)));
+    fs::write(debug_dir.join("timing.md"), markdown)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis >= 10_000 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        format!("{millis}ms")
+    }
+}
+
+fn transcript_header(engine: TranscriptionEngine, model_label: &str) -> String {
+    let mut header = format!(
+        "Generated by local {} transcription at Unix time {}.\n\nEngine: `{}`\nModel: `{model_label}`",
+        engine.display_name(),
+        unix_timestamp(),
+        engine.as_str(),
+    );
+    if let Some(line) = parakeet_attribution_line(engine, model_label) {
+        header.push('\n');
+        header.push_str(line);
+    }
+    header
+}
+
+fn parakeet_attribution_line(
+    engine: TranscriptionEngine,
+    model_label: &str,
+) -> Option<&'static str> {
+    if !matches!(engine, TranscriptionEngine::Parakeet) {
+        return None;
+    }
+    let id = model_label.trim();
+    if id.contains("parakeet-tdt-0.6b-v3") {
+        Some("Attribution: NVIDIA Parakeet TDT 0.6B v3 (CC-BY-4.0)")
+    } else if id.starts_with("nvidia/parakeet") || id.starts_with("mlx-community/parakeet") {
+        Some("Attribution: NVIDIA Parakeet weights (CC-BY-4.0)")
+    } else {
+        None
+    }
+}
+
+fn transcript_markdown(
+    title: &str,
+    engine: TranscriptionEngine,
+    model_label: &str,
+    segments: &[TranscriptSegment],
+) -> String {
     let clean_timeline = clean_conversation_markdown(segments);
     format!(
-        "# Transcript: {title}\n\nGenerated by local Whisper transcription at Unix time {}.\n\nModel: `{}`\n\n{}",
-        unix_timestamp(),
-        model.display(),
+        "# Transcript: {title}\n\n{}\n\n{}",
+        transcript_header(engine, model_label),
         if clean_timeline.is_empty() {
             "_No clean transcript text returned._\n"
         } else {
@@ -649,38 +1305,42 @@ fn transcript_markdown(title: &str, model: &Path, segments: &[TranscriptSegment]
 
 fn combined_timeline_debug_markdown(
     title: &str,
-    model: &Path,
+    engine: TranscriptionEngine,
+    model_label: &str,
     segments: &[TranscriptSegment],
 ) -> String {
     format!(
-        "# Combined Timeline Debug: {title}\n\nGenerated by local Whisper transcription at Unix time {}.\n\nModel: `{}`\n\n{}",
-        unix_timestamp(),
-        model.display(),
+        "# Combined Timeline Debug: {title}\n\n{}\n\n{}",
+        transcript_header(engine, model_label),
         combined_timeline_markdown(segments)
     )
 }
 
-fn raw_tracks_debug_markdown(title: &str, model: &Path, sections: &[String]) -> String {
+fn raw_tracks_debug_markdown(
+    title: &str,
+    engine: TranscriptionEngine,
+    model_label: &str,
+    sections: &[String],
+) -> String {
     format!(
-        "# Raw Track Transcripts: {title}\n\nGenerated by local Whisper transcription at Unix time {}.\n\nModel: `{}`\n\n{}\n",
-        unix_timestamp(),
-        model.display(),
+        "# Raw Track Transcripts: {title}\n\n{}\n\n{}\n",
+        transcript_header(engine, model_label),
         sections.join("\n")
     )
 }
 
 fn full_debug_transcript_markdown(
     title: &str,
-    model: &Path,
+    engine: TranscriptionEngine,
+    model_label: &str,
     segments: &[TranscriptSegment],
     sections: &[String],
 ) -> String {
     let clean_timeline = clean_conversation_markdown(segments);
     let timeline = combined_timeline_markdown(segments);
     format!(
-        "# Full Debug Transcript: {title}\n\nGenerated by local Whisper transcription at Unix time {}.\n\nModel: `{}`\n\n{}{}{}\n",
-        unix_timestamp(),
-        model.display(),
+        "# Full Debug Transcript: {title}\n\n{}\n\n{}{}{}\n",
+        transcript_header(engine, model_label),
         clean_timeline,
         timeline,
         sections.join("\n")
@@ -724,6 +1384,9 @@ fn clean_conversation_markdown(segments: &[TranscriptSegment]) -> String {
 }
 
 fn clean_conversation_segments(segments: &[TranscriptSegment]) -> (Vec<TranscriptSegment>, usize) {
+    // Thresholds were tuned on Whisper segment sizes. Parakeet sentence cues can
+    // be longer or shorter; re-check mic bleed on a real dual-track call before
+    // tightening.
     let mut sorted = segments.to_vec();
     sorted.sort_by_key(|segment| (segment.start_ms, segment.end_ms, segment.track));
 
@@ -1095,10 +1758,72 @@ fn unix_timestamp() -> u64 {
 mod tests {
     use super::{
         clean_conversation_segments, clean_transcript_text, clean_whisper_text_block,
-        format_timestamp, parse_vtt_segments_with_offset, path_with_added_extension,
-        TrackSelection, TranscriptSegment,
+        format_timestamp, parakeet_binary_doctor_level, parse_vtt_segments_with_offset,
+        path_with_added_extension, resolve_parakeet_model_id, DoctorCheckLevel, TrackSelection,
+        TranscriptSegment, TranscriptionEngine, DEFAULT_PARAKEET_MODEL,
     };
     use std::path::Path;
+    use std::time::Duration;
+
+    #[test]
+    fn engine_status_parts_shorten_model_ids() {
+        let (engine, model) = super::engine_status_parts(TranscriptionEngine::Parakeet, None, None);
+        assert_eq!(engine, "parakeet");
+        assert_eq!(model, "parakeet-tdt-0.6b-v3");
+
+        let (engine, model) = super::engine_status_parts(
+            TranscriptionEngine::Whisper,
+            None,
+            Some(Path::new(
+                "/Users/me/Models/whisper.cpp/ggml-large-v3-turbo.bin",
+            )),
+        );
+        assert_eq!(engine, "whisper");
+        assert_eq!(model, "ggml-large-v3-turbo.bin");
+    }
+
+    #[test]
+    fn parakeet_is_the_default_transcription_engine() {
+        assert_eq!(
+            TranscriptionEngine::default(),
+            TranscriptionEngine::Parakeet
+        );
+        assert_eq!(
+            TranscriptionEngine::parse("whisper"),
+            Some(TranscriptionEngine::Whisper)
+        );
+        assert_eq!(
+            TranscriptionEngine::parse("PARAKEET"),
+            Some(TranscriptionEngine::Parakeet)
+        );
+        assert!(TranscriptionEngine::parse("nemo").is_none());
+        assert_eq!(TranscriptionEngine::Whisper.as_str(), "whisper");
+    }
+
+    #[test]
+    fn parakeet_model_defaults_to_mlx_v3() {
+        assert_eq!(
+            resolve_parakeet_model_id(None, None),
+            DEFAULT_PARAKEET_MODEL
+        );
+        assert_eq!(
+            resolve_parakeet_model_id(Some("mlx-community/custom"), None),
+            "mlx-community/custom"
+        );
+    }
+
+    #[test]
+    fn missing_parakeet_binary_is_a_miss_when_it_is_the_selected_engine() {
+        let missing = Path::new("/definitely-missing-recall-parakeet-mlx");
+        assert_eq!(
+            parakeet_binary_doctor_level(Some(missing), TranscriptionEngine::Parakeet),
+            DoctorCheckLevel::Miss
+        );
+        assert_eq!(
+            parakeet_binary_doctor_level(Some(missing), TranscriptionEngine::Whisper),
+            DoctorCheckLevel::Warn
+        );
+    }
 
     #[test]
     fn parses_track_selection_aliases() {
@@ -1166,8 +1891,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_parakeet_sentence_vtt_with_chunk_offset() {
+        let fixture = "WEBVTT\n\n\
+00:00:00.080 --> 00:00:02.320\n\
+Hello there, this is a test.\n\n\
+00:00:02.400 --> 00:00:04.160\n\
+How are you today?\n";
+        let segments = parse_vtt_segments_with_offset("call", fixture, 600_000).unwrap();
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].start_ms, 600_080);
+        assert_eq!(segments[0].end_ms, 602_320);
+        assert_eq!(segments[0].text, "Hello there, this is a test.");
+        assert_eq!(segments[1].start_ms, 602_400);
+        assert_eq!(segments[1].text, "How are you today?");
+    }
+
+    #[test]
+    fn parses_parakeet_word_highlight_vtt() {
+        let fixture = "WEBVTT\n\n\
+00:00:00.080 --> 00:00:00.280\n\
+<b>Hello</b> there.\n\n\
+00:00:00.280 --> 00:00:00.520\n\
+Hello <b>there.</b>\n";
+        let segments = parse_vtt_segments_with_offset("mic", fixture, 1_000).unwrap();
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].start_ms, 1_080);
+        assert_eq!(segments[0].text, "Hello there.");
+        assert_eq!(segments[1].text, "Hello there.");
+    }
+
+    #[test]
     fn formats_timestamps() {
         assert_eq!(format_timestamp(65_432), "01:05.432");
+        assert_eq!(super::format_duration(Duration::from_millis(250)), "250ms");
+        assert_eq!(super::format_duration(Duration::from_secs(12)), "12.0s");
     }
 
     #[test]
@@ -1340,12 +2099,61 @@ mod tests {
             text: "Clean line.".to_string(),
         }];
 
-        let markdown = super::transcript_markdown("Test", Path::new("models/test.bin"), &segments);
+        let markdown = super::transcript_markdown(
+            "Test",
+            TranscriptionEngine::Whisper,
+            "models/test.bin",
+            &segments,
+        );
 
         assert!(markdown.contains("## Clean Conversation"));
         assert!(markdown.contains("Clean line."));
+        assert!(markdown.contains("Engine: `whisper`"));
+        assert!(markdown.contains("Model: `models/test.bin`"));
         assert!(!markdown.contains("## Combined Timeline"));
         assert!(!markdown.contains("## Call Audio"));
         assert!(!markdown.contains("## Microphone"));
+        assert!(!markdown.contains("CC-BY-4.0"));
+    }
+
+    #[test]
+    fn parakeet_transcript_header_includes_engine_and_attribution() {
+        let segments = vec![TranscriptSegment {
+            start_ms: 1_000,
+            end_ms: 2_000,
+            track: "call",
+            text: "Clean line.".to_string(),
+        }];
+
+        let markdown = super::transcript_markdown(
+            "Test",
+            TranscriptionEngine::Parakeet,
+            DEFAULT_PARAKEET_MODEL,
+            &segments,
+        );
+
+        assert!(markdown.contains("Engine: `parakeet`"));
+        assert!(markdown.contains(DEFAULT_PARAKEET_MODEL));
+        assert!(markdown.contains("NVIDIA Parakeet TDT 0.6B v3 (CC-BY-4.0)"));
+    }
+
+    #[test]
+    fn parakeet_attribution_does_not_pin_v3_for_other_model_ids() {
+        let segments = vec![TranscriptSegment {
+            start_ms: 1_000,
+            end_ms: 2_000,
+            track: "call",
+            text: "Clean line.".to_string(),
+        }];
+
+        let markdown = super::transcript_markdown(
+            "Test",
+            TranscriptionEngine::Parakeet,
+            "acme/custom-asr",
+            &segments,
+        );
+
+        assert!(!markdown.contains("CC-BY-4.0"));
+        assert!(!markdown.contains("NVIDIA Parakeet"));
     }
 }

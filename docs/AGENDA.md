@@ -14,6 +14,7 @@
 - First local smoke test writes both `mic.m4a` and `call.m4a`.
 - Real call test writes valid non-silent `mic.m4a` and `call.m4a`.
 - Local transcription command scaffold: `recall transcribe latest`.
+- Parakeet TDT 0.6B v3 via `parakeet-mlx` is the default transcription engine; Whisper remains a fallback.
 - Transcription docs: `docs/TRANSCRIPTION.md`.
 - Chunked transcription for long recordings.
 - Combined transcript timeline across call and mic tracks.
@@ -55,7 +56,6 @@
 ## Later
 
 - Optional TUI side panel for the live conversation, expandable to the full terminal. Requires live transcription first.
-- Optional NVIDIA Parakeet TDT 0.6B v3 transcription backend beside Whisper, likely via `parakeet-mlx`.
 
 ## Transcription Plan
 
@@ -70,7 +70,8 @@ The free-first path should be:
 
 Likely local transcription options:
 
-- `whisper.cpp`: strong free-first candidate; local model files, no cloud dependency.
+- NVIDIA Parakeet TDT 0.6B v3 via `parakeet-mlx`: default Apple Silicon engine. Install with `uv tool install parakeet-mlx`; `recall update` does not install it.
+- `whisper.cpp`: first-class fallback; local ggml files, no Python dependency.
 - `faster-whisper`: Python-based option; likely more setup and larger runtime dependencies.
 - Apple Speech APIs: local-ish system integration, but behavior and permissions need separate evaluation.
 

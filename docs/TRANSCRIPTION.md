@@ -10,6 +10,8 @@ recall transcribe latest --track call
 recall transcribe latest --track mic
 recall transcribe /path/to/session --track both
 recall transcribe latest --chunk-seconds 600
+recall transcribe latest --engine whisper
+recall transcribe latest --engine parakeet
 ```
 
 The command transcribes existing session audio and writes:
@@ -36,11 +38,11 @@ The debug files include:
 - the microphone transcript section
 - a full debug transcript containing clean, combined, and raw track sections
 
-The clean conversation timeline is not full speaker diarization. It starts from the combined timestamped segments, suppresses likely duplicate mic segments, and trims obvious call-audio phrases from mixed mic segments. The raw combined timeline is kept in `.recall/transcription/` for audit/debugging.
+The clean conversation timeline is not full speaker diarization. It starts from the combined timestamped segments, suppresses likely duplicate mic segments, and trims obvious call-audio phrases from mixed mic segments. The raw combined timeline is kept in `.recall/transcription/` for audit/debugging. Dedupe thresholds were tuned on Whisper segment sizes; Parakeet sentence cues can be longer or shorter, so speaker-bleed output should be checked on a real dual-track call.
 
 ## Multi-Hour Calls
 
-Recall chunks each audio track before sending it to `whisper-cli`. The default chunk size is 600 seconds, or 10 minutes.
+Recall chunks each audio track with `ffmpeg` before sending it to the selected ASR engine. The default engine is Parakeet (`parakeet-mlx`). `--engine whisper` uses `whisper-cli`. The default chunk size is 600 seconds, or 10 minutes.
 
 That means a 2-hour call with both `call.m4a` and `mic.m4a` becomes roughly:
 
@@ -125,9 +127,20 @@ The default documented model, `ggml-base.en.bin`, is fast and convenient, but re
 
 On silent or near-silent call audio, Whisper often invents short polite phrases such as `You` or `Thank you.` Those lines are model hallucinations, not meeting speech. A moving **Call** meter during capture is the check that the call track actually had sound. The current local default on this machine is `ggml-large-v3-turbo.bin`, which is stronger than `base.en` but can still hallucinate on empty audio.
 
-A later transcription option is NVIDIA **Parakeet TDT 0.6B v3** (via `parakeet-mlx` on Apple Silicon). It is smaller than Whisper turbo, often more accurate on English, and much faster, but it is a second engine, not a drop-in ggml file. Keep Whisper as the default until that backend exists.
+Default Apple Silicon backend: NVIDIA **Parakeet TDT 0.6B v3** via `parakeet-mlx`. Whisper/`whisper-cli` remains a first-class fallback. It is a second engine, not a drop-in ggml file.
 
-Before over-tuning merge heuristics, also test a larger local model:
+```sh
+uv tool install parakeet-mlx
+recall transcribe latest
+recall transcribe latest --engine parakeet
+recall transcribe latest --engine whisper
+```
+
+`--engine whisper` is always valid. The default Parakeet path needs `parakeet-mlx` on PATH (or `RECALL_PARAKEET_BIN`) and may download `mlx-community/parakeet-tdt-0.6b-v3` on first run. `recall update` does not install that CLI. Weights are NVIDIA **CC-BY-4.0**; credit NVIDIA / the model in user-facing docs. The `parakeet-mlx` runtime is Apache-2.0. Do not commit model weights.
+
+If the Parakeet binary is missing, the error includes an install hint. Whisper still works with `--engine whisper`.
+
+Before over-tuning merge heuristics, also test a larger local Whisper model:
 
 ```sh
 recall transcribe latest --model models/ggml-small.en.bin
@@ -208,9 +221,12 @@ auto_analyze = true
 preset = "general"
 
 [transcription]
+engine = "parakeet"   # default; fallback: "whisper"
 ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
 whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
 model_path = "~/Documents/Recall/models/ggml-base.en.bin"
+parakeet_bin = "parakeet-mlx"
+parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
 chunk_seconds = 600
 ```
 
@@ -231,6 +247,11 @@ Recall keeps control of file layout. The agent is asked to return one JSON objec
 Recall currently expects:
 
 - `ffmpeg`
+- `parakeet-mlx` on Apple Silicon (default engine)
+- Hugging Face cache of `mlx-community/parakeet-tdt-0.6b-v3` (downloaded on first Parakeet run)
+
+Whisper fallback, still supported:
+
 - `whisper-cli` from `whisper.cpp`
 - a local ggml Whisper model file
 
@@ -284,6 +305,15 @@ If the model is not at `models/ggml-base.en.bin`, set:
 
 ```sh
 export RECALL_WHISPER_MODEL=/path/to/ggml-model.bin
+```
+
+Default Parakeet:
+
+```sh
+uv tool install parakeet-mlx
+export RECALL_PARAKEET_BIN=/path/to/parakeet-mlx   # only if it is not on PATH
+export RECALL_PARAKEET_MODEL=mlx-community/parakeet-tdt-0.6b-v3
+recall transcribe latest
 ```
 
 ## Recommended Model Location

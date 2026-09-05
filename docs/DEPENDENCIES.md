@@ -35,27 +35,41 @@ These are provided by macOS/Xcode. They are not downloaded from Homebrew or Hugg
 
 ## Transcription
 
-Transcription currently needs three things:
+The default transcription engine is Parakeet on Apple Silicon. Whisper remains a first-class fallback.
+
+Default engine (Parakeet):
 
 | Dependency | Purpose | Source |
 | --- | --- | --- |
-| `whisper-cli` | Runs local speech-to-text inference | `whisper.cpp` on GitHub |
-| `ggml` Whisper model | Model weights loaded by `whisper-cli` | Hugging Face `ggerganov/whisper.cpp` |
+| `parakeet-mlx` | Default local speech-to-text CLI | `uv tool install parakeet-mlx` (preferred) or pip; Apache-2.0. Not Homebrew. |
+| `mlx-community/parakeet-tdt-0.6b-v3` | Default Parakeet MLX weights | Hugging Face on first run; NVIDIA **CC-BY-4.0** (credit NVIDIA / the model) |
 | `ffmpeg` | Chunks Recall `.m4a` audio and converts chunks to 16 kHz mono WAV | Homebrew for now, or an approved corporate binary |
 
-`ffmpeg` is a temporary dependency. The intended corporate-friendly direction is to replace it with a Swift/AVFoundation conversion command so transcription only needs `whisper-cli` and a model.
+Fallback engine (Whisper). Still supported, never removed:
+
+| Dependency | Purpose | Source |
+| --- | --- | --- |
+| `whisper-cli` | Fallback local speech-to-text inference (`--engine whisper`) | `whisper.cpp` on GitHub |
+| `ggml` Whisper model | Model weights loaded by `whisper-cli` | Hugging Face `ggerganov/whisper.cpp` |
+
+`ffmpeg` is a temporary dependency. `recall update` does **not** install `parakeet-mlx`, `whisper-cli`, `ffmpeg`, or model weights. It only refreshes the Recall source checkout and the `recall` Cargo binary. Install ASR tools yourself, then keep them.
+
+Missing `parakeet-mlx` does not break `--engine whisper`. `recall doctor` reports a missing Parakeet CLI as a warning. First Parakeet run may download weights; later runs can be offline once the cache is warm. Do not commit model files.
 
 ## Personal Mac Setup With Homebrew
 
 Use this on a personal machine where Homebrew is allowed:
 
 ```sh
-brew install whisper-cpp
+uv tool install parakeet-mlx
+brew install whisper-cpp   # fallback engine only
 mkdir -p models
 curl -L -o models/ggml-base.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 cargo install --path . --locked
 recall transcribe latest
 ```
+
+`uv tool install parakeet-mlx` puts `parakeet-mlx` on PATH. Homebrew is fine for `uv` or `ffmpeg`, but do not expect a `brew install parakeet-mlx` formula. The first `recall transcribe` downloads the MLX model from Hugging Face.
 
 ## No-Brew Corporate Setup
 
@@ -119,6 +133,27 @@ Options for getting `whisper-cli` without Homebrew:
 
 Recall should not assume Homebrew in corporate environments. It should accept explicit paths through `RECALL_WHISPER_BIN` and `RECALL_WHISPER_MODEL`.
 
+## Parakeet (`parakeet-mlx`)
+
+Parakeet is the default engine. Install the CLI yourself; Recall will not install it during `recall update`.
+
+```sh
+uv tool install parakeet-mlx
+# or: pip install parakeet-mlx
+recall transcribe latest
+recall transcribe latest --engine whisper   # fallback
+```
+
+Optional overrides:
+
+```sh
+export RECALL_PARAKEET_BIN=/path/to/parakeet-mlx
+export RECALL_PARAKEET_MODEL=mlx-community/parakeet-tdt-0.6b-v3
+export RECALL_PARAKEET_CACHE="$HOME/Library/Application Support/recall/models/parakeet"
+```
+
+The default model is NVIDIA Parakeet TDT 0.6B v3, converted for MLX. License: **CC-BY-4.0**. Commercial use is allowed with attribution. `recall doctor` and `recall spec` mention this. Weights stay in the Hugging Face cache or a configured Recall cache directory; they are gitignored.
+
 ## Optional Agent Analysis
 
 Agent analysis is optional. Recording and local transcription work without it.
@@ -161,9 +196,12 @@ auto_analyze = true
 preset = "general"
 
 [transcription]
+engine = "parakeet"
 ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
 whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
 model_path = "~/Documents/Recall/models/ggml-base.en.bin"
+parakeet_bin = "parakeet-mlx"
+parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
 chunk_seconds = 600
 ```
 
