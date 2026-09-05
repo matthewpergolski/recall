@@ -104,7 +104,7 @@ pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
     }
     fs::create_dir_all(&debug_dir)?;
 
-    let prompt = analysis_prompt(&transcript_path, &options.preset);
+    let prompt = analysis_prompt(&transcript_path, &options.preset)?;
     let prompt_path = debug_dir.join("prompt.md");
     fs::write(&prompt_path, &prompt)?;
 
@@ -124,13 +124,14 @@ pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "Unknown agent '{}'. Use grok, cline, codex, or claude.",
-                options.agent
+                "Unknown agent '{}'. Use {}.",
+                options.agent,
+                known_agents().join(", ")
             ),
         )
     })?;
 
-    let output = run_agent(&profile, &prompt)?;
+    let output = run_agent(&profile, &prompt, &transcript_path)?;
     let raw_output_path = debug_dir.join(profile.raw_output_file);
     fs::write(&raw_output_path, &output)?;
 
@@ -175,7 +176,7 @@ pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
 }
 
 pub fn known_agents() -> Vec<&'static str> {
-    vec!["grok", "cline", "codex", "claude"]
+    vec!["grok", "cline", "codex", "claude", "opencode", "pi"]
 }
 
 fn resolve_session_path(options: &AnalyzeOptions) -> io::Result<PathBuf> {
@@ -219,17 +220,43 @@ fn agent_profile(agent: &str) -> Option<AgentProfile> {
             args: &["--bare", "-p", "{prompt}", "--output-format", "json"],
             raw_output_file: "agent-raw-output.json",
         }),
+        "opencode" => Some(AgentProfile {
+            command: "opencode",
+            args: &[
+                "run",
+                "--format",
+                "json",
+                "--pure",
+                "--title",
+                "Recall analysis",
+                "--file",
+                "{transcript}",
+                "{prompt}",
+            ],
+            raw_output_file: "agent-raw-output.jsonl",
+        }),
+        "pi" => Some(AgentProfile {
+            command: "pi",
+            args: &["--mode", "json", "--no-session", "{prompt}"],
+            raw_output_file: "agent-raw-output.jsonl",
+        }),
         _ => None,
     }
 }
 
-fn run_agent(profile: &AgentProfile, prompt: &str) -> io::Result<String> {
+fn run_agent(profile: &AgentProfile, prompt: &str, transcript_path: &Path) -> io::Result<String> {
     let mut command = Command::new(profile.command);
     for arg in profile.args {
-        if *arg == "{prompt}" {
-            command.arg(prompt);
-        } else {
-            command.arg(arg);
+        match *arg {
+            "{prompt}" => {
+                command.arg(prompt);
+            }
+            "{transcript}" => {
+                command.arg(transcript_path);
+            }
+            other => {
+                command.arg(other);
+            }
         }
     }
 
@@ -252,18 +279,20 @@ fn run_agent(profile: &AgentProfile, prompt: &str) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn analysis_prompt(transcript_path: &Path, preset: &str) -> String {
-    format!(
+fn analysis_prompt(transcript_path: &Path, preset: &str) -> io::Result<String> {
+    let transcript = fs::read_to_string(transcript_path)?;
+    Ok(format!(
         r#"You are analyzing a Recall meeting transcript.
-
-Read this clean transcript file from disk:
-{transcript}
 
 Preset: {preset}
 
-Use only the clean transcript as the source of truth. Do not use files under .recall/transcription unless explicitly asked.
+Use only the transcript below as the source of truth. Do not browse the filesystem, edit files, or call tools unless required to return the JSON. Return exactly one JSON object and no prose outside JSON.
 
-Return exactly one JSON object and no prose outside JSON. Use this schema:
+--- transcript.md ({transcript_path}) ---
+{transcript}
+--- end transcript ---
+
+Use this schema:
 
 {{
   "summary": "Concise meeting summary.",
@@ -302,9 +331,10 @@ Return exactly one JSON object and no prose outside JSON. Use this schema:
 If a field has no items, return an empty array. Use null when owner, due, evidence, or timestamp is unknown.
 If the transcript title is generic, such as Quick Capture, infer a specific useful title from the conversation.
 "#,
-        transcript = transcript_path.display(),
+        transcript_path = transcript_path.display(),
+        transcript = transcript,
         preset = preset
-    )
+    ))
 }
 
 fn extract_agent_result_json(output: &str) -> Option<Value> {
@@ -326,25 +356,39 @@ fn extract_agent_result_json(output: &str) -> Option<Value> {
         return last_result;
     }
 
-    extract_json_object(output).and_then(|json_text| serde_json::from_str::<Value>(json_text).ok())
+    json_from_text(output).filter(looks_like_meeting_result)
 }
 
 fn find_meeting_result(value: &Value) -> Option<Value> {
+    find_meeting_result_inner(value, 0)
+}
+
+fn find_meeting_result_inner(value: &Value, depth: usize) -> Option<Value> {
+    if depth > 6 {
+        return None;
+    }
+
     if looks_like_meeting_result(value) {
         return Some(value.clone());
     }
 
-    for key in ["result", "content", "message", "text", "output"] {
-        if let Some(candidate) = value.get(key) {
-            if looks_like_meeting_result(candidate) {
-                return Some(candidate.clone());
+    for text in candidate_texts(value) {
+        if let Some(parsed) = json_from_text(&text) {
+            if looks_like_meeting_result(&parsed) {
+                return Some(parsed);
             }
-            if let Some(text) = candidate.as_str() {
-                if let Some(value) = extract_json_object(text)
-                    .and_then(|json_text| serde_json::from_str::<Value>(json_text).ok())
-                {
-                    if looks_like_meeting_result(&value) {
-                        return Some(value);
+        }
+    }
+
+    for key in ["result", "content", "message", "part", "output", "response"] {
+        if let Some(nested) = value.get(key) {
+            if let Some(found) = find_meeting_result_inner(nested, depth + 1) {
+                return Some(found);
+            }
+            if let Some(items) = nested.as_array() {
+                for item in items.iter().rev() {
+                    if let Some(found) = find_meeting_result_inner(item, depth + 1) {
+                        return Some(found);
                     }
                 }
             }
@@ -352,6 +396,44 @@ fn find_meeting_result(value: &Value) -> Option<Value> {
     }
 
     None
+}
+
+fn candidate_texts(value: &Value) -> Vec<String> {
+    let mut texts = Vec::new();
+    push_text(&mut texts, value.as_str());
+    for key in ["text", "content", "result", "output", "response"] {
+        push_text(&mut texts, value.get(key).and_then(Value::as_str));
+    }
+    if let Some(part) = value.get("part") {
+        push_text(&mut texts, part.get("text").and_then(Value::as_str));
+    }
+    if let Some(message) = value.get("message") {
+        push_text(&mut texts, message.get("text").and_then(Value::as_str));
+        if let Some(items) = message.get("content").and_then(Value::as_array) {
+            for item in items {
+                push_text(&mut texts, item.as_str());
+                push_text(&mut texts, item.get("text").and_then(Value::as_str));
+            }
+        }
+    }
+    texts
+}
+
+fn push_text(texts: &mut Vec<String>, value: Option<&str>) {
+    if let Some(text) = value {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            texts.push(trimmed.to_string());
+        }
+    }
+}
+
+fn json_from_text(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Some(value);
+    }
+    extract_json_object(trimmed).and_then(|json_text| serde_json::from_str(json_text).ok())
 }
 
 fn looks_like_meeting_result(value: &Value) -> bool {
@@ -716,11 +798,36 @@ mod tests {
     }
 
     #[test]
+    fn extracts_opencode_text_event_json() {
+        let value = extract_agent_result_json(
+            r#"{"type":"step_start"}
+{"type":"text","timestamp":1,"sessionID":"s1","part":{"type":"text","text":"{\"summary\":\"OpenCode summary\",\"title\":\"Call Notes\",\"decisions\":[],\"action_items\":[],\"questions\":[],\"followups\":[]}"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(value["summary"], "OpenCode summary");
+        assert_eq!(value["title"], "Call Notes");
+    }
+
+    #[test]
+    fn extracts_pi_message_end_json() {
+        let value = extract_agent_result_json(
+            r#"{"type":"session","id":"abc"}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"{\"summary\":\"Pi summary\",\"decisions\":[],\"action_items\":[],\"questions\":[],\"followups\":[]}"}]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(value["summary"], "Pi summary");
+    }
+
+    #[test]
     fn lists_builtin_agents() {
         assert!(known_agents().contains(&"grok"));
         assert!(known_agents().contains(&"cline"));
         assert!(known_agents().contains(&"codex"));
         assert!(known_agents().contains(&"claude"));
+        assert!(known_agents().contains(&"opencode"));
+        assert!(known_agents().contains(&"pi"));
     }
 
     #[test]

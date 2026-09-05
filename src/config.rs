@@ -9,6 +9,7 @@ pub struct RecallConfig {
     pub consent_default: Option<ConsentMode>,
     pub storage_dir: Option<PathBuf>,
     pub source_dir: Option<PathBuf>,
+    pub editor: Option<String>,
     pub analysis: AnalysisConfig,
     pub transcription: TranscriptionConfig,
 }
@@ -79,6 +80,9 @@ impl RecallConfig {
                 }
                 ("", "source_dir") => {
                     config.source_dir = parse_string(value).map(expand_path);
+                }
+                ("", "editor") => {
+                    config.editor = parse_string(value);
                 }
                 ("analysis", "default_agent") => {
                     config.analysis.default_agent = parse_string(value);
@@ -164,6 +168,7 @@ mod tests {
             consent_default = "provided"
             storage_dir = "~/Recall/Sessions"
             source_dir = "~/Projects/recall"
+            editor = "code"
 
             [analysis]
             default_agent = "grok"
@@ -181,6 +186,7 @@ mod tests {
         assert!(matches!(config.consent_default, Some(ConsentMode::Noted)));
         assert!(config.storage_dir.is_some());
         assert!(config.source_dir.is_some());
+        assert_eq!(config.editor.as_deref(), Some("code"));
         assert_eq!(config.analysis.default_agent.as_deref(), Some("grok"));
         assert_eq!(config.analysis.auto_analyze, Some(true));
         assert_eq!(config.analysis.preset.as_deref(), Some("work"));

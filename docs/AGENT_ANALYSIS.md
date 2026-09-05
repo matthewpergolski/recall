@@ -14,6 +14,8 @@ Built-in profiles:
 | Cline | `cline --json <prompt>` | NDJSON |
 | Codex | `codex exec --json <prompt>` | JSON |
 | Claude | `claude --bare -p <prompt> --output-format json` | JSON |
+| OpenCode | `opencode run --format json --pure --title Recall analysis --file <transcript.md> <prompt>` | NDJSON events |
+| Pi | `pi --mode json --no-session <prompt>` | NDJSON events |
 
 Check what is available on your machine:
 
@@ -21,6 +23,16 @@ Check what is available on your machine:
 recall agents list
 recall agents doctor
 ```
+
+OpenCode and Pi are optional extra CLIs. Pi is not required unless you want `--agent pi`.
+
+Install Pi:
+
+```sh
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+```
+
+OpenCode is whatever `opencode` binary is already on your `PATH`. Authenticate it the same way you would for interactive use (`opencode auth login`).
 
 ## Manual Analysis
 
@@ -30,6 +42,8 @@ Run analysis for the newest session:
 recall analyze latest --agent grok
 recall analyze latest --agent cline
 recall analyze latest --agent claude --preset work
+recall analyze latest --agent opencode
+recall analyze latest --agent pi
 ```
 
 Run analysis for a specific session:
@@ -165,6 +179,6 @@ Recall keeps control of file layout. It parses the agent response, saves raw and
 
 ## Current Limits
 
-- Agent parsing is initial and should be validated against real Grok/Cline/Codex/Claude output.
+- Agent parsing is initial and should be validated against real Grok/Cline/Codex/Claude/OpenCode/Pi output.
 - Headless agents may use network services depending on how those tools are configured.
 - Bad transcripts produce bad summaries, so continue to review `transcript.md`.

@@ -131,6 +131,8 @@ If you want Recall to generate a complete `meeting.md`, install and authenticate
 | Cline | `cline` |
 | Codex | `codex` |
 | Claude | `claude` |
+| OpenCode | `opencode` |
+| Pi | `pi` |
 
 Check local availability:
 

@@ -52,6 +52,11 @@
 - Validate real agent outputs from Grok/Cline/Claude/Codex and tune JSON extraction as needed.
 - Improve generated summary/action prompts after transcript quality is reliable.
 
+## Later
+
+- Optional TUI side panel for the live conversation, expandable to the full terminal. Requires live transcription first.
+- Optional NVIDIA Parakeet TDT 0.6B v3 transcription backend beside Whisper, likely via `parakeet-mlx`.
+
 ## Transcription Plan
 
 Prioritize transcript generation before higher-level analysis.

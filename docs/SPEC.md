@@ -53,6 +53,7 @@ Recall should feel polished and calm, with a Claude Code-style terminal interfac
 ## Later Features
 
 - Live transcription
+- Optional TUI side panel for the live conversation, expandable to the full terminal
 - Speaker diarization
 - Search across meetings
 - Obsidian/Apple Notes export

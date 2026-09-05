@@ -6,6 +6,8 @@ Use this runbook to verify that Recall captures both your microphone and call/sy
 
 Use a dedicated terminal app for routine testing, not the VS Code integrated terminal. This keeps macOS capture permissions scoped to the terminal rather than your editor.
 
+Grant **Microphone** and **System Audio Recording Only** permission to the exact launcher you will use. Apple Terminal, Ghostty, VS Code, and Codex are separate permission identities; success in one does not imply success in another. After changing permission, fully quit and reopen that application.
+
 Check the installed command:
 
 ```sh
@@ -18,6 +20,8 @@ Expected:
 
 - `recall sources` lists Teams/Zoom/browser apps and microphones.
 - `recall audio-tap-probe` prints `audio_tap_probe_ok` and `audio_tap_probe_stopped`.
+
+The probe confirms that the CoreAudio tap APIs are available, but it does not prove that an audible signal reaches the recording. Complete the quick system-audio test below and watch the **Call** meter before relying on Recall for a meeting.
 
 ## Teams Test Call
 
@@ -44,8 +48,9 @@ recall --consent provided
 6. Press Space or Enter in Recall to start recording.
 7. In the Teams test call, say a short phrase out loud.
 8. Let Teams play your phrase back.
-9. Press Space or Enter in Recall to end the session and start transcription.
-10. Press `q` to quit Recall.
+9. Confirm that the **Call** meter moves during playback. If it remains at zero, stop and check the launching terminal's **System Audio Recording Only** permission.
+10. Press Space or Enter in Recall to end the session and start transcription.
+11. Press `q` to quit Recall.
 
 The important part is that the test includes both:
 
@@ -69,7 +74,7 @@ To test route-change behavior:
 
 Watch the TUI capture-health line. Recall should show the active/default mic and warn if the mic input changes or the mic recorder stops early.
 
-Current expected behavior: Recall detects and reports the input change, but seamless mic segment restarting/stitching is still future work. If the mic file is shorter than the call file, treat that as a failed route-switch test.
+Verified behavior: Recall detects and reports the input change. The mic file may continue for the rest of the session, or it may end at the switch. If `mic.m4a` is shorter than `call.m4a` after an AirPods switch, that is the route-change failure. If both files last the full session and still have audible speech after the switch, the route change survived. Starting already on AirPods is the more reliable path. Automatic mic restart and stitching are still unimplemented.
 
 ## Alternative Real Call Test
 
@@ -150,8 +155,11 @@ The session passes if:
 
 - `mic.m4a` exists and plays your local microphone.
 - `call.m4a` exists and plays the Teams/Zoom/browser call audio.
+- Recall's **Call** meter moves while known system audio is playing.
 - `mic.m4a` duration is close to the active call duration when you did not intentionally mute or switch away from the mic.
 - Recall does not need VS Code's broad Screen & System Audio Recording permission when launched from a dedicated terminal.
+
+A full-duration `call.m4a` can still contain digital silence when the launcher lacks working system-audio access. File creation and `audio-tap-probe` are therefore necessary checks, but audible playback or a moving **Call** meter is the actual pass condition.
 
 ## Current Gaps
 

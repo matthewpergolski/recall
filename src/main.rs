@@ -15,8 +15,8 @@ use analysis::{analyze, known_agents, AnalyzeOptions, AnalyzeTarget};
 use capture_sources::{detect_sources, probe_audio_tap};
 use config::{config_path, RecallConfig};
 use session::{
-    default_storage_dir, export_session, latest_session, list_sessions, primary_document_path,
-    start_session, ConsentMode, StartOptions,
+    default_storage_dir, export_session, latest_session, list_sessions, open_path,
+    primary_document_path, start_session, ConsentMode, StartOptions,
 };
 use transcription::{
     transcribe_with_progress, TrackSelection, TranscribeOptions, TranscribeTarget,
@@ -81,6 +81,7 @@ USAGE:
     recall list                           List local sessions
     recall show latest                    Show the latest session path
     recall open latest                    Open the latest meeting document
+    recall open latest --dir              Open the latest session folder
     recall export latest                  Build one portable Markdown export
     recall sources                        List detected app and microphone sources
     recall audio-tap-probe                Probe CoreAudio process-tap availability
@@ -110,7 +111,7 @@ TRANSCRIBE OPTIONS:
 ANALYZE OPTIONS:
     recall analyze latest [options]
     recall analyze <session-path> [options]
-    --agent <grok|cline|codex|claude>     Headless agent profile to run
+    --agent <grok|cline|codex|claude|opencode|pi>  Headless agent profile to run
     --preset <general|work|personal>      Analysis prompt preset, default: general
     --storage <path>                      Storage directory for latest lookup
     --dry-run                             Write analysis prompt without running agent
@@ -125,6 +126,14 @@ TUI ANALYSIS OPTIONS:
     --auto-analyze                        Run analysis after transcription
     --no-auto-analyze                     Disable analysis after transcription
     --preset <name>                       Analysis prompt preset
+    --editor <command>                    Editor/app used by TUI o to open the session folder
+
+OPEN OPTIONS:
+    recall open latest [options]
+    recall open <session-path> [options]
+    --dir                                 Open the session folder instead of meeting.md
+    --editor <command>                    Folder opener: code, cursor, zed, or an app name
+    --storage <path>                      Storage directory for latest lookup
 
 EXPORT OPTIONS:
     recall export latest [options]
@@ -406,30 +415,36 @@ fn run_show(args: Vec<String>, tui_defaults: &TuiOptions) {
 }
 
 fn run_open(args: Vec<String>, tui_defaults: &TuiOptions) {
-    let (session_path, _) = match parse_session_document_args(args, tui_defaults, false) {
+    let options = match parse_open_args(args, tui_defaults) {
         Ok(value) => value,
         Err(message) => {
             eprintln!("{message}");
             std::process::exit(2);
         }
     };
-    let document_path = primary_document_path(&session_path);
-    if !document_path.exists() {
-        eprintln!("No meeting document found in {}", session_path.display());
-        std::process::exit(1);
-    }
-
-    match std::process::Command::new("open")
-        .arg(&document_path)
-        .status()
-    {
-        Ok(status) if status.success() => println!("Opened {}", document_path.display()),
-        Ok(status) => {
-            eprintln!("Failed to open {} ({status})", document_path.display());
+    let target_path = if options.open_dir {
+        options.session_path.clone()
+    } else {
+        let document_path = primary_document_path(&options.session_path);
+        if !document_path.exists() {
+            eprintln!(
+                "No meeting document found in {}",
+                options.session_path.display()
+            );
             std::process::exit(1);
         }
+        document_path
+    };
+    let editor = if options.open_dir {
+        options.editor.as_deref()
+    } else {
+        None
+    };
+
+    match open_path(&target_path, editor) {
+        Ok(()) => println!("Opened {}", target_path.display()),
         Err(error) => {
-            eprintln!("Failed to open {}: {error}", document_path.display());
+            eprintln!("Failed to open {}: {error}", target_path.display());
             std::process::exit(1);
         }
     }
@@ -451,6 +466,74 @@ fn run_export(args: Vec<String>, tui_defaults: &TuiOptions) {
             std::process::exit(1);
         }
     }
+}
+
+struct OpenCommandOptions {
+    session_path: PathBuf,
+    open_dir: bool,
+    editor: Option<String>,
+}
+
+fn parse_open_args(
+    args: Vec<String>,
+    tui_defaults: &TuiOptions,
+) -> Result<OpenCommandOptions, String> {
+    let mut target = None;
+    let mut storage_dir = tui_defaults.storage_dir.clone();
+    let mut open_dir = false;
+    let mut editor = tui_defaults.editor.clone();
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "latest" => {
+                if target.is_some() {
+                    return Err("Only one session target is allowed.".to_string());
+                }
+                target = Some(None);
+            }
+            "--dir" | "--folder" => open_dir = true,
+            "--editor" => {
+                editor = Some(
+                    iter.next()
+                        .ok_or_else(|| "--editor requires a value".to_string())?,
+                );
+            }
+            "--storage" => {
+                storage_dir = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--storage requires a value".to_string())?,
+                ));
+            }
+            value if value.starts_with("--") => {
+                return Err(format!("Unknown option: {value}"));
+            }
+            path => {
+                if target.is_some() {
+                    return Err("Only one session target is allowed.".to_string());
+                }
+                target = Some(Some(PathBuf::from(path)));
+            }
+        }
+    }
+
+    let session_path = match target.unwrap_or(None) {
+        Some(path) => path,
+        None => {
+            let storage_dir =
+                storage_dir
+                    .unwrap_or(default_storage_dir().map_err(|error| {
+                        format!("Failed to resolve storage directory: {error}")
+                    })?);
+            latest_session(&storage_dir).map_err(|error| error.to_string())?
+        }
+    };
+
+    Ok(OpenCommandOptions {
+        session_path,
+        open_dir,
+        editor,
+    })
 }
 
 fn parse_session_document_args(
@@ -586,6 +669,12 @@ fn parse_leading_tui_defaults(args: Vec<String>) -> Result<(TuiOptions, Vec<Stri
                     .next()
                     .ok_or_else(|| "--preset requires a value".to_string())?;
             }
+            "--editor" => {
+                options.editor = Some(
+                    iter.next()
+                        .ok_or_else(|| "--editor requires a value".to_string())?,
+                );
+            }
             other => {
                 remainder.push(other.to_string());
                 remainder.extend(iter);
@@ -603,6 +692,10 @@ fn tui_options_from_config(config: &RecallConfig) -> TuiOptions {
         options.consent_noted = !matches!(consent, ConsentMode::NotYet);
     }
     options.storage_dir = config.storage_dir.clone();
+    options.editor = env::var("RECALL_EDITOR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or(config.editor.clone());
     options.ffmpeg_bin = config.transcription.ffmpeg_bin.clone();
     options.whisper_bin = config.transcription.whisper_bin.clone();
     options.model_path = config.transcription.model_path.clone();
@@ -790,9 +883,12 @@ fn parse_analyze_options(
     }
 
     let config = RecallConfig::load();
-    let agent = agent
-        .or(config.analysis.default_agent)
-        .ok_or_else(|| "Missing --agent. Use --agent grok, cline, codex, or claude.".to_string())?;
+    let agent = agent.or(config.analysis.default_agent).ok_or_else(|| {
+        format!(
+            "Missing --agent. Use --agent {}.",
+            known_agents().join(", ")
+        )
+    })?;
     if preset.is_empty() {
         preset = config
             .analysis

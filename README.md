@@ -15,8 +15,8 @@ Recall is usable as a macOS prototype:
 
 - interactive Rust TUI
 - consent-aware session start
-- microphone recording
-- CoreAudio system/call audio recording
+- microphone recording, including AirPods when that is the input at start
+- CoreAudio system/call audio recording when the launching terminal has system-audio permission
 - local session folders
 - local Whisper transcription command
 - chunked local transcription
@@ -28,11 +28,14 @@ Recall is usable as a macOS prototype:
 - one-command meeting opening and portable Markdown export
 - configurable storage and transcription binary/model paths
 
-Still in progress:
+Capture has been verified on real calls and on AirPods. Known limits, not missing tests:
 
-- transcript dedupe tuning when the mic also hears speaker audio
-- real-agent output validation and prompt tuning
-- packaging/distribution
+- macOS permission belongs to the app that launched Recall. Apple Terminal, Ghostty, VS Code, and Codex are separate. A working session in Terminal does not imply Ghostty is granted.
+- Watch the **Call** meter. A full-length `call.m4a` can still be digital silence if the launcher lacks system-audio access.
+- Starting on AirPods records the mic for the whole session. Switching *to* AirPods mid-call is detected in the TUI. The mic file sometimes continues for the rest of the session and sometimes ends at the switch. Recall does not yet restart and stitch mic segments.
+- Speaker-mode meetings can still duplicate remote speech on the mic track; clean-transcript dedupe is conservative.
+
+Still in progress: packaging/distribution, and further transcript-merge tuning for speaker bleed.
 
 ## Requirements
 
@@ -50,7 +53,7 @@ Required for transcription:
 
 Optional for agent analysis:
 
-- one supported headless CLI agent installed and authenticated, such as `grok`, `cline`, `codex`, or `claude`
+- one supported headless CLI agent installed and authenticated, such as `grok`, `cline`, `codex`, `claude`, `opencode`, or `pi`
 
 See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for Homebrew and no-Brew setup paths.
 
@@ -82,6 +85,10 @@ recall doctor
 recall sources
 recall audio-tap-probe
 ```
+
+Before the first recording, grant **Microphone** and **System Audio Recording Only** access to the terminal application that will launch Recall. macOS scopes these permissions to the launcher: Apple Terminal, Ghostty, VS Code, and Codex are separate applications. Permission granted to one does not apply to the others. Fully quit and reopen the launcher after changing its permission.
+
+During a short test, play system audio and confirm that Recall's **Call** meter moves. A created `call.m4a` file does not by itself prove that macOS supplied audible system audio.
 
 After this first installation, update the source checkout and installed command from any directory:
 
@@ -167,6 +174,8 @@ Supported built-in agent profiles:
 - `cline`
 - `codex`
 - `claude`
+- `opencode`
+- `pi`
 
 Run analysis manually:
 
@@ -174,6 +183,8 @@ Run analysis manually:
 recall analyze latest --agent grok
 recall analyze latest --agent cline
 recall analyze latest --agent claude --preset work
+recall analyze latest --agent opencode
+recall analyze latest --agent pi
 ```
 
 Preview the generated prompt without running an agent:
@@ -211,6 +222,7 @@ Optional config file:
 consent_default = "provided"
 storage_dir = "~/Documents/Recall/sessions"
 source_dir = "~/Projects/recall"
+editor = "code"
 
 [analysis]
 default_agent = "grok"
@@ -234,7 +246,11 @@ Open the latest meeting document:
 
 ```sh
 recall open latest
+recall open latest --dir
+recall open latest --dir --editor code
 ```
+
+`recall open latest` opens `meeting.md` in the default macOS handler. `--dir` opens the session folder. Set `editor = "code"` in `~/.config/recall/config.toml`, or `RECALL_EDITOR=code`, to open that folder in VS Code (or `cursor`, `zed`, or an app name such as `"Visual Studio Code"`). Without an editor setting, macOS Finder opens the folder.
 
 Create one portable Markdown file containing the meeting record and full transcript:
 
@@ -251,6 +267,8 @@ recall export latest --output ~/Desktop/project-sync.md
 - `r`: refresh detected sources
 - `m`: add a timestamped marker to the session
 - `n`: type a timestamped note, then `Enter` saves it with the session
+- `o`: open the session folder in Finder or the configured editor
+- `O`: open the meeting document
 - `q` or `Ctrl+C`: quit
 
 Pause/resume is intentionally disabled for real recording until segmented audio capture is implemented.
@@ -293,6 +311,7 @@ recall --title "Project sync"
 recall list
 recall show latest
 recall open latest
+recall open latest --dir
 recall export latest
 recall sources
 recall audio-tap-probe
@@ -300,6 +319,7 @@ recall transcribe latest
 recall transcribe latest --track call
 recall transcribe latest --track mic
 recall analyze latest --agent grok
+recall analyze latest --agent opencode
 recall agents list
 recall agents doctor
 recall update
