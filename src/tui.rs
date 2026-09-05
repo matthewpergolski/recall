@@ -1,5 +1,5 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,7 +11,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::analysis::{analyze, known_agents, AnalyzeOptions, AnalyzeTarget};
+use crate::analysis::{
+    analyze, known_agents, maybe_rename_session_dir_for_title, AnalyzeOptions, AnalyzeTarget,
+};
+use crate::audio::{
+    copy_take1_aliases, prepare_continued_take, write_capture_progress, AudioTrack, CaptureProgress,
+};
 use crate::capture_sources::{detect_sources, SourceSummary};
 use crate::mic_recorder::MicRecorder;
 use crate::session::{
@@ -20,8 +25,9 @@ use crate::session::{
 };
 use crate::system_recorder::SystemRecorder;
 use crate::transcription::{
-    engine_status_parts, transcribe_with_progress, TrackSelection, TranscribeOptions,
-    TranscribeTarget, TranscriptionEngine, TranscriptionProgress, TRANSCRIPTION_CHUNK_SECONDS,
+    engine_status_parts, format_bytes, format_model_download_label, transcribe_with_progress,
+    TrackSelection, TranscribeOptions, TranscribeTarget, TranscriptionEngine,
+    TranscriptionProgress, TRANSCRIPTION_CHUNK_SECONDS,
 };
 
 const TICK_RATE: Duration = Duration::from_millis(100);
@@ -94,7 +100,10 @@ struct App {
     consent_noted: bool,
     tick: u64,
     started_at: Option<Instant>,
+    ended_at: Option<Instant>,
     accumulated: Duration,
+    take_index: u32,
+    completed_take: u32,
     session_path: Option<PathBuf>,
     storage_dir: PathBuf,
     toast: String,
@@ -145,6 +154,7 @@ struct TranscriptionStatus {
 }
 
 struct TranscriptionJob {
+    generation: u32,
     receiver: Receiver<TranscriptionUiEvent>,
 }
 
@@ -152,14 +162,18 @@ struct TranscriptionJob {
 enum TranscriptionUiEvent {
     Progress {
         session_path: PathBuf,
+        generation: u32,
         progress: TranscriptionProgress,
     },
     Complete {
         session_path: PathBuf,
+        generation: u32,
         transcript_path: PathBuf,
+        published: bool,
     },
     Failed {
         session_path: PathBuf,
+        generation: u32,
         message: String,
     },
 }
@@ -174,6 +188,7 @@ struct AnalysisStatus {
 
 struct AnalysisJob {
     session_path: PathBuf,
+    generation: u32,
     receiver: Receiver<AnalysisUiEvent>,
 }
 
@@ -182,11 +197,14 @@ enum AnalysisUiEvent {
     Complete {
         original_session_path: PathBuf,
         session_path: PathBuf,
+        generation: u32,
         meeting_path: PathBuf,
         generated_title: Option<String>,
+        published: bool,
     },
     Failed {
         session_path: PathBuf,
+        generation: u32,
         message: String,
     },
 }
@@ -199,7 +217,10 @@ impl App {
             consent_noted,
             tick: 0,
             started_at: None,
+            ended_at: None,
             accumulated: Duration::ZERO,
+            take_index: 0,
+            completed_take: 0,
             session_path: None,
             storage_dir: options.storage_dir.unwrap_or(default_storage_dir()?),
             toast: if consent_noted {
@@ -319,9 +340,10 @@ impl App {
     }
 
     fn primary_recording_action(&mut self) -> io::Result<()> {
-        match self.state {
-            CaptureState::Ready | CaptureState::Ended => self.start_capture(),
-            CaptureState::Recording => {
+        match next_recording_action(self.state, self.session_path.is_some()) {
+            RecordingAction::StartNew => self.start_capture(),
+            RecordingAction::Continue => self.continue_capture(),
+            RecordingAction::End => {
                 self.end_capture();
                 Ok(())
             }
@@ -368,6 +390,10 @@ impl App {
         self.session_path.as_ref() == Some(session_path)
     }
 
+    fn should_apply_generation(&self, session_path: &PathBuf, generation: u32) -> bool {
+        self.is_current_session(session_path) && generation == self.completed_take
+    }
+
     fn session_label(session_path: &std::path::Path) -> String {
         session_path
             .file_name()
@@ -400,38 +426,29 @@ impl App {
 
         self.session_path = Some(session.path.clone());
         self.started_at = Some(Instant::now());
+        self.ended_at = None;
         self.accumulated = Duration::ZERO;
-        self.system_capture_failed = false;
-        self.system_capture_warning = None;
-        self.mic_capture_warning = None;
-        self.mic_device_label = None;
-        self.mic_device_id = None;
+        self.take_index = 1;
+        self.completed_take = 0;
+        self.reset_capture_health();
+        let _ = write_capture_progress(
+            &session.path,
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 0,
+            },
+        );
 
-        let mut started = Vec::new();
-        let mut failures = Vec::new();
-
-        match MicRecorder::start(&session.path) {
-            Ok(recorder) => {
-                self.mic_recorder = Some(recorder);
-                started.push("mic");
-            }
-            Err(error) => failures.push(format!("mic failed: {error}")),
-        }
-
-        match SystemRecorder::start(&session.path) {
-            Ok(recorder) => {
-                self.system_recorder = Some(recorder);
-                started.push("system audio");
-            }
-            Err(error) => {
-                self.system_capture_failed = true;
-                failures.push(format!("system audio failed: {error}"));
-            }
-        }
+        let (started, failures) = self.start_recorders(
+            &session.path,
+            &AudioTrack::Mic.segment_name(1),
+            &AudioTrack::Call.segment_name(1),
+        );
 
         if started.is_empty() {
             self.state = CaptureState::Ended;
             self.started_at = None;
+            self.ended_at = Some(Instant::now());
             self.toast = format!(
                 "Session created, but capture failed: {}",
                 failures.join("; ")
@@ -446,9 +463,10 @@ impl App {
         }
 
         self.live_notes = vec![
-            "Microphone recording writes audio/mic.m4a.".to_string(),
+            "Microphone recording writes audio/mic-001.m4a.".to_string(),
             "Mic source changes are detected while recording.".to_string(),
-            "System audio capture writes audio/call.m4a via CoreAudio process taps.".to_string(),
+            "System audio capture writes audio/call-001.m4a via CoreAudio process taps."
+                .to_string(),
             "Press Space or Enter to end and start transcription.".to_string(),
         ];
         for failure in failures {
@@ -456,6 +474,108 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn continue_capture(&mut self) -> io::Result<()> {
+        if matches!(self.state, CaptureState::Recording) {
+            self.toast = "Session is already active.".to_string();
+            return Ok(());
+        }
+
+        let Some(session_path) = self.session_path.clone() else {
+            return self.start_capture();
+        };
+
+        if let Some(ended_at) = self.ended_at.take() {
+            self.accumulated += ended_at.elapsed();
+        }
+
+        let continued = prepare_continued_take(&session_path)?;
+        self.take_index = continued.take_index;
+        self.reset_capture_health();
+        let _ = write_capture_progress(
+            &session_path,
+            CaptureProgress {
+                take_count: continued.take_index,
+                completed_take: self.completed_take,
+            },
+        );
+
+        let (started, failures) =
+            self.start_recorders(&session_path, &continued.mic_name, &continued.call_name);
+
+        if started.is_empty() {
+            self.state = CaptureState::Ended;
+            self.ended_at = Some(Instant::now());
+            self.toast = format!("Could not continue this session: {}", failures.join("; "));
+        } else {
+            self.started_at = Some(Instant::now());
+            self.state = CaptureState::Recording;
+            self.reset_analysis_gauge_for_new_take();
+            self.toast = if self.has_background_jobs() {
+                "Continuing this session. Previous transcript still running in the background."
+                    .to_string()
+            } else {
+                "Continuing this session. New audio will append.".to_string()
+            };
+            self.live_notes.push(
+                "Continuing this session (audio appends; clock includes the break).".to_string(),
+            );
+            self.live_notes.push(format!(
+                "Take {} writes audio/{} and audio/{}.",
+                continued.take_index, continued.mic_name, continued.call_name
+            ));
+        }
+        for failure in failures {
+            self.live_notes.push(failure);
+        }
+
+        Ok(())
+    }
+
+    fn reset_analysis_gauge_for_new_take(&mut self) {
+        if self.analysis_jobs.is_empty() {
+            self.analysis_status = AnalysisStatus::idle();
+        }
+    }
+
+    fn reset_capture_health(&mut self) {
+        self.system_capture_failed = false;
+        self.system_capture_warning = None;
+        self.mic_capture_warning = None;
+        self.mic_device_label = None;
+        self.mic_device_id = None;
+    }
+
+    fn start_recorders(
+        &mut self,
+        session_path: &Path,
+        mic_name: &str,
+        call_name: &str,
+    ) -> (Vec<&'static str>, Vec<String>) {
+        let mut started = Vec::new();
+        let mut failures = Vec::new();
+
+        match MicRecorder::start(session_path, mic_name) {
+            Ok(recorder) => {
+                self.mic_recorder = Some(recorder);
+                started.push("mic");
+            }
+            Err(error) => failures.push(format!("mic failed: {error}")),
+        }
+
+        match SystemRecorder::start(session_path, call_name) {
+            Ok(recorder) => {
+                self.system_recorder = Some(recorder);
+                started.push("system audio");
+            }
+            Err(error) => {
+                self.system_capture_failed = true;
+                failures.push(format!("system audio failed: {error}"));
+            }
+        }
+
+        (started, failures)
     }
 
     fn toggle_consent(&mut self) {
@@ -474,7 +594,34 @@ impl App {
                     self.accumulated += started_at.elapsed();
                 }
                 self.stop_recorders();
+                self.ended_at = Some(Instant::now());
                 self.state = CaptureState::Ended;
+                self.completed_take = self.take_index.max(1);
+                self.live_notes
+                    .retain(|note| !note.contains("Press Space or Enter to end"));
+                self.live_notes
+                    .push("Audio finalized. Space or Enter continues this session.".to_string());
+                self.live_notes
+                    .push("q leaves (next start is a new session).".to_string());
+                if let Some(session_path) = &self.session_path {
+                    if let Err(error) = write_capture_progress(
+                        session_path,
+                        CaptureProgress {
+                            take_count: self.take_index.max(1),
+                            completed_take: self.completed_take,
+                        },
+                    ) {
+                        self.toast = format!(
+                            "Take {} ended, but Recall could not save take state: {error}",
+                            self.completed_take
+                        );
+                        self.live_notes.push(self.toast.clone());
+                        return;
+                    }
+                    if self.completed_take == 1 {
+                        let _ = copy_take1_aliases(session_path);
+                    }
+                }
                 self.start_transcription_job();
             }
             _ => {
@@ -822,15 +969,26 @@ impl App {
             self.toast = "Session ended, but no session path was available.".to_string();
             return;
         };
+        let generation = self.completed_take.max(1);
 
         let (sender, receiver) = mpsc::channel();
-        self.transcription_jobs.push(TranscriptionJob { receiver });
+        self.transcription_jobs.push(TranscriptionJob {
+            generation,
+            receiver,
+        });
         if self.is_current_session(&session_path) {
             self.transcription_status = TranscriptionStatus::queued();
         }
-        self.toast = "Session ended. Audio finalized; transcription queued.".to_string();
-        self.live_notes
-            .push("Transcription queued for this session.".to_string());
+        self.toast = if generation > 1 {
+            format!("Take {generation} ended. Re-transcribing all takes.")
+        } else {
+            "Session ended. Audio finalized; transcription queued.".to_string()
+        };
+        self.live_notes.push(if generation > 1 {
+            format!("Take {generation} queued a full re-transcribe of all audio.")
+        } else {
+            "Transcription queued for this session.".to_string()
+        });
 
         let engine = self.engine;
         let ffmpeg_bin = self.ffmpeg_bin.clone();
@@ -858,6 +1016,7 @@ impl App {
                 chunk_seconds,
                 keep_wav: false,
                 require_parakeet,
+                generation: Some(generation),
             };
 
             let progress_sender = sender.clone();
@@ -865,6 +1024,7 @@ impl App {
             let result = transcribe_with_progress(&options, |progress| {
                 let _ = progress_sender.send(TranscriptionUiEvent::Progress {
                     session_path: progress_session_path.clone(),
+                    generation,
                     progress,
                 });
             });
@@ -873,12 +1033,15 @@ impl App {
                 Ok(result) => {
                     let _ = sender.send(TranscriptionUiEvent::Complete {
                         session_path: event_session_path,
+                        generation,
                         transcript_path: result.transcript_path,
+                        published: result.published,
                     });
                 }
                 Err(error) => {
                     let _ = sender.send(TranscriptionUiEvent::Failed {
                         session_path: event_session_path,
+                        generation,
                         message: error.to_string(),
                     });
                 }
@@ -901,17 +1064,22 @@ impl App {
             match event {
                 TranscriptionUiEvent::Progress {
                     session_path,
+                    generation,
                     progress,
                 } => {
-                    if self.is_current_session(&session_path) {
+                    if self.should_apply_generation(&session_path, generation) {
                         self.apply_transcription_progress(progress);
                     }
                 }
                 TranscriptionUiEvent::Complete {
                     session_path,
+                    generation,
                     transcript_path,
+                    published,
                 } => {
-                    if self.is_current_session(&session_path) {
+                    let apply =
+                        published && self.should_apply_generation(&session_path, generation);
+                    if apply {
                         self.transcription_status.label = "Transcript ready".to_string();
                         self.transcription_status.percent = 100;
                         self.transcription_status.transcript_path = Some(transcript_path.clone());
@@ -919,31 +1087,40 @@ impl App {
                         self.toast = format!("Transcript ready: {}", transcript_path.display());
                         self.live_notes
                             .push(format!("Transcript ready: {}", transcript_path.display()));
+                    } else if self.is_current_session(&session_path) {
+                        self.live_notes.push(format!(
+                            "Ignored stale take {generation} transcript after a newer take."
+                        ));
                     } else {
                         self.live_notes.push(format!(
                             "Transcript ready for {}.",
                             Self::session_label(&session_path)
                         ));
                     }
-                    if self.auto_analyze {
-                        self.start_analysis_job(session_path);
+                    if apply && self.auto_analyze {
+                        self.start_analysis_job(session_path, generation);
                     }
                     finished_jobs.push(job_index);
                 }
                 TranscriptionUiEvent::Failed {
                     session_path,
+                    generation,
                     message,
                 } => {
-                    if self.is_current_session(&session_path) {
+                    if self.should_apply_generation(&session_path, generation) {
                         self.transcription_status.label = "Transcription failed".to_string();
                         self.transcription_status.percent = 0;
                         self.transcription_status.failed = true;
                         self.toast = format!("Transcription failed: {message}");
                     }
-                    self.live_notes.push(format!(
-                        "Transcription failed for {}: {message}",
-                        Self::session_label(&session_path)
-                    ));
+                    if !self.is_current_session(&session_path)
+                        || self.should_apply_generation(&session_path, generation)
+                    {
+                        self.live_notes.push(format!(
+                            "Transcription failed for {}: {message}",
+                            Self::session_label(&session_path)
+                        ));
+                    }
                     finished_jobs.push(job_index);
                 }
             }
@@ -956,17 +1133,17 @@ impl App {
         }
     }
 
-    fn start_analysis_job(&mut self, session_path: PathBuf) {
+    fn start_analysis_job(&mut self, session_path: PathBuf, generation: u32) {
         if self
             .analysis_jobs
             .iter()
-            .any(|job| job.session_path == session_path)
+            .any(|job| job.session_path == session_path && job.generation == generation)
         {
             return;
         }
 
         let Some(agent) = self.agent.clone() else {
-            if self.is_current_session(&session_path) {
+            if self.should_apply_generation(&session_path, generation) {
                 self.analysis_status.label = "Analysis skipped: no agent".to_string();
                 self.analysis_status.percent = 0;
                 self.toast = "Analysis skipped because no agent is selected.".to_string();
@@ -982,14 +1159,16 @@ impl App {
         let (sender, receiver) = mpsc::channel();
         self.analysis_jobs.push(AnalysisJob {
             session_path: session_path.clone(),
+            generation,
             receiver,
         });
-        if self.is_current_session(&session_path) {
+        if self.should_apply_generation(&session_path, generation) {
             self.analysis_status = AnalysisStatus::running(&agent);
         }
         self.toast = format!("Analysis queued with {agent}.");
-        self.live_notes
-            .push(format!("Analysis queued with {agent}."));
+        self.live_notes.push(format!(
+            "Analysis queued with {agent} for take {generation}."
+        ));
 
         thread::spawn(move || {
             let original_session_path = session_path.clone();
@@ -999,6 +1178,7 @@ impl App {
                 agent,
                 preset,
                 dry_run: false,
+                generation: Some(generation),
             };
             match analyze(&options) {
                 Ok(result) => {
@@ -1006,13 +1186,16 @@ impl App {
                     let _ = sender.send(AnalysisUiEvent::Complete {
                         original_session_path,
                         session_path: result.session_path,
+                        generation,
                         meeting_path,
                         generated_title: result.generated_title,
+                        published: result.published,
                     });
                 }
                 Err(error) => {
                     let _ = sender.send(AnalysisUiEvent::Failed {
                         session_path: original_session_path,
+                        generation,
                         message: error.to_string(),
                     });
                 }
@@ -1036,11 +1219,33 @@ impl App {
                 AnalysisUiEvent::Complete {
                     original_session_path,
                     session_path,
+                    generation,
                     meeting_path,
                     generated_title,
+                    published,
                 } => {
-                    let is_current = self.is_current_session(&original_session_path);
-                    if is_current {
+                    let apply = published
+                        && self.should_apply_generation(&original_session_path, generation);
+                    if apply {
+                        let mut session_path = session_path;
+                        let mut meeting_path = meeting_path;
+                        if let Some(title) = generated_title.clone() {
+                            if self.take_index <= 1
+                                && self.completed_take <= 1
+                                && matches!(self.state, CaptureState::Ended)
+                            {
+                                if let Ok(renamed) =
+                                    maybe_rename_session_dir_for_title(&session_path, &title)
+                                {
+                                    if renamed != session_path {
+                                        meeting_path = renamed.join("meeting.md");
+                                        session_path = renamed;
+                                    }
+                                }
+                            }
+                            self.title = title.clone();
+                            self.live_notes.push(format!("Session titled: {title}"));
+                        }
                         self.session_path = Some(session_path.clone());
                         if self.transcription_status.transcript_path.is_some() {
                             self.transcription_status.transcript_path =
@@ -1051,14 +1256,12 @@ impl App {
                         self.analysis_status.result_path = Some(meeting_path.clone());
                         self.analysis_status.failed = false;
                         self.toast = "Meeting notes ready.".to_string();
-                        if let Some(title) = generated_title {
-                            self.title = title.clone();
-                            self.live_notes.push(format!("Session titled: {title}"));
-                        }
-                    }
-                    if is_current {
                         self.live_notes
                             .push(format!("Meeting ready: {}", meeting_path.display()));
+                    } else if self.is_current_session(&original_session_path) {
+                        self.live_notes.push(format!(
+                            "Ignored stale take {generation} analysis after a newer take."
+                        ));
                     } else {
                         self.live_notes.push(format!(
                             "Analysis ready for {}.",
@@ -1069,18 +1272,23 @@ impl App {
                 }
                 AnalysisUiEvent::Failed {
                     session_path,
+                    generation,
                     message,
                 } => {
-                    if self.is_current_session(&session_path) {
+                    if self.should_apply_generation(&session_path, generation) {
                         self.analysis_status.label = "Analysis failed".to_string();
                         self.analysis_status.percent = 0;
                         self.analysis_status.failed = true;
                         self.toast = format!("Analysis failed: {message}");
                     }
-                    self.live_notes.push(format!(
-                        "Analysis failed for {}: {message}",
-                        Self::session_label(&session_path)
-                    ));
+                    if !self.is_current_session(&session_path)
+                        || self.should_apply_generation(&session_path, generation)
+                    {
+                        self.live_notes.push(format!(
+                            "Analysis failed for {}: {message}",
+                            Self::session_label(&session_path)
+                        ));
+                    }
                     finished_jobs.push(job_index);
                 }
             }
@@ -1114,6 +1322,56 @@ impl App {
                     self.live_notes.push(note);
                     self.toast = self.live_notes.last().cloned().unwrap_or_default();
                 }
+            }
+            TranscriptionProgress::ModelDownloadStarted {
+                model,
+                cache_path,
+                expected_bytes,
+            } => {
+                self.transcription_status.label = format!(
+                    "Downloading Parakeet model ({model}, ~{}) — one-time",
+                    format_bytes(expected_bytes)
+                );
+                self.transcription_status.percent = 1;
+                self.transcription_status.failed = false;
+                self.toast = self.transcription_status.label.clone();
+                self.live_notes.push(format!(
+                    "Downloading {model} (~{}) to {} — one-time, reused across sessions.",
+                    format_bytes(expected_bytes),
+                    cache_path.display()
+                ));
+            }
+            TranscriptionProgress::ModelDownloadProgress {
+                model,
+                cache_path,
+                downloaded_bytes,
+                total_bytes,
+                bytes_per_sec,
+            } => {
+                self.transcription_status.label = format_model_download_label(
+                    &model,
+                    downloaded_bytes,
+                    total_bytes,
+                    bytes_per_sec,
+                );
+                self.transcription_status.percent = downloaded_bytes
+                    .saturating_mul(99)
+                    .checked_div(total_bytes)
+                    .unwrap_or(1)
+                    .clamp(1, 99) as u16;
+                self.toast = format!(
+                    "{}  Cache: {}",
+                    self.transcription_status.label,
+                    cache_path.display()
+                );
+            }
+            TranscriptionProgress::ModelDownloadFinished { model, cache_path } => {
+                self.transcription_status.label =
+                    format!("Parakeet model ready ({model}). Starting transcription.");
+                self.transcription_status.percent = 8;
+                self.toast = self.transcription_status.label.clone();
+                self.live_notes
+                    .push(format!("Model cached at {}", cache_path.display()));
             }
             TranscriptionProgress::TrackStarted {
                 track,
@@ -1524,6 +1782,18 @@ impl App {
         if self.has_background_jobs() {
             lines.push(self.background_jobs_line());
         }
+        if self.take_index > 1 {
+            lines.push(Line::from(vec![
+                Span::styled("Take: ", Style::default().fg(Color::Gray)),
+                Span::raw(self.take_index.to_string()),
+            ]));
+        }
+        if let Some(older) = self.older_transcription_take() {
+            lines.push(Line::from(vec![Span::styled(
+                format!("Take {older} transcript still running"),
+                Style::default().fg(Color::Yellow),
+            )]));
+        }
         lines.push(Line::raw(""));
 
         if !self.transcription_jobs.is_empty()
@@ -1673,6 +1943,14 @@ impl App {
         ])
     }
 
+    fn older_transcription_take(&self) -> Option<u32> {
+        self.transcription_jobs
+            .iter()
+            .map(|job| job.generation)
+            .filter(|generation| *generation < self.take_index)
+            .min()
+    }
+
     fn background_jobs_line(&self) -> Line<'static> {
         let transcript_count = self.transcription_jobs.len();
         let analysis_count = self.analysis_jobs.len();
@@ -1698,13 +1976,21 @@ impl App {
                 "Press Space or Enter to start".to_string(),
             ],
             CaptureState::Recording => vec![
-                "Microphone recording targets audio/mic.m4a".to_string(),
-                "System audio targets audio/call.m4a".to_string(),
+                format!(
+                    "Microphone recording targets audio/{}",
+                    AudioTrack::Mic.segment_name(self.take_index.max(1))
+                ),
+                format!(
+                    "System audio targets audio/{}",
+                    AudioTrack::Call.segment_name(self.take_index.max(1))
+                ),
                 "Space or Enter ends and starts transcription".to_string(),
                 format!("Analysis agent: {}", self.agent_label()),
             ],
             CaptureState::Ended => vec![
                 "Audio finalized".to_string(),
+                "Space or Enter continues this session".to_string(),
+                "q leaves (next start is a new session)".to_string(),
                 self.transcription_status.label.clone(),
                 self.analysis_status.label.clone(),
             ],
@@ -1774,7 +2060,7 @@ impl App {
                 " Space/Enter ",
                 Style::default().fg(Color::Black).bg(Color::Green),
             ),
-            Span::raw(" start/end  "),
+            Span::raw(" start/end/continue  "),
             Span::styled(" c ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::raw(" consent  "),
             Span::styled(" m ", Style::default().fg(Color::Black).bg(Color::Magenta)),
@@ -1859,6 +2145,22 @@ fn db_to_percent(level_db: f32) -> u16 {
     (normalized * 100.0) as u16
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingAction {
+    StartNew,
+    Continue,
+    End,
+}
+
+fn next_recording_action(state: CaptureState, has_session: bool) -> RecordingAction {
+    match state {
+        CaptureState::Ready => RecordingAction::StartNew,
+        CaptureState::Ended if has_session => RecordingAction::Continue,
+        CaptureState::Ended => RecordingAction::StartNew,
+        CaptureState::Recording => RecordingAction::End,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1869,7 +2171,10 @@ mod tests {
             consent_noted: true,
             tick: 0,
             started_at: None,
+            ended_at: None,
             accumulated: Duration::ZERO,
+            take_index: 1,
+            completed_take: 1,
             session_path: Some(current_session),
             storage_dir: std::env::temp_dir(),
             toast: String::new(),
@@ -1937,12 +2242,17 @@ mod tests {
         let previous_transcript = previous_session.join("transcript.md");
         let (sender, receiver) = mpsc::channel();
         let mut app = test_app(current_session.clone());
-        app.transcription_jobs.push(TranscriptionJob { receiver });
+        app.transcription_jobs.push(TranscriptionJob {
+            generation: 1,
+            receiver,
+        });
 
         sender
             .send(TranscriptionUiEvent::Complete {
                 session_path: previous_session.clone(),
+                generation: 1,
                 transcript_path: previous_transcript,
+                published: true,
             })
             .unwrap();
 
@@ -1969,6 +2279,7 @@ mod tests {
         app.transcription_status.transcript_path = Some(current_session.join("transcript.md"));
         app.analysis_jobs.push(AnalysisJob {
             session_path: previous_session.clone(),
+            generation: 1,
             receiver,
         });
 
@@ -1977,7 +2288,9 @@ mod tests {
                 original_session_path: previous_session,
                 meeting_path: renamed_previous.join("meeting.md"),
                 session_path: renamed_previous,
+                generation: 1,
                 generated_title: Some("Previous Generated Title".to_string()),
+                published: true,
             })
             .unwrap();
 
@@ -1995,5 +2308,154 @@ mod tests {
             .live_notes
             .iter()
             .any(|note| note.contains("Analysis ready for recall-renamed-previous-session.")));
+    }
+
+    #[test]
+    fn continue_clears_finished_ai_gauge_but_keeps_in_flight_analysis() {
+        let current_session = PathBuf::from("/tmp/recall-ai-gauge");
+        let mut app = test_app(current_session.clone());
+        app.analysis_status = AnalysisStatus {
+            label: "Meeting notes ready".to_string(),
+            percent: 100,
+            result_path: Some(current_session.join("meeting.md")),
+            failed: false,
+        };
+        app.reset_analysis_gauge_for_new_take();
+        assert_eq!(app.analysis_status.percent, 0);
+        assert_eq!(app.analysis_status.label, "Analysis idle");
+        assert!(app.analysis_status.result_path.is_none());
+
+        let (_sender, receiver) = mpsc::channel();
+        app.analysis_status = AnalysisStatus::running("grok");
+        app.analysis_jobs.push(AnalysisJob {
+            session_path: current_session,
+            generation: 1,
+            receiver,
+        });
+        app.reset_analysis_gauge_for_new_take();
+        assert_eq!(app.analysis_status.percent, 10);
+        assert!(app.analysis_status.label.contains("Analyzing with grok"));
+    }
+
+    #[test]
+    fn ended_session_continues_instead_of_starting_a_new_folder() {
+        assert_eq!(
+            next_recording_action(CaptureState::Ended, true),
+            RecordingAction::Continue
+        );
+        assert_eq!(
+            next_recording_action(CaptureState::Ready, false),
+            RecordingAction::StartNew
+        );
+        assert_eq!(
+            next_recording_action(CaptureState::Recording, true),
+            RecordingAction::End
+        );
+    }
+
+    #[test]
+    fn quit_then_new_start_creates_a_new_session_action() {
+        assert_eq!(
+            next_recording_action(CaptureState::Ready, false),
+            RecordingAction::StartNew
+        );
+        assert_eq!(
+            next_recording_action(CaptureState::Ended, false),
+            RecordingAction::StartNew
+        );
+    }
+
+    #[test]
+    fn late_take_one_transcript_does_not_overwrite_take_two() {
+        let current_session = PathBuf::from("/tmp/recall-continued-session");
+        let (sender, receiver) = mpsc::channel();
+        let mut app = test_app(current_session.clone());
+        app.take_index = 2;
+        app.completed_take = 2;
+        app.transcription_status = TranscriptionStatus::queued();
+        app.auto_analyze = true;
+        app.agent = Some("grok".to_string());
+        app.transcription_jobs.push(TranscriptionJob {
+            generation: 1,
+            receiver,
+        });
+
+        sender
+            .send(TranscriptionUiEvent::Complete {
+                session_path: current_session.clone(),
+                generation: 1,
+                transcript_path: current_session.join("stale-transcript.md"),
+                published: true,
+            })
+            .unwrap();
+
+        app.process_transcription_events();
+
+        assert_eq!(app.transcription_status.label, "Transcription queued");
+        assert!(app.transcription_status.transcript_path.is_none());
+        assert!(app.analysis_jobs.is_empty());
+        assert!(app
+            .live_notes
+            .iter()
+            .any(|note| note.contains("Ignored stale take 1 transcript")));
+    }
+
+    #[test]
+    fn continue_is_allowed_while_take_one_jobs_are_running() {
+        let current_session = PathBuf::from("/tmp/recall-continue-while-running");
+        let (_sender, receiver) = mpsc::channel();
+        let mut app = test_app(current_session);
+        app.state = CaptureState::Ended;
+        app.take_index = 1;
+        app.completed_take = 1;
+        app.transcription_jobs.push(TranscriptionJob {
+            generation: 1,
+            receiver,
+        });
+
+        assert_eq!(
+            next_recording_action(app.state, app.session_path.is_some()),
+            RecordingAction::Continue
+        );
+        assert!(app.has_background_jobs());
+        assert_eq!(app.older_transcription_take(), None);
+        app.take_index = 2;
+        assert_eq!(app.older_transcription_take(), Some(1));
+    }
+
+    #[test]
+    fn late_take_one_analysis_does_not_replace_take_two_title() {
+        let current_session = PathBuf::from("/tmp/recall-continued-analysis");
+        let (sender, receiver) = mpsc::channel();
+        let mut app = test_app(current_session.clone());
+        app.take_index = 2;
+        app.completed_take = 2;
+        app.title = "Current Session".to_string();
+        app.analysis_jobs.push(AnalysisJob {
+            session_path: current_session.clone(),
+            generation: 1,
+            receiver,
+        });
+
+        sender
+            .send(AnalysisUiEvent::Complete {
+                original_session_path: current_session.clone(),
+                session_path: current_session,
+                generation: 1,
+                meeting_path: PathBuf::from("/tmp/stale-meeting.md"),
+                generated_title: Some("Stale Title".to_string()),
+                published: true,
+            })
+            .unwrap();
+
+        app.process_analysis_events();
+
+        assert_eq!(app.title, "Current Session");
+        assert_eq!(app.analysis_status.label, "Analysis idle");
+        assert!(app.analysis_jobs.is_empty());
+        assert!(app
+            .live_notes
+            .iter()
+            .any(|note| note.contains("Ignored stale take 1 analysis")));
     }
 }

@@ -1,11 +1,17 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::audio::{
+    concat_audio_segments, discover_track_segments, generation_is_current, lock_session_publish,
+    refresh_track_alias, AudioTrack,
+};
 use crate::session::{
     default_storage_dir, list_sessions, mark_transcript_ready, read_session_title,
     transcription_dir, transcription_work_dir,
@@ -14,6 +20,7 @@ use crate::session::{
 pub const TRANSCRIPTION_CHUNK_SECONDS: u64 = 600;
 pub const DEFAULT_PARAKEET_BIN: &str = "parakeet-mlx";
 pub const DEFAULT_PARAKEET_MODEL: &str = "mlx-community/parakeet-tdt-0.6b-v3";
+pub const PARAKEET_TDT_V3_EXPECTED_BYTES: u64 = 1_200_000_000;
 pub const PARAKEET_CHUNK_SECONDS: u64 = 120;
 pub const PARAKEET_OVERLAP_SECONDS: u64 = 15;
 pub const PARAKEET_INSTALL_HINT: &str =
@@ -109,6 +116,7 @@ pub struct TranscribeOptions {
     pub chunk_seconds: u64,
     pub keep_wav: bool,
     pub require_parakeet: bool,
+    pub generation: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +137,7 @@ pub struct TranscribeResult {
     pub session_path: PathBuf,
     pub transcript_path: PathBuf,
     pub tracks: Vec<TrackResult>,
+    pub published: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +155,22 @@ pub enum TranscriptionProgress {
         engine: TranscriptionEngine,
         model: String,
         note: Option<String>,
+    },
+    ModelDownloadStarted {
+        model: String,
+        cache_path: PathBuf,
+        expected_bytes: u64,
+    },
+    ModelDownloadProgress {
+        model: String,
+        cache_path: PathBuf,
+        downloaded_bytes: u64,
+        total_bytes: u64,
+        bytes_per_sec: Option<u64>,
+    },
+    ModelDownloadFinished {
+        model: String,
+        cache_path: PathBuf,
     },
     TrackStarted {
         track: &'static str,
@@ -219,16 +244,20 @@ impl Track {
     }
 
     fn file_name(self) -> &'static str {
-        match self {
-            Self::Call => "call.m4a",
-            Self::Mic => "mic.m4a",
-        }
+        self.audio_track().alias_name()
     }
 
     fn heading(self) -> &'static str {
         match self {
             Self::Call => "Call Audio",
             Self::Mic => "Microphone",
+        }
+    }
+
+    fn audio_track(self) -> AudioTrack {
+        match self {
+            Self::Call => AudioTrack::Call,
+            Self::Mic => AudioTrack::Mic,
         }
     }
 }
@@ -296,12 +325,16 @@ impl AsrEngine {
                     &[wav.to_path_buf()],
                     output_dir,
                     cache_dir.as_deref(),
+                    |_| {},
                 )
             }
         }
     }
 
-    fn transcribe_track(&self, chunks: &[AudioChunk]) -> io::Result<()> {
+    fn transcribe_track<F>(&self, chunks: &[AudioChunk], progress: F) -> io::Result<()>
+    where
+        F: FnMut(TranscriptionProgress),
+    {
         match self {
             Self::Whisper { .. } => Ok(()),
             Self::Parakeet {
@@ -317,7 +350,14 @@ impl AsrEngine {
                     .iter()
                     .map(|chunk| chunk.wav_path.clone())
                     .collect::<Vec<_>>();
-                run_parakeet(bin, model, &wavs, output_dir, cache_dir.as_deref())
+                run_parakeet(
+                    bin,
+                    model,
+                    &wavs,
+                    output_dir,
+                    cache_dir.as_deref(),
+                    progress,
+                )
             }
         }
     }
@@ -363,6 +403,9 @@ where
     let elapsed_secs = || started.elapsed().as_secs();
 
     let session_path = resolve_session_path(options)?;
+    if transcription_generation_is_stale(&session_path, options.generation) {
+        return Ok(stale_transcribe_result(&session_path));
+    }
     let ffmpeg = resolve_ffmpeg_binary(options)?;
     let engine = resolve_asr_engine(options)?;
     let title = read_session_title(&session_path)?;
@@ -370,43 +413,50 @@ where
     fs::create_dir_all(&work_dir)?;
     mark_stage("setup", &mut stages, &mut stage_started);
 
-    let mut start_note = engine.fallback_note();
-    if matches!(engine.kind(), TranscriptionEngine::Parakeet)
-        && !parakeet_model_is_cached(
-            &engine.model_label(),
-            match &engine {
-                AsrEngine::Parakeet { cache_dir, .. } => cache_dir.as_deref(),
-                AsrEngine::Whisper { .. } => None,
-            },
-        )
-    {
-        let download =
-            "Parakeet model is not cached yet; first run may download weights from Hugging Face."
-                .to_string();
-        start_note = Some(match start_note {
-            Some(existing) => format!("{existing} {download}"),
-            None => download,
-        });
-    }
+    let parakeet_cache_dir = match &engine {
+        AsrEngine::Parakeet { cache_dir, .. } => cache_dir.clone(),
+        AsrEngine::Whisper { .. } => None,
+    };
+    let parakeet_needs_download = matches!(engine.kind(), TranscriptionEngine::Parakeet)
+        && !parakeet_model_is_cached(&engine.model_label(), parakeet_cache_dir.as_deref());
 
     progress(TranscriptionProgress::Started {
         session_path: session_path.clone(),
         engine: engine.kind(),
         model: engine.model_label(),
-        note: start_note,
+        note: engine.fallback_note(),
     });
+    if parakeet_needs_download {
+        let model = engine.model_label();
+        progress(TranscriptionProgress::ModelDownloadStarted {
+            model: short_model_label(&model),
+            cache_path: parakeet_model_cache_location(&model, parakeet_cache_dir.as_deref()),
+            expected_bytes: expected_parakeet_model_bytes(&model),
+        });
+    }
 
     let mut sections = Vec::new();
     let mut segments = Vec::new();
     let mut track_results = Vec::new();
 
     for track in options.track.tracks() {
-        let audio_path = session_path.join("audio").join(track.file_name());
+        let audio_segments =
+            discover_track_segments(&session_path, track.audio_track(), options.generation);
+        if audio_segments.is_empty() {
+            continue;
+        }
+        let audio_path = resolve_track_audio(
+            &ffmpeg,
+            &work_dir,
+            track,
+            &audio_segments,
+            options.generation,
+        )?;
         if !audio_path.exists() {
             continue;
         }
 
-        let chunks_dir = work_dir.join(format!("{}-chunks", track.label()));
+        let chunks_dir = track_chunks_dir(&work_dir, track, options.generation);
         cleanup_legacy_track_outputs(&work_dir, track);
         let chunks =
             convert_to_wav_chunks(&ffmpeg, &audio_path, &chunks_dir, options.chunk_seconds)?;
@@ -417,21 +467,49 @@ where
         );
         let mut track_text_parts = Vec::new();
 
-        progress(TranscriptionProgress::TrackStarted {
-            track: track.label(),
-            chunks: chunks.len(),
-            elapsed_secs: elapsed_secs(),
-        });
-
         match engine.kind() {
             TranscriptionEngine::Parakeet => {
-                progress(TranscriptionProgress::ChunkStarted {
-                    track: track.label(),
-                    index: 1,
-                    total: chunks.len(),
-                    elapsed_secs: elapsed_secs(),
-                });
-                engine.transcribe_track(&chunks)?;
+                let mut download_finished =
+                    parakeet_model_is_cached(&engine.model_label(), parakeet_cache_dir.as_deref());
+                if download_finished {
+                    progress(TranscriptionProgress::TrackStarted {
+                        track: track.label(),
+                        chunks: chunks.len(),
+                        elapsed_secs: elapsed_secs(),
+                    });
+                    progress(TranscriptionProgress::ChunkStarted {
+                        track: track.label(),
+                        index: 1,
+                        total: chunks.len(),
+                        elapsed_secs: elapsed_secs(),
+                    });
+                }
+                engine.transcribe_track(&chunks, |event| {
+                    let finished_download =
+                        matches!(event, TranscriptionProgress::ModelDownloadFinished { .. });
+                    progress(event);
+                    if finished_download && !download_finished {
+                        download_finished = true;
+                        progress(TranscriptionProgress::TrackStarted {
+                            track: track.label(),
+                            chunks: chunks.len(),
+                            elapsed_secs: elapsed_secs(),
+                        });
+                        progress(TranscriptionProgress::ChunkStarted {
+                            track: track.label(),
+                            index: 1,
+                            total: chunks.len(),
+                            elapsed_secs: elapsed_secs(),
+                        });
+                    }
+                })?;
+                if !download_finished {
+                    progress(TranscriptionProgress::TrackStarted {
+                        track: track.label(),
+                        chunks: chunks.len(),
+                        elapsed_secs: elapsed_secs(),
+                    });
+                }
                 mark_stage(
                     &format!("{} parakeet-mlx ({} file(s))", track.label(), chunks.len()),
                     &mut stages,
@@ -482,11 +560,11 @@ where
         }
 
         let clean_text = track_text_parts.join("\n");
+        let source_label = track_source_label(&audio_segments, track);
 
         sections.push(format!(
-            "## {}\n\nSource: `audio/{}`\n\n{}\n",
+            "## {}\n\nSource: {source_label}\n\n{}\n",
             track.heading(),
-            track.file_name(),
             if clean_text.is_empty() {
                 "_No transcript text returned._"
             } else {
@@ -517,6 +595,11 @@ where
         ));
     }
 
+    let _lock = lock_session_publish(&session_path)?;
+    if transcription_generation_is_stale(&session_path, options.generation) {
+        return Ok(stale_transcribe_result(&session_path));
+    }
+
     let transcript_path = session_path.join("transcript.md");
     let debug_dir = transcription_dir(&session_path);
     write_transcription_outputs(
@@ -537,6 +620,7 @@ where
         started.elapsed(),
     )?;
     mark_transcript_ready(&session_path)?;
+    refresh_published_aliases(&session_path, &track_results)?;
 
     progress(TranscriptionProgress::Finished {
         transcript_path: transcript_path.clone(),
@@ -547,7 +631,81 @@ where
         session_path,
         transcript_path,
         tracks: track_results,
+        published: true,
     })
+}
+
+fn transcription_generation_is_stale(session_path: &Path, generation: Option<u32>) -> bool {
+    match generation {
+        Some(generation) => !generation_is_current(session_path, generation),
+        None => false,
+    }
+}
+
+fn stale_transcribe_result(session_path: &Path) -> TranscribeResult {
+    TranscribeResult {
+        transcript_path: session_path.join("transcript.md"),
+        session_path: session_path.to_path_buf(),
+        tracks: Vec::new(),
+        published: false,
+    }
+}
+
+fn track_chunks_dir(work_dir: &Path, track: Track, generation: Option<u32>) -> PathBuf {
+    work_dir.join(format!(
+        "{}{}-chunks",
+        track.label(),
+        generation_suffix(generation)
+    ))
+}
+
+fn generation_suffix(generation: Option<u32>) -> String {
+    generation
+        .map(|value| format!("-take-{value:03}"))
+        .unwrap_or_default()
+}
+
+fn resolve_track_audio(
+    ffmpeg: &Path,
+    work_dir: &Path,
+    track: Track,
+    segments: &[PathBuf],
+    generation: Option<u32>,
+) -> io::Result<PathBuf> {
+    if segments.len() == 1 {
+        return Ok(segments[0].clone());
+    }
+    let concat_path = work_dir.join(format!(
+        "{}{}-concat.m4a",
+        track.label(),
+        generation_suffix(generation)
+    ));
+    concat_audio_segments(ffmpeg, segments, &concat_path)?;
+    Ok(concat_path)
+}
+
+fn track_source_label(segments: &[PathBuf], track: Track) -> String {
+    if segments.len() <= 1 {
+        return format!("`audio/{}`", track.file_name());
+    }
+    let names = segments
+        .iter()
+        .filter_map(|path| path.file_name()?.to_str())
+        .map(|name| format!("`audio/{name}`"))
+        .collect::<Vec<_>>();
+    names.join(" + ")
+}
+
+fn refresh_published_aliases(session_path: &Path, tracks: &[TrackResult]) -> io::Result<()> {
+    for track in tracks {
+        let audio_track = match track.label {
+            "call" => AudioTrack::Call,
+            "mic" => AudioTrack::Mic,
+            _ => continue,
+        };
+        let _ = refresh_track_alias(session_path, audio_track, &track.audio_path);
+    }
+    Ok(())
 }
 
 fn resolve_session_path(options: &TranscribeOptions) -> io::Result<PathBuf> {
@@ -802,9 +960,14 @@ fn parakeet_model_cache_roots(cache_dir: Option<&Path>) -> Vec<PathBuf> {
     roots
 }
 
+fn huggingface_repo_dir_name(model: &str) -> String {
+    format!("models--{}", model.replace('/', "--"))
+}
+
 fn huggingface_snapshot_present(root: &Path, model: &str) -> bool {
-    let encoded = format!("models--{}", model.replace('/', "--"));
-    let snapshots = root.join(encoded).join("snapshots");
+    let snapshots = root
+        .join(huggingface_repo_dir_name(model))
+        .join("snapshots");
     snapshots.is_dir()
         && fs::read_dir(&snapshots)
             .map(|entries| {
@@ -819,6 +982,198 @@ fn huggingface_snapshot_present(root: &Path, model: &str) -> bool {
                 })
             })
             .unwrap_or(false)
+}
+
+pub fn parakeet_model_cache_location(model: &str, cache_dir: Option<&Path>) -> PathBuf {
+    let encoded = huggingface_repo_dir_name(model);
+    for root in parakeet_model_cache_roots(cache_dir) {
+        let path = root.join(&encoded);
+        if path.exists() {
+            return path;
+        }
+    }
+    parakeet_model_cache_roots(cache_dir)
+        .into_iter()
+        .next()
+        .unwrap_or_else(default_hf_hub_dir)
+        .join(encoded)
+}
+
+fn default_hf_hub_dir() -> PathBuf {
+    if let Some(hf_home) = env::var_os("HF_HOME").map(PathBuf::from) {
+        return hf_home.join("hub");
+    }
+    env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".cache/huggingface/hub"))
+        .unwrap_or_else(|| PathBuf::from(".cache/huggingface/hub"))
+}
+
+fn expected_parakeet_model_bytes(_model: &str) -> u64 {
+    PARAKEET_TDT_V3_EXPECTED_BYTES
+}
+
+pub(crate) fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{} MB", bytes.div_ceil(1_000_000))
+    } else if bytes >= 1_000 {
+        format!("{} KB", bytes.div_ceil(1_000))
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+pub(crate) fn format_model_download_label(
+    model: &str,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    bytes_per_sec: Option<u64>,
+) -> String {
+    let mut label = format!(
+        "Downloading Parakeet model ({model}, ~{}) — one-time: {} / {}",
+        format_bytes(total_bytes),
+        format_bytes(downloaded_bytes),
+        format_bytes(total_bytes)
+    );
+    if let Some(rate) = bytes_per_sec.filter(|rate| *rate > 0) {
+        label.push_str(&format!(" ({}/s)", format_bytes(rate)));
+    }
+    label
+}
+
+fn parse_hf_progress_line(line: &str) -> Option<HfByteProgress> {
+    let cleaned = strip_ansi(line.trim());
+    if cleaned.is_empty() || cleaned.contains("it/s") && cleaned.contains("Fetching") {
+        return None;
+    }
+    let (downloaded, total) = parse_size_pair(&cleaned)?;
+    let bytes_per_sec = parse_rate(&cleaned);
+    Some(HfByteProgress {
+        downloaded,
+        total,
+        bytes_per_sec,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HfByteProgress {
+    downloaded: u64,
+    total: u64,
+    bytes_per_sec: Option<u64>,
+}
+
+fn parse_size_pair(line: &str) -> Option<(u64, u64)> {
+    for (index, ch) in line.char_indices() {
+        if ch != '/' {
+            continue;
+        }
+        let left = line[..index]
+            .rsplit(|ch: char| ch.is_whitespace() || ch == '|')
+            .next()?;
+        let right = line[index + 1..]
+            .split(|ch: char| ch.is_whitespace() || ch == '[' || ch == ',')
+            .next()?;
+        if let (Some(downloaded), Some(total)) = (parse_size_token(left), parse_size_token(right)) {
+            if total > 0 {
+                return Some((downloaded.min(total), total));
+            }
+        }
+    }
+    None
+}
+
+fn parse_size_token(raw: &str) -> Option<u64> {
+    let raw = raw
+        .trim()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.');
+    if raw.is_empty() {
+        return None;
+    }
+    let split = raw
+        .char_indices()
+        .find(|(_, ch)| ch.is_ascii_alphabetic())
+        .map(|(index, _)| index)
+        .unwrap_or(raw.len());
+    let (number, unit) = raw.split_at(split);
+    let value: f64 = number.parse().ok()?;
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1_000.0,
+        "ki" | "kib" => 1024.0,
+        "m" | "mb" => 1_000_000.0,
+        "mi" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" => 1_000_000_000.0,
+        "gi" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((value * multiplier).round() as u64)
+}
+
+fn parse_rate(line: &str) -> Option<u64> {
+    let lower = line.to_ascii_lowercase();
+    let index = lower.find("/s")?;
+    let prefix = line[..index]
+        .rsplit(|ch: char| ch.is_whitespace() || ch == ',' || ch == '[')
+        .next()?;
+    parse_size_token(prefix)
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        output.push(ch);
+    }
+    output
+}
+
+fn directory_size(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if child.is_dir() {
+            total += directory_size(&child);
+        } else if let Ok(metadata) = entry.metadata() {
+            total += metadata.len();
+        }
+    }
+    total
+}
+
+fn looks_like_download_failure(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    [
+        "couldn't connect",
+        "connection",
+        "nameresolutionerror",
+        "maxretryerror",
+        "offline",
+        "localentrynotfounderror",
+        "failed to download",
+        "huggingface.co",
+        "network is unreachable",
+        "proxy",
+        "ssl",
+        "timed out",
+        "timeout",
+    ]
+    .into_iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn find_required_binary(name: &str, hint: &str) -> io::Result<PathBuf> {
@@ -951,19 +1306,28 @@ fn run_whisper_once(
     Ok(status.success())
 }
 
-fn run_parakeet(
+fn run_parakeet<F>(
     parakeet: &Path,
     model: &str,
     wavs: &[PathBuf],
     output_dir: &Path,
     cache_dir: Option<&Path>,
-) -> io::Result<()> {
+    mut progress: F,
+) -> io::Result<()>
+where
+    F: FnMut(TranscriptionProgress),
+{
     if wavs.is_empty() {
         return Ok(());
     }
     if let Some(cache_dir) = cache_dir {
         fs::create_dir_all(cache_dir)?;
     }
+
+    let cache_path = parakeet_model_cache_location(model, cache_dir);
+    let expected_bytes = expected_parakeet_model_bytes(model);
+    let started_uncached = !parakeet_model_is_cached(model, cache_dir);
+    let mut download_announced = !started_uncached;
 
     let mut command = Command::new(parakeet);
     for wav in wavs {
@@ -980,13 +1344,15 @@ fn run_parakeet(
         .arg(PARAKEET_CHUNK_SECONDS.to_string())
         .arg("--overlap-duration")
         .arg(PARAKEET_OVERLAP_SECONDS.to_string())
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     if let Some(cache_dir) = cache_dir {
         command.arg("--cache-dir").arg(cache_dir);
     }
 
-    let output = command.output().map_err(|error| {
+    let mut child = command.spawn().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -997,12 +1363,155 @@ fn run_parakeet(
         }
     })?;
 
-    if output.status.success() {
-        return Ok(());
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (line_sender, line_receiver) = mpsc::channel::<String>();
+    let (stdout_sender, stdout_receiver) = mpsc::channel::<String>();
+    if let Some(stderr) = stderr {
+        let sender = line_sender.clone();
+        thread::spawn(move || drain_progress_stream(stderr, sender));
     }
+    if let Some(stdout) = stdout {
+        thread::spawn(move || {
+            let mut buf = String::new();
+            let mut reader = BufReader::new(stdout);
+            let _ = reader.read_to_string(&mut buf);
+            let _ = stdout_sender.send(buf);
+        });
+    }
+    drop(line_sender);
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut last_bytes = directory_size(&cache_path);
+    let mut last_mark = Instant::now();
+    let mut last_rate = None;
+    let mut stderr_tail = String::new();
+
+    loop {
+        while let Ok(line) = line_receiver.try_recv() {
+            push_stderr_tail(&mut stderr_tail, &line);
+            if started_uncached {
+                if let Some(parsed) = parse_hf_progress_line(&line) {
+                    last_bytes = parsed.downloaded;
+                    last_rate = parsed.bytes_per_sec;
+                    last_mark = Instant::now();
+                    progress(TranscriptionProgress::ModelDownloadProgress {
+                        model: short_model_label(model),
+                        cache_path: cache_path.clone(),
+                        downloaded_bytes: parsed.downloaded,
+                        total_bytes: parsed.total.max(expected_bytes),
+                        bytes_per_sec: parsed.bytes_per_sec,
+                    });
+                }
+            }
+        }
+
+        if started_uncached && !parakeet_model_is_cached(model, cache_dir) {
+            let downloaded = directory_size(&cache_path).max(last_bytes);
+            let now = Instant::now();
+            let elapsed = now.saturating_duration_since(last_mark).as_secs_f64();
+            if elapsed >= 0.2 && downloaded > last_bytes {
+                last_rate = Some(((downloaded - last_bytes) as f64 / elapsed).round() as u64);
+                last_bytes = downloaded;
+                last_mark = now;
+            }
+            progress(TranscriptionProgress::ModelDownloadProgress {
+                model: short_model_label(model),
+                cache_path: cache_path.clone(),
+                downloaded_bytes: downloaded.min(expected_bytes),
+                total_bytes: expected_bytes,
+                bytes_per_sec: last_rate,
+            });
+        } else if started_uncached
+            && !download_announced
+            && parakeet_model_is_cached(model, cache_dir)
+        {
+            download_announced = true;
+            progress(TranscriptionProgress::ModelDownloadFinished {
+                model: short_model_label(model),
+                cache_path: cache_path.clone(),
+            });
+        }
+
+        match child.try_wait()? {
+            Some(status) => {
+                let stdout = stdout_receiver.try_recv().unwrap_or_default();
+                while let Ok(line) = line_receiver.try_recv() {
+                    push_stderr_tail(&mut stderr_tail, &line);
+                }
+                if status.success() {
+                    if started_uncached && !download_announced {
+                        progress(TranscriptionProgress::ModelDownloadFinished {
+                            model: short_model_label(model),
+                            cache_path: cache_path.clone(),
+                        });
+                    }
+                    return Ok(());
+                }
+                return Err(parakeet_failure(
+                    wavs,
+                    model,
+                    &cache_path,
+                    started_uncached && !parakeet_model_is_cached(model, cache_dir),
+                    &stderr_tail,
+                    &stdout,
+                ));
+            }
+            None => thread::sleep(Duration::from_millis(200)),
+        }
+    }
+}
+
+fn drain_progress_stream<R: Read>(reader: R, sender: mpsc::Sender<String>) {
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                if byte[0] == b'\n' || byte[0] == b'\r' {
+                    if !buf.is_empty() {
+                        let _ = sender.send(String::from_utf8_lossy(&buf).into_owned());
+                        buf.clear();
+                    }
+                } else {
+                    buf.push(byte[0]);
+                    if buf.len() > 8_192 {
+                        let _ = sender.send(String::from_utf8_lossy(&buf).into_owned());
+                        buf.clear();
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if !buf.is_empty() {
+        let _ = sender.send(String::from_utf8_lossy(&buf).into_owned());
+    }
+}
+
+fn push_stderr_tail(tail: &mut String, line: &str) {
+    if line.trim().is_empty() {
+        return;
+    }
+    if !tail.is_empty() {
+        tail.push('\n');
+    }
+    tail.push_str(line.trim());
+    if tail.len() > 4_000 {
+        let extra = tail.len() - 4_000;
+        tail.drain(..extra);
+    }
+}
+
+fn parakeet_failure(
+    wavs: &[PathBuf],
+    model: &str,
+    cache_path: &Path,
+    download_failed: bool,
+    stderr: &str,
+    stdout: &str,
+) -> io::Error {
     let mut detail = [stderr.trim(), stdout.trim()]
         .into_iter()
         .filter(|part| !part.is_empty())
@@ -1017,14 +1526,27 @@ fn run_parakeet(
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
+    if download_failed || looks_like_download_failure(&detail) {
+        let mut message = format!(
+            "Parakeet model download failed for {} (~{} one-time cache at {}).",
+            short_model_label(model),
+            format_bytes(expected_parakeet_model_bytes(model)),
+            cache_path.display()
+        );
+        if detail.is_empty() {
+            message.push_str(" Check the network or proxy, then retry.");
+        } else {
+            message.push_str(": ");
+            message.push_str(&detail);
+        }
+        return io::Error::other(message);
+    }
     if detail.is_empty() {
-        Err(io::Error::other(format!(
-            "Parakeet transcription failed for {labels}"
-        )))
+        io::Error::other(format!("Parakeet transcription failed for {labels}"))
     } else {
-        Err(io::Error::other(format!(
+        io::Error::other(format!(
             "Parakeet transcription failed for {labels}: {detail}"
-        )))
+        ))
     }
 }
 
@@ -1757,13 +2279,70 @@ fn unix_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_conversation_segments, clean_transcript_text, clean_whisper_text_block,
-        format_timestamp, parakeet_binary_doctor_level, parse_vtt_segments_with_offset,
-        path_with_added_extension, resolve_parakeet_model_id, DoctorCheckLevel, TrackSelection,
-        TranscriptSegment, TranscriptionEngine, DEFAULT_PARAKEET_MODEL,
+        clean_conversation_segments, clean_transcript_text, clean_whisper_text_block, format_bytes,
+        format_model_download_label, format_timestamp, huggingface_repo_dir_name,
+        parakeet_binary_doctor_level, parse_hf_progress_line, parse_vtt_segments_with_offset,
+        path_with_added_extension, resolve_parakeet_model_id, track_chunks_dir, DoctorCheckLevel,
+        Track, TrackSelection, TranscriptSegment, TranscriptionEngine, DEFAULT_PARAKEET_MODEL,
     };
     use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn overlapping_takes_use_separate_chunk_directories() {
+        let work = Path::new("/tmp/recall-work");
+        assert_eq!(
+            track_chunks_dir(work, Track::Mic, None),
+            work.join("mic-chunks")
+        );
+        assert_eq!(
+            track_chunks_dir(work, Track::Mic, Some(1)),
+            work.join("mic-take-001-chunks")
+        );
+        assert_eq!(
+            track_chunks_dir(work, Track::Call, Some(2)),
+            work.join("call-take-002-chunks")
+        );
+        assert_ne!(
+            track_chunks_dir(work, Track::Mic, Some(1)),
+            track_chunks_dir(work, Track::Mic, Some(2))
+        );
+    }
+
+    #[test]
+    fn huggingface_repo_dir_uses_hub_encoding() {
+        assert_eq!(
+            huggingface_repo_dir_name("mlx-community/parakeet-tdt-0.6b-v3"),
+            "models--mlx-community--parakeet-tdt-0.6b-v3"
+        );
+    }
+
+    #[test]
+    fn parses_huggingface_tqdm_byte_progress() {
+        let parsed = parse_hf_progress_line(
+            "model.safetensors:  45%|████      | 540M/1.20G [00:12<00:14, 45.3MB/s]",
+        )
+        .unwrap();
+        assert_eq!(parsed.downloaded, 540_000_000);
+        assert_eq!(parsed.total, 1_200_000_000);
+        assert_eq!(parsed.bytes_per_sec, Some(45_300_000));
+    }
+
+    #[test]
+    fn download_label_is_definite_and_includes_size_and_rate() {
+        let label = format_model_download_label(
+            "parakeet-tdt-0.6b-v3",
+            540_000_000,
+            1_200_000_000,
+            Some(45_000_000),
+        );
+        assert!(
+            label.contains("Downloading Parakeet model (parakeet-tdt-0.6b-v3, ~1.2 GB) — one-time")
+        );
+        assert!(label.contains("540 MB / 1.2 GB"));
+        assert!(label.contains("45 MB/s"));
+        assert_eq!(format_bytes(1_200_000_000), "1.2 GB");
+    }
 
     #[test]
     fn engine_status_parts_shorten_model_ids() {

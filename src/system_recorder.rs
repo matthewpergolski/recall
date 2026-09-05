@@ -29,7 +29,7 @@ pub struct SystemRecorder {
 }
 
 impl SystemRecorder {
-    pub fn start(session_dir: &Path) -> io::Result<Self> {
+    pub fn start(session_dir: &Path, output_name: &str) -> io::Result<Self> {
         let state_dir = state_dir(session_dir);
         fs::create_dir_all(&state_dir)?;
         let stop_file = state_dir.join("stop-system");
@@ -37,7 +37,7 @@ impl SystemRecorder {
             fs::remove_file(&stop_file)?;
         }
 
-        let mut child = spawn_helper(session_dir, &stop_file)?;
+        let mut child = spawn_helper(session_dir, &stop_file, output_name)?;
         let stdout = child
             .stdout
             .take()
@@ -102,7 +102,7 @@ impl Drop for SystemRecorder {
     }
 }
 
-fn spawn_helper(session_dir: &Path, stop_file: &Path) -> io::Result<Child> {
+fn spawn_helper(session_dir: &Path, stop_file: &Path, output_name: &str) -> io::Result<Child> {
     let helper_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("capture-helper");
 
     let mut command = if let Some(binary) = helper_binary(&helper_dir) {
@@ -124,6 +124,8 @@ fn spawn_helper(session_dir: &Path, stop_file: &Path) -> io::Result<Child> {
         .arg(session_dir)
         .arg("--stop-file")
         .arg(stop_file)
+        .arg("--output-name")
+        .arg(output_name)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 

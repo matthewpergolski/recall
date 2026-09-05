@@ -20,9 +20,9 @@ Current command shape:
 
 ```sh
 swift run recall-capture list-sources
-swift run recall-capture record-mic --session-dir ../sessions/example --duration 5
-swift run recall-capture record-audio-tap --session-dir ../sessions/example --duration 5
-swift run recall-capture record-system --session-dir ../sessions/example --duration 5
+swift run recall-capture record-mic --session-dir ../sessions/example --duration 5 --output-name mic-001.m4a
+swift run recall-capture record-audio-tap --session-dir ../sessions/example --duration 5 --output-name call-001.m4a
+swift run recall-capture record-system --session-dir ../sessions/example --duration 5 --output-name call-001.m4a
 swift run recall-capture probe-audio-tap
 ```
 

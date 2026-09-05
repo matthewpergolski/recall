@@ -75,12 +75,14 @@ struct RecordMicOptions {
     let sessionDir: URL
     let durationSeconds: TimeInterval
     let stopFile: URL?
+    let outputName: String
 }
 
 struct RecordSystemOptions {
     let sessionDir: URL
     let durationSeconds: TimeInterval
     let stopFile: URL?
+    let outputName: String
 }
 
 final class PermissionResult: @unchecked Sendable {
@@ -90,6 +92,7 @@ final class PermissionResult: @unchecked Sendable {
 enum CaptureError: Error, CustomStringConvertible {
     case missingValue(String)
     case invalidDuration(String)
+    case invalidOutputName(String)
     case missingSessionDir
     case microphonePermissionDenied(String)
     case recorderCreationFailed
@@ -110,6 +113,8 @@ enum CaptureError: Error, CustomStringConvertible {
             return "\(flag) requires a value"
         case .invalidDuration(let value):
             return "Invalid --duration value: \(value)"
+        case .invalidOutputName(let value):
+            return "Invalid --output-name value: \(value)"
         case .missingSessionDir:
             return "record-mic requires --session-dir <path>"
         case .microphonePermissionDenied(let status):
@@ -232,6 +237,7 @@ struct RecallCapture {
         var sessionDir: URL?
         var durationSeconds: TimeInterval = 8 * 60 * 60
         var stopFile: URL?
+        var outputName = "mic.m4a"
         var index = 0
 
         while index < args.count {
@@ -258,6 +264,12 @@ struct RecallCapture {
                     throw CaptureError.missingValue(arg)
                 }
                 stopFile = URL(fileURLWithPath: args[index + 1])
+                index += 2
+            case "--output-name":
+                guard index + 1 < args.count else {
+                    throw CaptureError.missingValue(arg)
+                }
+                outputName = try validatedOutputName(args[index + 1])
                 index += 2
             default:
                 fputs("Ignoring unknown record-mic option: \(arg)\n", stderr)
@@ -272,7 +284,8 @@ struct RecallCapture {
         return RecordMicOptions(
             sessionDir: sessionDir,
             durationSeconds: durationSeconds,
-            stopFile: stopFile
+            stopFile: stopFile,
+            outputName: outputName
         )
     }
 
@@ -280,6 +293,7 @@ struct RecallCapture {
         var sessionDir: URL?
         var durationSeconds: TimeInterval = 8 * 60 * 60
         var stopFile: URL?
+        var outputName = "call.m4a"
         var index = 0
 
         while index < args.count {
@@ -307,6 +321,12 @@ struct RecallCapture {
                 }
                 stopFile = URL(fileURLWithPath: args[index + 1])
                 index += 2
+            case "--output-name":
+                guard index + 1 < args.count else {
+                    throw CaptureError.missingValue(arg)
+                }
+                outputName = try validatedOutputName(args[index + 1])
+                index += 2
             default:
                 fputs("Ignoring unknown record-system option: \(arg)\n", stderr)
                 index += 1
@@ -320,8 +340,22 @@ struct RecallCapture {
         return RecordSystemOptions(
             sessionDir: sessionDir,
             durationSeconds: durationSeconds,
-            stopFile: stopFile
+            stopFile: stopFile,
+            outputName: outputName
         )
+    }
+
+    private static func validatedOutputName(_ value: String) throws -> String {
+        let name = (value as NSString).lastPathComponent
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        guard name == value,
+              name.lowercased().hasSuffix(".m4a"),
+              name.unicodeScalars.allSatisfy({ allowed.contains($0) }),
+              name != ".m4a"
+        else {
+            throw CaptureError.invalidOutputName(value)
+        }
+        return name
     }
 
     private static func recordMic(_ options: RecordMicOptions) throws {
@@ -330,7 +364,7 @@ struct RecallCapture {
         let audioDir = options.sessionDir.appendingPathComponent("audio", isDirectory: true)
         try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
 
-        let outputURL = audioDir.appendingPathComponent("mic.m4a")
+        let outputURL = audioDir.appendingPathComponent(options.outputName)
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try FileManager.default.removeItem(at: outputURL)
         }
@@ -476,7 +510,7 @@ struct RecallCapture {
         let audioDir = options.sessionDir.appendingPathComponent("audio", isDirectory: true)
         try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
 
-        let outputURL = audioDir.appendingPathComponent("call.m4a")
+        let outputURL = audioDir.appendingPathComponent(options.outputName)
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try FileManager.default.removeItem(at: outputURL)
         }
@@ -493,7 +527,7 @@ struct RecallCapture {
         let audioDir = options.sessionDir.appendingPathComponent("audio", isDirectory: true)
         try FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
 
-        let outputURL = audioDir.appendingPathComponent("call.m4a")
+        let outputURL = audioDir.appendingPathComponent(options.outputName)
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try FileManager.default.removeItem(at: outputURL)
         }
@@ -717,17 +751,17 @@ struct RecallCapture {
 
             USAGE:
                 recall-capture list-sources
-                recall-capture record-mic --session-dir <path> [--duration <seconds>] [--stop-file <path>]
-                recall-capture record-audio-tap --session-dir <path> [--duration <seconds>] [--stop-file <path>]
-                recall-capture record-system --session-dir <path> [--duration <seconds>] [--stop-file <path>]
+                recall-capture record-mic --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
+                recall-capture record-audio-tap --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
+                recall-capture record-system --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
                 recall-capture probe-audio-tap
                 recall-capture version
 
             COMMANDS:
                 list-sources    Emit candidate meeting apps and microphones as JSON.
-                record-mic      Record default microphone audio into <session-dir>/audio/mic.m4a.
-                record-audio-tap Record system audio with CoreAudio process taps into <session-dir>/audio/call.m4a.
-                record-system   Record app/system audio into <session-dir>/audio/call.m4a.
+                record-mic      Record default microphone audio into <session-dir>/audio/<output-name>.
+                record-audio-tap Record system audio with CoreAudio process taps into <session-dir>/audio/<output-name>.
+                record-system   Record app/system audio into <session-dir>/audio/<output-name>.
                 probe-audio-tap Probe CoreAudio's process-tap API without writing audio.
                 version         Print helper version.
 

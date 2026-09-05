@@ -77,6 +77,8 @@ Flow:
 
 If another recording starts before analysis finishes, the previous session keeps processing in the background. Agent results are written back to that session folder and do not retarget the active recording.
 
+If you continue the same TUI session after ending a take, analysis is a do-over on the latest full `transcript.md`. It replaces `meeting.md` and does not merge two meeting documents. Notes and markers stay. After the first continue, the session folder name stays sticky so a later generated title does not rename the folder mid-meeting.
+
 Disable auto-analysis for a run:
 
 ```sh
