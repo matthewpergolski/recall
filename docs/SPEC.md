@@ -21,6 +21,7 @@ Recall should feel polished and calm, with a Claude Code-style terminal interfac
 
 - Interactive terminal dashboard
 - TUI startup flag: `--consent provided`
+- TUI resume: `--resume`, `--resume <session-id>`, and `recall resume latest`
 - Start session command
 - List sessions command
 - Show latest session command
@@ -113,4 +114,14 @@ sessions/
 }
 ```
 
-`recall show latest`, `recall transcribe latest`, and `recall analyze latest` sort sessions by `created_at_unix` rather than folder name.
+`recall show latest`, `recall transcribe latest`, `recall analyze latest`, and `recall --resume latest` sort sessions by `created_at_unix` rather than folder name.
+
+After a TUI session that created or resumed a folder, quitting restores the terminal and prints:
+
+```text
+Resume this session with:
+  recall --resume 05-26-2026_7-21pm-et-design-sync
+Or: recall --resume latest
+```
+
+`--resume` reopens that folder in the ENDED TUI state. Space or Enter records the next numbered take (`mic-002.m4a` / `call-002.m4a`). Plain `recall` still starts a new session. Resume refuses if another Recall process is already recording into that folder, or if `capture.json` shows an unfinished take.

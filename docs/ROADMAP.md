@@ -35,6 +35,7 @@ Implemented:
 - `recall open latest` and portable `recall export latest`
 - `recall update` with safe checkout discovery and fast-forward-only Git updates
 - continue the same TUI session after Space/Enter with numbered audio takes and a full re-transcribe
+- relaunch resume with `recall --resume` / `recall --resume <session-id>` into the same folder
 
 Not implemented yet:
 

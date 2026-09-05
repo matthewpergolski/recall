@@ -157,7 +157,9 @@ The TUI starts transcription automatically after the user presses Space or Enter
 
 If you stay in that TUI session and press Space or Enter again, Recall continues the same folder. Recorders write the next numbered take (`mic-002.m4a` / `call-002.m4a`). Ending that take concatenates every take in order and re-transcribes the full mic and call tracks. Transcript timestamps follow concatenated audio time, not the TUI clock; the TUI clock includes the break between takes, and the audio does not insert silence for that gap.
 
-A continued take can start while take 1 is still transcribing or analyzing. Those jobs keep running. The later take's full re-transcribe and analysis replace `transcript.md` and `meeting.md`. A late take-1 completion does not overwrite newer take outputs. Notes and markers accumulate. Quitting the TUI and launching Recall again starts a new session.
+A continued take can start while take 1 is still transcribing or analyzing. Those jobs keep running. The later take's full re-transcribe and analysis replace `transcript.md` and `meeting.md`. A late take-1 completion does not overwrite newer take outputs. Notes and markers accumulate.
+
+Quitting the TUI (`q` / Ctrl+C) leaves transcription and analysis running in the background. Recall prints the session path and a log file under `.recall/work/postprocess.log`. Plain `recall` starts a new session. `recall --resume` or `recall --resume <session-id>` reopens the same folder so a later take can append. Resume does not auto-transcribe until that new take ends. The TUI clock restores the last accumulated recording time and does not add the time spent away.
 
 Recall can keep processing a finished session while the user starts another recording. Background transcription and analysis jobs are session-scoped, so a previous session finishing should not overwrite the currently active session display. Continued takes use the same session-scoped rule, keyed by take generation.
 

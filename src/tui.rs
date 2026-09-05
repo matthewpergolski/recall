@@ -1,8 +1,13 @@
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -15,13 +20,16 @@ use crate::analysis::{
     analyze, known_agents, maybe_rename_session_dir_for_title, AnalyzeOptions, AnalyzeTarget,
 };
 use crate::audio::{
-    copy_take1_aliases, prepare_continued_take, write_capture_progress, AudioTrack, CaptureProgress,
+    acquire_capture_lock, copy_take1_aliases, next_take_index, prepare_continued_take,
+    read_capture_progress, resume_block_reason, write_capture_progress, AudioTrack, CaptureLock,
+    CaptureProgress,
 };
 use crate::capture_sources::{detect_sources, SourceSummary};
 use crate::mic_recorder::MicRecorder;
 use crate::session::{
-    append_session_marker, append_session_note, default_storage_dir, open_path,
-    primary_document_path, start_session, ConsentMode, StartOptions,
+    append_session_marker, append_session_note, default_storage_dir, internal_dir, open_path,
+    primary_document_path, read_session_consent, read_session_title, resolve_session_target,
+    start_session, ConsentMode, StartOptions,
 };
 use crate::system_recorder::SystemRecorder;
 use crate::transcription::{
@@ -38,6 +46,28 @@ enum CaptureState {
     Ready,
     Recording,
     Ended,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeTarget {
+    Latest,
+    Named(String),
+}
+
+impl ResumeTarget {
+    pub fn from_arg(value: Option<&str>) -> Self {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("latest") => Self::Latest,
+            Some(other) => Self::Named(other.to_string()),
+        }
+    }
+
+    fn lookup(&self) -> &str {
+        match self {
+            Self::Latest => "latest",
+            Self::Named(name) => name,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +88,7 @@ pub struct TuiOptions {
     pub auto_analyze: bool,
     pub preset: String,
     pub editor: Option<String>,
+    pub resume: Option<ResumeTarget>,
 }
 
 impl Default for TuiOptions {
@@ -79,19 +110,73 @@ impl Default for TuiOptions {
             auto_analyze: true,
             preset: "general".to_string(),
             editor: None,
+            resume: None,
         }
     }
 }
 
-pub fn run_with_options(options: TuiOptions) -> io::Result<()> {
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedResume {
+    path: PathBuf,
+    title: String,
+    consent_noted: bool,
+    progress: CaptureProgress,
+}
+
+pub(crate) fn prepare_resume(
+    storage_dir: &Path,
+    target: &ResumeTarget,
+    cli_consent_noted: bool,
+) -> io::Result<PreparedResume> {
+    let path = resolve_session_target(storage_dir, target.lookup())?;
+    if let Some(reason) = resume_block_reason(&path) {
+        return Err(io::Error::other(reason));
+    }
+
+    let mut progress = read_capture_progress(&path);
+    if progress.take_count == 0 {
+        let next = next_take_index(&path);
+        if next > 1 {
+            progress.take_count = next - 1;
+            progress.completed_take = progress.take_count;
+        }
+    }
+
+    let stored_consent = read_session_consent(&path);
+    Ok(PreparedResume {
+        path: path.clone(),
+        title: read_session_title(&path).unwrap_or_else(|_| "Recall Session".to_string()),
+        consent_noted: cli_consent_noted
+            || stored_consent.is_some_and(|consent| !matches!(consent, ConsentMode::NotYet)),
+        progress,
+    })
+}
+
+#[derive(Debug, Default)]
+pub struct TuiExit {
+    pub session_path: Option<PathBuf>,
+    pub detached_logs: Vec<(PathBuf, PathBuf)>,
+}
+
+pub fn run_with_options(options: TuiOptions) -> io::Result<TuiExit> {
+    let resume = match &options.resume {
+        Some(target) => {
+            let storage_dir = options
+                .storage_dir
+                .clone()
+                .unwrap_or(default_storage_dir()?);
+            Some(prepare_resume(&storage_dir, target, options.consent_noted)?)
+        }
+        None => None,
+    };
     let mut terminal = ratatui::try_init()?;
-    let result = App::new(options)?.run(&mut terminal);
+    let result = App::new(options, resume)?.run(&mut terminal);
     let restore_result = ratatui::try_restore();
 
     match (result, restore_result) {
         (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(exit), Ok(())) => Ok(exit),
     }
 }
 
@@ -143,6 +228,9 @@ struct App {
     chunk_seconds: u64,
     note_draft: Option<String>,
     editor: Option<String>,
+    resumed: bool,
+    capture_lock: Option<CaptureLock>,
+    detached_logs: Vec<(PathBuf, PathBuf)>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +242,7 @@ struct TranscriptionStatus {
 }
 
 struct TranscriptionJob {
+    session_path: PathBuf,
     generation: u32,
     receiver: Receiver<TranscriptionUiEvent>,
 }
@@ -210,9 +299,9 @@ enum AnalysisUiEvent {
 }
 
 impl App {
-    fn new(options: TuiOptions) -> io::Result<Self> {
+    fn new(options: TuiOptions, resume: Option<PreparedResume>) -> io::Result<Self> {
         let consent_noted = options.consent_noted;
-        Ok(Self {
+        let mut app = Self {
             state: CaptureState::Ready,
             consent_noted,
             tick: 0,
@@ -267,10 +356,54 @@ impl App {
             chunk_seconds: options.chunk_seconds,
             note_draft: None,
             editor: options.editor,
-        })
+            resumed: false,
+            capture_lock: None,
+            detached_logs: Vec::new(),
+        };
+        if let Some(resume) = resume {
+            app.apply_resume(resume);
+        }
+        Ok(app)
     }
 
-    fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+    fn apply_resume(&mut self, resume: PreparedResume) {
+        let next_take = next_take_index(&resume.path);
+        self.state = CaptureState::Ended;
+        self.session_path = Some(resume.path.clone());
+        self.title = resume.title;
+        self.consent_noted = resume.consent_noted;
+        self.take_index = resume.progress.take_count.max(1);
+        self.completed_take = resume.progress.completed_take;
+        self.accumulated = Duration::from_millis(resume.progress.elapsed_ms);
+        self.started_at = None;
+        self.ended_at = None;
+        self.resumed = true;
+        let id = Self::session_label(&resume.path);
+        let clock = self.elapsed_label();
+        self.toast = format!(
+            "Resumed {id}. Space appends take {next_take}. Clock continues from {clock} (break not added)."
+        );
+        self.live_notes = vec![
+            format!("Resumed {}", resume.path.display()),
+            format!(
+                "Take {} of {} completed. Consent: {}.",
+                resume.progress.completed_take,
+                resume
+                    .progress
+                    .take_count
+                    .max(resume.progress.completed_take),
+                if self.consent_noted {
+                    "noted"
+                } else {
+                    "not noted"
+                }
+            ),
+            "Space or Enter records another take in this session.".to_string(),
+            "q leaves; next plain recall starts a new session.".to_string(),
+        ];
+    }
+
+    fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<TuiExit> {
         loop {
             self.process_mic_events();
             self.process_system_events();
@@ -282,7 +415,10 @@ impl App {
             if event::poll(TICK_RATE)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press && self.handle_key(key)? {
-                        return Ok(());
+                        return Ok(TuiExit {
+                            session_path: self.session_path.clone(),
+                            detached_logs: self.detached_logs.clone(),
+                        });
                     }
                 }
             }
@@ -298,26 +434,12 @@ impl App {
         }
 
         if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if self.has_background_jobs() {
-                self.toast =
-                    "Background work is running; wait for Recall to finish before quitting."
-                        .to_string();
-                return Ok(false);
-            }
-            self.stop_recorders();
-            return Ok(true);
+            return self.request_quit();
         }
 
         match key.code {
             KeyCode::Char('q') => {
-                if self.has_background_jobs() {
-                    self.toast =
-                        "Background work is running; wait for Recall to finish before quitting."
-                            .to_string();
-                    return Ok(false);
-                }
-                self.stop_recorders();
-                return Ok(true);
+                return self.request_quit();
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.primary_recording_action()?,
             KeyCode::Char('c') => self.toggle_consent(),
@@ -337,6 +459,48 @@ impl App {
         }
 
         Ok(false)
+    }
+
+    fn request_quit(&mut self) -> io::Result<bool> {
+        if matches!(self.state, CaptureState::Recording) {
+            self.end_capture();
+        }
+        if self.has_background_jobs() {
+            match self.detach_background_jobs() {
+                Ok(logs) => self.detached_logs = logs,
+                Err(error) => {
+                    self.toast = format!(
+                        "Could not keep processing after quit: {error}. Wait for Recall to finish, or try q again."
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        self.stop_recorders();
+        self.capture_lock = None;
+        Ok(true)
+    }
+
+    fn detach_background_jobs(&mut self) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+        let plans = self.detach_plans();
+        let exe = std::env::current_exe()?;
+        let mut logs = Vec::new();
+        for plan in plans {
+            let log_path = spawn_detached_postprocess(&exe, self, &plan)?;
+            logs.push((plan.session_path, log_path));
+        }
+        self.transcription_jobs.clear();
+        self.analysis_jobs.clear();
+        Ok(logs)
+    }
+
+    fn detach_plans(&self) -> Vec<DetachPlan> {
+        detach_plans_from_jobs(
+            &self.transcription_jobs,
+            &self.analysis_jobs,
+            self.auto_analyze,
+            self.agent.is_some(),
+        )
     }
 
     fn primary_recording_action(&mut self) -> io::Result<()> {
@@ -430,14 +594,17 @@ impl App {
         self.accumulated = Duration::ZERO;
         self.take_index = 1;
         self.completed_take = 0;
+        self.resumed = false;
         self.reset_capture_health();
-        let _ = write_capture_progress(
-            &session.path,
-            CaptureProgress {
-                take_count: 1,
-                completed_take: 0,
-            },
-        );
+        match acquire_capture_lock(&session.path) {
+            Ok(lock) => self.capture_lock = Some(lock),
+            Err(error) => {
+                self.session_path = Some(session.path);
+                self.state = CaptureState::Ended;
+                self.toast = error.to_string();
+                return Ok(());
+            }
+        }
 
         let (started, failures) = self.start_recorders(
             &session.path,
@@ -446,6 +613,7 @@ impl App {
         );
 
         if started.is_empty() {
+            self.capture_lock = None;
             self.state = CaptureState::Ended;
             self.started_at = None;
             self.ended_at = Some(Instant::now());
@@ -454,6 +622,14 @@ impl App {
                 failures.join("; ")
             );
         } else {
+            let _ = write_capture_progress(
+                &session.path,
+                CaptureProgress {
+                    take_count: 1,
+                    completed_take: 0,
+                    elapsed_ms: 0,
+                },
+            );
             self.state = CaptureState::Recording;
             self.toast = format!(
                 "Recording {}: {}",
@@ -486,29 +662,43 @@ impl App {
             return self.start_capture();
         };
 
-        if let Some(ended_at) = self.ended_at.take() {
+        let included_break = if let Some(ended_at) = self.ended_at.take() {
             self.accumulated += ended_at.elapsed();
-        }
+            true
+        } else {
+            false
+        };
 
         let continued = prepare_continued_take(&session_path)?;
         self.take_index = continued.take_index;
         self.reset_capture_health();
-        let _ = write_capture_progress(
-            &session_path,
-            CaptureProgress {
-                take_count: continued.take_index,
-                completed_take: self.completed_take,
-            },
-        );
+        match acquire_capture_lock(&session_path) {
+            Ok(lock) => self.capture_lock = Some(lock),
+            Err(error) => {
+                self.state = CaptureState::Ended;
+                self.ended_at = Some(Instant::now());
+                self.toast = error.to_string();
+                return Ok(());
+            }
+        }
 
         let (started, failures) =
             self.start_recorders(&session_path, &continued.mic_name, &continued.call_name);
 
         if started.is_empty() {
+            self.capture_lock = None;
             self.state = CaptureState::Ended;
             self.ended_at = Some(Instant::now());
             self.toast = format!("Could not continue this session: {}", failures.join("; "));
         } else {
+            let _ = write_capture_progress(
+                &session_path,
+                CaptureProgress {
+                    take_count: continued.take_index,
+                    completed_take: self.completed_take,
+                    elapsed_ms: self.elapsed().as_millis() as u64,
+                },
+            );
             self.started_at = Some(Instant::now());
             self.state = CaptureState::Recording;
             self.reset_analysis_gauge_for_new_take();
@@ -518,9 +708,11 @@ impl App {
             } else {
                 "Continuing this session. New audio will append.".to_string()
             };
-            self.live_notes.push(
-                "Continuing this session (audio appends; clock includes the break).".to_string(),
-            );
+            self.live_notes.push(if included_break {
+                "Continuing this session (audio appends; clock includes the break).".to_string()
+            } else {
+                "Continuing this session (audio appends; break not added to the clock).".to_string()
+            });
             self.live_notes.push(format!(
                 "Take {} writes audio/{} and audio/{}.",
                 continued.take_index, continued.mic_name, continued.call_name
@@ -609,6 +801,7 @@ impl App {
                         CaptureProgress {
                             take_count: self.take_index.max(1),
                             completed_take: self.completed_take,
+                            elapsed_ms: self.elapsed().as_millis() as u64,
                         },
                     ) {
                         self.toast = format!(
@@ -622,6 +815,7 @@ impl App {
                         let _ = copy_take1_aliases(session_path);
                     }
                 }
+                self.capture_lock = None;
                 self.start_transcription_job();
             }
             _ => {
@@ -631,8 +825,8 @@ impl App {
     }
 
     fn add_marker(&mut self) {
-        if !matches!(self.state, CaptureState::Recording) {
-            self.toast = "Start a session before adding markers.".to_string();
+        if self.session_path.is_none() {
+            self.toast = "Start or resume a session before adding markers.".to_string();
             return;
         }
 
@@ -649,8 +843,8 @@ impl App {
     }
 
     fn start_manual_note(&mut self) {
-        if !matches!(self.state, CaptureState::Recording) {
-            self.toast = "Start a session before adding notes.".to_string();
+        if self.session_path.is_none() {
+            self.toast = "Start or resume a session before adding notes.".to_string();
             return;
         }
 
@@ -973,6 +1167,7 @@ impl App {
 
         let (sender, receiver) = mpsc::channel();
         self.transcription_jobs.push(TranscriptionJob {
+            session_path: session_path.clone(),
             generation,
             receiver,
         });
@@ -1988,9 +2183,13 @@ impl App {
                 format!("Analysis agent: {}", self.agent_label()),
             ],
             CaptureState::Ended => vec![
-                "Audio finalized".to_string(),
-                "Space or Enter continues this session".to_string(),
-                "q leaves (next start is a new session)".to_string(),
+                if self.resumed {
+                    "Resumed previous session".to_string()
+                } else {
+                    "Audio finalized".to_string()
+                },
+                "Space or Enter records another take in this session".to_string(),
+                "q leaves (next plain recall starts a new session)".to_string(),
                 self.transcription_status.label.clone(),
                 self.analysis_status.label.clone(),
             ],
@@ -2093,6 +2292,148 @@ impl App {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetachPlan {
+    session_path: PathBuf,
+    generation: u32,
+    transcribe: bool,
+    analyze: bool,
+}
+
+fn detach_plans_from_jobs(
+    transcription_jobs: &[TranscriptionJob],
+    analysis_jobs: &[AnalysisJob],
+    auto_analyze: bool,
+    has_agent: bool,
+) -> Vec<DetachPlan> {
+    let mut plans = Vec::new();
+    for job in transcription_jobs {
+        let index = detach_plan_index(&mut plans, &job.session_path, job.generation);
+        plans[index].transcribe = true;
+        if auto_analyze && has_agent {
+            plans[index].analyze = true;
+        }
+    }
+    for job in analysis_jobs {
+        let index = detach_plan_index(&mut plans, &job.session_path, job.generation);
+        plans[index].analyze = true;
+    }
+    plans
+}
+
+fn detach_plan_index(plans: &mut Vec<DetachPlan>, path: &Path, generation: u32) -> usize {
+    if let Some(index) = plans.iter().position(|plan| plan.session_path == path) {
+        plans[index].generation = plans[index].generation.max(generation);
+        index
+    } else {
+        plans.push(DetachPlan {
+            session_path: path.to_path_buf(),
+            generation,
+            transcribe: false,
+            analyze: false,
+        });
+        plans.len() - 1
+    }
+}
+
+fn spawn_detached_postprocess(exe: &Path, app: &App, plan: &DetachPlan) -> io::Result<PathBuf> {
+    let work = internal_dir(&plan.session_path).join("work");
+    fs::create_dir_all(&work)?;
+    let log_path = work.join("postprocess.log");
+    let script_path = work.join("postprocess.sh");
+    fs::write(&script_path, postprocess_script(exe, app, plan, &log_path))?;
+
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg(&script_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    let _child = command.spawn()?;
+    Ok(log_path)
+}
+
+fn postprocess_script(exe: &Path, app: &App, plan: &DetachPlan, log_path: &Path) -> String {
+    let mut lines = vec![
+        "#!/bin/sh".to_string(),
+        "set -e".to_string(),
+        format!(
+            "exec >>{} 2>&1",
+            posix_single_quote(&log_path.to_string_lossy())
+        ),
+        format!(
+            "echo Recall postprocess started for {}",
+            posix_single_quote(&plan.session_path.to_string_lossy())
+        ),
+    ];
+    if plan.transcribe {
+        lines.push(transcribe_command_line(
+            exe,
+            app,
+            &plan.session_path,
+            plan.generation,
+        ));
+    }
+    if plan.analyze {
+        if let Some(agent) = &app.agent {
+            lines.push(format!(
+                "{} analyze {} --agent {} --preset {} --generation {}",
+                posix_single_quote(&exe.to_string_lossy()),
+                posix_single_quote(&plan.session_path.to_string_lossy()),
+                posix_single_quote(agent),
+                posix_single_quote(&app.preset),
+                plan.generation,
+            ));
+        }
+    }
+    lines.push("echo Recall postprocess finished".to_string());
+    lines.join("\n") + "\n"
+}
+
+fn transcribe_command_line(exe: &Path, app: &App, session_path: &Path, generation: u32) -> String {
+    let mut args = vec![
+        posix_single_quote(&exe.to_string_lossy()),
+        "transcribe".to_string(),
+        posix_single_quote(&session_path.to_string_lossy()),
+        "--engine".to_string(),
+        app.engine.as_str().to_string(),
+        "--chunk-seconds".to_string(),
+        app.chunk_seconds.to_string(),
+        "--generation".to_string(),
+        generation.to_string(),
+    ];
+    push_quoted_path_flag(&mut args, "--ffmpeg", app.ffmpeg_bin.as_deref());
+    push_quoted_path_flag(&mut args, "--whisper", app.whisper_bin.as_deref());
+    push_quoted_path_flag(&mut args, "--model", app.model_path.as_deref());
+    push_quoted_path_flag(&mut args, "--parakeet", app.parakeet_bin.as_deref());
+    if let Some(model) = &app.parakeet_model {
+        args.push("--parakeet-model".to_string());
+        args.push(posix_single_quote(model));
+    }
+    push_quoted_path_flag(
+        &mut args,
+        "--parakeet-cache-dir",
+        app.parakeet_cache_dir.as_deref(),
+    );
+    args.join(" ")
+}
+
+fn push_quoted_path_flag(args: &mut Vec<String>, flag: &str, path: Option<&Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    args.push(flag.to_string());
+    args.push(posix_single_quote(&path.to_string_lossy()));
+}
+
+fn posix_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 impl TranscriptionStatus {
     fn idle() -> Self {
         Self {
@@ -2164,6 +2505,7 @@ fn next_recording_action(state: CaptureState, has_session: bool) -> RecordingAct
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn test_app(current_session: PathBuf) -> App {
         App {
@@ -2214,6 +2556,9 @@ mod tests {
             chunk_seconds: TRANSCRIPTION_CHUNK_SECONDS,
             note_draft: None,
             editor: None,
+            resumed: false,
+            capture_lock: None,
+            detached_logs: Vec::new(),
         }
     }
 
@@ -2243,6 +2588,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut app = test_app(current_session.clone());
         app.transcription_jobs.push(TranscriptionJob {
+            session_path: previous_session.clone(),
             generation: 1,
             receiver,
         });
@@ -2376,6 +2722,7 @@ mod tests {
         app.auto_analyze = true;
         app.agent = Some("grok".to_string());
         app.transcription_jobs.push(TranscriptionJob {
+            session_path: current_session.clone(),
             generation: 1,
             receiver,
         });
@@ -2404,11 +2751,12 @@ mod tests {
     fn continue_is_allowed_while_take_one_jobs_are_running() {
         let current_session = PathBuf::from("/tmp/recall-continue-while-running");
         let (_sender, receiver) = mpsc::channel();
-        let mut app = test_app(current_session);
+        let mut app = test_app(current_session.clone());
         app.state = CaptureState::Ended;
         app.take_index = 1;
         app.completed_take = 1;
         app.transcription_jobs.push(TranscriptionJob {
+            session_path: current_session,
             generation: 1,
             receiver,
         });
@@ -2457,5 +2805,206 @@ mod tests {
             .live_notes
             .iter()
             .any(|note| note.contains("Ignored stale take 1 analysis")));
+    }
+
+    #[test]
+    fn resume_opens_ended_session_and_space_continues_the_same_folder() {
+        let storage = std::env::temp_dir().join(format!(
+            "recall-tui-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let session = start_session(&StartOptions {
+            title: "Design Sync".to_string(),
+            consent: ConsentMode::Noted,
+            storage_dir: storage.clone(),
+        })
+        .unwrap();
+        let audio = session.path.join("audio");
+        fs::create_dir_all(&audio).unwrap();
+        fs::write(audio.join("mic-001.m4a"), b"mic").unwrap();
+        fs::write(audio.join("call-001.m4a"), b"call").unwrap();
+        write_capture_progress(
+            &session.path,
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 1,
+                elapsed_ms: 724_000,
+            },
+        )
+        .unwrap();
+
+        let prepared = prepare_resume(&storage, &ResumeTarget::Latest, false).unwrap();
+        assert_eq!(prepared.path, session.path);
+        assert_eq!(prepared.title, "Design Sync");
+        assert!(prepared.consent_noted);
+
+        let mut app = test_app(session.path.clone());
+        app.apply_resume(prepared);
+        assert_eq!(app.state, CaptureState::Ended);
+        assert_eq!(app.session_path.as_ref(), Some(&session.path));
+        assert_eq!(app.accumulated, Duration::from_millis(724_000));
+        assert!(app.ended_at.is_none());
+        assert_eq!(
+            next_recording_action(app.state, app.session_path.is_some()),
+            RecordingAction::Continue
+        );
+        assert!(app.toast.contains("Resumed"));
+        assert!(app.toast.contains("take 2"));
+        assert!(app.toast.contains("12:04"));
+        assert!(app.toast.contains("break not added"));
+
+        let continued = prepare_continued_take(&session.path).unwrap();
+        assert_eq!(continued.take_index, 2);
+        assert_eq!(
+            fs::read_dir(&storage)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .count(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn resume_refuses_an_in_progress_take() {
+        let storage = std::env::temp_dir().join(format!(
+            "recall-tui-resume-busy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let session = start_session(&StartOptions {
+            title: "Busy".to_string(),
+            consent: ConsentMode::Noted,
+            storage_dir: storage.clone(),
+        })
+        .unwrap();
+        write_capture_progress(
+            &session.path,
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 0,
+                elapsed_ms: 1_000,
+            },
+        )
+        .unwrap();
+
+        let error =
+            prepare_resume(&storage, &ResumeTarget::Named(session.id.clone()), false).unwrap_err();
+        assert!(error.to_string().contains("unfinished take"));
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn resumed_ended_session_allows_notes_and_does_not_add_overnight_gap() {
+        let mut app = test_app(PathBuf::from("/tmp/recall-resume-notes"));
+        app.apply_resume(PreparedResume {
+            path: PathBuf::from("/tmp/recall-resume-notes"),
+            title: "Grill supper".to_string(),
+            consent_noted: true,
+            progress: CaptureProgress {
+                take_count: 1,
+                completed_take: 1,
+                elapsed_ms: 60_000,
+            },
+        });
+        assert_eq!(app.elapsed_label(), "01:00");
+        app.start_manual_note();
+        assert!(app.note_draft.is_some());
+        assert!(app.ended_at.is_none());
+    }
+
+    #[test]
+    fn posix_single_quote_escapes_embedded_quotes() {
+        assert_eq!(posix_single_quote("plain"), "'plain'");
+        assert_eq!(posix_single_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn detached_transcribe_command_passes_generation() {
+        let app = test_app(PathBuf::from("/tmp/recall-command-line"));
+        let line =
+            transcribe_command_line(Path::new("/tmp/recall"), &app, Path::new("/tmp/session"), 2);
+        assert!(line.contains(" transcribe "));
+        assert!(line.contains("--generation 2"));
+        assert!(line.contains("'/tmp/session'"));
+    }
+
+    #[test]
+    fn quit_detach_plan_reruns_transcribe_and_follow_on_analysis() {
+        let session = PathBuf::from("/tmp/recall-detach-session");
+        let (_sender, receiver) = mpsc::channel();
+        let jobs = [TranscriptionJob {
+            session_path: session.clone(),
+            generation: 1,
+            receiver,
+        }];
+        let plans = detach_plans_from_jobs(&jobs, &[], true, true);
+        assert_eq!(
+            plans,
+            vec![DetachPlan {
+                session_path: session,
+                generation: 1,
+                transcribe: true,
+                analyze: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn quit_detach_plan_reruns_analysis_only_when_transcript_already_finished() {
+        let session = PathBuf::from("/tmp/recall-detach-analysis");
+        let (_sender, receiver) = mpsc::channel();
+        let jobs = [AnalysisJob {
+            session_path: session.clone(),
+            generation: 1,
+            receiver,
+        }];
+        let plans = detach_plans_from_jobs(&[], &jobs, true, true);
+        assert_eq!(
+            plans,
+            vec![DetachPlan {
+                session_path: session,
+                generation: 1,
+                transcribe: false,
+                analyze: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn quit_detach_plan_keeps_the_newest_take_generation() {
+        let session = PathBuf::from("/tmp/recall-detach-generations");
+        let (_sender_one, receiver_one) = mpsc::channel();
+        let (_sender_two, receiver_two) = mpsc::channel();
+        let transcription = [TranscriptionJob {
+            session_path: session.clone(),
+            generation: 1,
+            receiver: receiver_one,
+        }];
+        let analysis = [AnalysisJob {
+            session_path: session.clone(),
+            generation: 2,
+            receiver: receiver_two,
+        }];
+        let plans = detach_plans_from_jobs(&transcription, &analysis, true, true);
+        assert_eq!(
+            plans,
+            vec![DetachPlan {
+                session_path: session,
+                generation: 2,
+                transcribe: true,
+                analyze: true,
+            }]
+        );
     }
 }

@@ -67,6 +67,30 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
+`cargo test` already runs unit tests and `tests/cli_smoke.rs`, which invokes the compiled `recall` binary. Use that (or `cargo run -- <args>`) to verify CLI behavior from this checkout. Do not ask the user to `cargo install` or start a live meeting just to prove flag parsing, resume errors, or other non-TUI paths.
+
+The interactive TUI needs a real terminal. Agent command output is not a TTY (`TERM=dumb`, piped stdin/stdout), so `cargo run` cannot drive the dashboard or press Space here.
+
+### Feature capture tests
+
+When the task is a capture, resume, transcription, or recorder-path change, agents may run a **short, obvious, throwaway** mic/system recording to verify the feature. This is standing permission for that kind of work only. Do not record during docs-only, CLI-parse, or unrelated changes.
+
+Rules:
+
+- Use a temp `--session-dir` / `--storage` under the system temp directory. Never write test captures into the user's real `sessions/`.
+- Prefer the duration-limited Swift helper, which does not need a TUI:
+
+```sh
+swift run --package-path capture-helper recall-capture record-mic --session-dir /tmp/recall-agent-smoke --duration 3
+swift run --package-path capture-helper recall-capture record-audio-tap --session-dir /tmp/recall-agent-smoke --duration 3
+```
+
+- Keep it a few seconds. Do not leave recorders running.
+- Do not hide, disguise, or background-capture after the test. Delete the temp session when finished.
+- Do not commit those files. macOS may still prompt for Microphone / System Audio Recording; if permission is denied, report that and stop rather than bypassing it.
+
+The installed `~/.cargo/bin/recall` is a separate binary. Source edits are verified with `cargo test` / `cargo run`; install only when the user wants their shell `recall` command refreshed.
+
 For docs-only changes, run:
 
 ```sh
