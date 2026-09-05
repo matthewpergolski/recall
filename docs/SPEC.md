@@ -79,6 +79,8 @@ sessions/
     audio/
       mic.m4a
       call.m4a
+      mic-001.m4a
+      call-001.m4a
     .recall/
       metadata.json
       markers.md

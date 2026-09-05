@@ -1,4 +1,5 @@
 mod analysis;
+mod audio;
 mod capture_sources;
 mod config;
 mod mic_recorder;
@@ -19,10 +20,11 @@ use session::{
     primary_document_path, start_session, ConsentMode, StartOptions,
 };
 use transcription::{
-    find_parakeet_binary, parakeet_binary_doctor_level, parakeet_model_is_cached,
-    resolve_parakeet_cache_dir_for_options, resolve_parakeet_model_id, transcribe_with_progress,
-    DoctorCheckLevel, TrackSelection, TranscribeOptions, TranscribeTarget, TranscriptionEngine,
-    TranscriptionProgress, DEFAULT_PARAKEET_BIN, PARAKEET_INSTALL_HINT,
+    find_parakeet_binary, format_bytes, format_model_download_label, parakeet_binary_doctor_level,
+    parakeet_model_is_cached, resolve_parakeet_cache_dir_for_options, resolve_parakeet_model_id,
+    transcribe_with_progress, DoctorCheckLevel, TrackSelection, TranscribeOptions,
+    TranscribeTarget, TranscriptionEngine, TranscriptionProgress, DEFAULT_PARAKEET_BIN,
+    PARAKEET_INSTALL_HINT,
 };
 use tui::TuiOptions;
 use update::{update, UpdateOptions};
@@ -323,6 +325,33 @@ fn run_transcribe(args: Vec<String>, tui_defaults: &TuiOptions) {
             if let Some(note) = note {
                 eprintln!("{note}");
             }
+        }
+        TranscriptionProgress::ModelDownloadStarted {
+            model,
+            cache_path,
+            expected_bytes,
+        } => {
+            eprintln!(
+                "Downloading Parakeet model ({model}, ~{}) — one-time",
+                format_bytes(expected_bytes)
+            );
+            eprintln!("Cache: {}", cache_path.display());
+        }
+        TranscriptionProgress::ModelDownloadProgress {
+            model,
+            downloaded_bytes,
+            total_bytes,
+            bytes_per_sec,
+            ..
+        } => {
+            eprint!(
+                "\r{}",
+                format_model_download_label(&model, downloaded_bytes, total_bytes, bytes_per_sec,)
+            );
+        }
+        TranscriptionProgress::ModelDownloadFinished { cache_path, .. } => {
+            eprintln!();
+            eprintln!("Parakeet model ready at {}", cache_path.display());
         }
         TranscriptionProgress::ChunkStarted {
             track,
@@ -923,6 +952,7 @@ fn parse_transcribe_options(
         chunk_seconds,
         keep_wav,
         require_parakeet,
+        generation: None,
     })
 }
 
@@ -990,6 +1020,7 @@ fn parse_analyze_options(
         agent,
         preset,
         dry_run,
+        generation: None,
     })
 }
 

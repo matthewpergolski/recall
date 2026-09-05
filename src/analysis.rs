@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::audio::{generation_is_current, lock_session_publish, session_folder_is_sticky};
 use crate::session::{
     analysis_dir, default_storage_dir, list_sessions, markers_path, metadata_path, notes_path,
     read_session_title,
@@ -18,6 +19,7 @@ pub struct AnalyzeOptions {
     pub agent: String,
     pub preset: String,
     pub dry_run: bool,
+    pub generation: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +37,7 @@ pub struct AnalyzeResult {
     pub written_files: Vec<PathBuf>,
     pub generated_title: Option<String>,
     pub dry_run: bool,
+    pub published: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +93,9 @@ struct Followup {
 
 pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
     let mut session_path = resolve_session_path(options)?;
+    if analysis_generation_is_stale(&session_path, options.generation) {
+        return Ok(stale_analyze_result(&session_path));
+    }
     let transcript_path = session_path.join("transcript.md");
     if !transcript_path.exists() {
         return Err(io::Error::new(
@@ -98,7 +104,7 @@ pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
         ));
     }
 
-    let debug_dir = analysis_dir(&session_path);
+    let debug_dir = analysis_work_dir(&session_path, options.generation);
     if debug_dir.exists() {
         fs::remove_dir_all(&debug_dir)?;
     }
@@ -117,6 +123,7 @@ pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
             written_files: Vec::new(),
             generated_title: None,
             dry_run: true,
+            published: true,
         });
     }
 
@@ -153,11 +160,18 @@ pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
     })?;
 
     let generated_title = normalized_title(result.title.as_deref());
-    if let Some(title) = &generated_title {
-        session_path = rename_session_dir_for_title(&session_path, title)?;
+    if options.generation.is_none() {
+        if let Some(title) = &generated_title {
+            session_path = maybe_rename_session_dir_for_title(&session_path, title)?;
+        }
     }
 
-    let debug_dir = analysis_dir(&session_path);
+    let _lock = lock_session_publish(&session_path)?;
+    if analysis_generation_is_stale(&session_path, options.generation) {
+        return Ok(stale_analyze_result(&session_path));
+    }
+
+    let debug_dir = analysis_work_dir(&session_path, options.generation);
     let prompt_path = debug_dir.join("prompt.md");
     let raw_output_path = debug_dir.join(profile.raw_output_file);
     let result_path = debug_dir.join("agent-result.json");
@@ -172,7 +186,35 @@ pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
         written_files,
         generated_title,
         dry_run: false,
+        published: true,
     })
+}
+
+fn analysis_work_dir(session_path: &Path, generation: Option<u32>) -> PathBuf {
+    match generation {
+        Some(generation) => analysis_dir(session_path).join(format!("take-{generation:03}")),
+        None => analysis_dir(session_path),
+    }
+}
+
+fn analysis_generation_is_stale(session_path: &Path, generation: Option<u32>) -> bool {
+    match generation {
+        Some(generation) => !generation_is_current(session_path, generation),
+        None => false,
+    }
+}
+
+fn stale_analyze_result(session_path: &Path) -> AnalyzeResult {
+    AnalyzeResult {
+        prompt_path: analysis_dir(session_path).join("prompt.md"),
+        session_path: session_path.to_path_buf(),
+        raw_output_path: None,
+        result_path: None,
+        written_files: Vec::new(),
+        generated_title: None,
+        dry_run: false,
+        published: false,
+    }
 }
 
 pub fn known_agents() -> Vec<&'static str> {
@@ -448,6 +490,16 @@ fn extract_json_object(output: &str) -> Option<&str> {
     let start = output.find('{')?;
     let end = output.rfind('}')?;
     (start <= end).then_some(&output[start..=end])
+}
+
+pub(crate) fn maybe_rename_session_dir_for_title(
+    session_path: &Path,
+    title: &str,
+) -> io::Result<PathBuf> {
+    if session_folder_is_sticky(session_path) {
+        return Ok(session_path.to_path_buf());
+    }
+    rename_session_dir_for_title(session_path, title)
 }
 
 fn rename_session_dir_for_title(session_path: &Path, title: &str) -> io::Result<PathBuf> {
@@ -771,9 +823,11 @@ fn append_detail(markdown: &mut String, label: &str, value: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_agent_result_json, known_agents, meeting_markdown, session_timestamp_prefix,
-        title_slug, ActionItem, AgentMeetingResult, Decision,
+        analysis_work_dir, extract_agent_result_json, known_agents,
+        maybe_rename_session_dir_for_title, meeting_markdown, session_timestamp_prefix, title_slug,
+        write_analysis_markdown, ActionItem, AgentMeetingResult, Decision,
     };
+    use crate::audio::{write_capture_progress, CaptureProgress};
     use std::fs;
 
     #[test]
@@ -895,5 +949,80 @@ mod tests {
         assert!(markdown.contains("[Transcript](transcript.md)"));
 
         let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn overlapping_takes_use_separate_analysis_directories() {
+        let session = std::path::Path::new("/tmp/recall-session");
+        assert_eq!(
+            analysis_work_dir(session, None),
+            session.join(".recall/analysis")
+        );
+        assert_eq!(
+            analysis_work_dir(session, Some(1)),
+            session.join(".recall/analysis/take-001")
+        );
+        assert_ne!(
+            analysis_work_dir(session, Some(1)),
+            analysis_work_dir(session, Some(2))
+        );
+    }
+
+    #[test]
+    fn analysis_overwrite_keeps_notes_and_markers() {
+        let session_dir =
+            std::env::temp_dir().join(format!("recall-analysis-keep-notes-{}", std::process::id()));
+        fs::create_dir_all(session_dir.join(".recall")).unwrap();
+        fs::write(
+            session_dir.join(".recall/notes.md"),
+            "# Notes: Keep Me\n\n- `12:10` Stay in the folder\n",
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join(".recall/markers.md"),
+            "# Markers: Keep Me\n\n- `12:11` Marker\n",
+        )
+        .unwrap();
+        fs::write(session_dir.join("meeting.md"), "# Old meeting\n").unwrap();
+
+        let result = AgentMeetingResult {
+            title: Some("Replacement Notes".to_string()),
+            summary: Some("Do-over summary.".to_string()),
+            ..AgentMeetingResult::default()
+        };
+        write_analysis_markdown(&session_dir, &result, Some("Replacement Notes")).unwrap();
+
+        let notes = fs::read_to_string(session_dir.join(".recall/notes.md")).unwrap();
+        let markers = fs::read_to_string(session_dir.join(".recall/markers.md")).unwrap();
+        let meeting = fs::read_to_string(session_dir.join("meeting.md")).unwrap();
+        assert!(notes.contains("Stay in the folder"));
+        assert!(markers.contains("`12:11` Marker"));
+        assert!(meeting.contains("Do-over summary."));
+        assert!(meeting.contains("Stay in the folder"));
+
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn continued_session_folder_name_stays_sticky() {
+        let storage =
+            std::env::temp_dir().join(format!("recall-sticky-rename-{}", std::process::id()));
+        let session = storage.join("05-26-2026_7-21pm-et-quick-capture");
+        fs::create_dir_all(&session).unwrap();
+        write_capture_progress(
+            &session,
+            CaptureProgress {
+                take_count: 2,
+                completed_take: 1,
+            },
+        )
+        .unwrap();
+
+        let renamed = maybe_rename_session_dir_for_title(&session, "Better Title").unwrap();
+        assert_eq!(renamed, session);
+        assert!(session.exists());
+        assert!(!storage.join("05-26-2026_7-21pm-et-better-title").exists());
+
+        let _ = fs::remove_dir_all(storage);
     }
 }

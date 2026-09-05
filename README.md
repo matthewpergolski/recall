@@ -145,7 +145,7 @@ uv tool install parakeet-mlx
 recall transcribe latest
 ```
 
-First Parakeet run may download `mlx-community/parakeet-tdt-0.6b-v3`. NVIDIA Parakeet TDT 0.6B v3 is CC-BY-4.0; credit NVIDIA / the model. `recall doctor` warns if `parakeet-mlx` is missing and still checks `whisper-cli`. Use `--engine whisper` for the Whisper fallback.
+First Parakeet run downloads `mlx-community/parakeet-tdt-0.6b-v3` (~1.2 GB) into the local Hugging Face cache. Recall shows that as a one-time download phase with size, rate, and cache path, then starts transcription. NVIDIA Parakeet TDT 0.6B v3 is CC-BY-4.0; credit NVIDIA / the model. `recall doctor` warns if `parakeet-mlx` is missing and still checks `whisper-cli`. Use `--engine whisper` for the Whisper fallback.
 
 ## Usage
 
@@ -167,7 +167,7 @@ Start with a session title:
 recall --title "Project sync"
 ```
 
-When you press Space or Enter to end a recording, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready. You can start another recording while a previous session continues transcribing or analyzing in the background.
+When you press Space or Enter to end a recording, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready. If you stay in that TUI session and press Space or Enter again, Recall continues the same meeting folder with a new audio take. Quitting (`q` / Ctrl+C) and launching Recall again starts a new session.
 
 You can also transcribe manually:
 
@@ -280,8 +280,8 @@ recall export latest --output ~/Desktop/project-sync.md
 ## TUI Keys
 
 - `c`: toggle consent noted
-- `Space` or `Enter`: start recording when idle; end and finalize when recording
-- transcript progress starts after recording ends
+- `Space` or `Enter`: start recording when idle; end and finalize when recording; continue the same session after it ends
+- transcript progress starts after recording ends; a continued take re-transcribes the full concatenated audio
 - `r`: refresh detected sources
 - `m`: add a timestamped marker to the session
 - `n`: type a timestamped note, then `Enter` saves it with the session
@@ -289,7 +289,7 @@ recall export latest --output ~/Desktop/project-sync.md
 - `O`: open the meeting document
 - `q` or `Ctrl+C`: quit
 
-Pause/resume is intentionally disabled for real recording until segmented audio capture is implemented.
+Pause/resume without ending the take is still disabled. Ending finalizes the current `m4a` files so transcription can start; continuing writes the next numbered take into the same session.
 
 ## Session Files
 
@@ -303,6 +303,10 @@ sessions/
     audio/
       mic.m4a
       call.m4a
+      mic-001.m4a
+      call-001.m4a
+      mic-002.m4a   # present after a continued take
+      call-002.m4a
     .recall/
       metadata.json
       markers.md

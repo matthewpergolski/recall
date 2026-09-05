@@ -69,6 +69,8 @@ Smaller chunks show progress more often and reduce per-process working size. Lar
 
 Transcription time still scales with meeting length, number of tracks, model size, and machine speed. On Apple Silicon with `whisper.cpp`, short tests are fast, but multi-hour meetings should be expected to run after the call. The TUI starts this automatically in the background after the user ends the recording.
 
+The first Parakeet run downloads NVIDIA Parakeet TDT 0.6B v3 (~1.2 GB) into the Hugging Face cache (`~/.cache/huggingface/hub/models--mlx-community--parakeet-tdt-0.6b-v3` unless `HF_HOME` or `--parakeet-cache-dir` is set). Recall treats that as its own phase: the TUI says it is downloading, shows MB downloaded / total, rate, and the cache path, and does not label it as transcription progress. Later sessions reuse the cache. If the download fails (offline, proxy, stall), the transcript status is a download error rather than a frozen 8%.
+
 If you only need one side for a quick check, transcribe one track:
 
 ```sh
@@ -153,7 +155,11 @@ Larger models cost more local compute time but should improve transcript quality
 
 The TUI starts transcription automatically after the user presses Space or Enter to end a recording. The status area shows current transcript progress, including the active track/chunk, and shows the final `transcript.md` path when complete.
 
-Recall can keep processing a finished session while the user starts another recording. Background transcription and analysis jobs are session-scoped, so a previous session finishing should not overwrite the currently active session display.
+If you stay in that TUI session and press Space or Enter again, Recall continues the same folder. Recorders write the next numbered take (`mic-002.m4a` / `call-002.m4a`). Ending that take concatenates every take in order and re-transcribes the full mic and call tracks. Transcript timestamps follow concatenated audio time, not the TUI clock; the TUI clock includes the break between takes, and the audio does not insert silence for that gap.
+
+A continued take can start while take 1 is still transcribing or analyzing. Those jobs keep running. The later take's full re-transcribe and analysis replace `transcript.md` and `meeting.md`. A late take-1 completion does not overwrite newer take outputs. Notes and markers accumulate. Quitting the TUI and launching Recall again starts a new session.
+
+Recall can keep processing a finished session while the user starts another recording. Background transcription and analysis jobs are session-scoped, so a previous session finishing should not overwrite the currently active session display. Continued takes use the same session-scoped rule, keyed by take generation.
 
 The direct command still exists for re-running or debugging transcription:
 
@@ -165,7 +171,7 @@ recall transcribe /path/to/session
 End-state behavior should be:
 
 1. User ends a recording in the TUI.
-2. Recall finalizes `audio/mic.m4a` and `audio/call.m4a`.
+2. Recall finalizes the current take (`audio/mic-001.m4a` and `audio/call-001.m4a`, plus convenience `mic.m4a` / `call.m4a` aliases).
 3. Recall automatically starts transcription.
 4. Recall writes `transcript.md`.
 5. If auto-analysis is enabled, Recall runs the selected headless agent and writes one complete `meeting.md` from the transcript.
