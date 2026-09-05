@@ -181,12 +181,23 @@ chunk_seconds = 600
 
 ## macOS Permissions
 
-The real capture implementation will need macOS permissions:
+Recall needs macOS permission for:
 
 - Microphone
-- System/call audio capture permissions as required by macOS
+- System audio recording
 
-The default system/call audio path uses CoreAudio process taps. ScreenCaptureKit remains as a fallback and may trigger broader Screen Recording prompts. Prefer testing from a dedicated terminal app so permissions are scoped to that launcher rather than an IDE.
+macOS attributes these permissions to the application that launches Recall, not to the `recall` command as a standalone app. Apple Terminal, Ghostty, VS Code, and Codex therefore have independent permission entries. If Recall works in Apple Terminal but records silent system audio in Ghostty, enable Ghostty under:
+
+```text
+System Settings -> Privacy & Security -> Screen & System Audio Recording
+                -> System Audio Recording Only
+```
+
+Also enable the same launcher under **Microphone**. If it is missing from either list, use the `+` control to add the application. Fully quit and reopen the launcher after changing permission; opening a new shell tab is not always sufficient.
+
+The default system/call path uses CoreAudio process taps and should use the narrower **System Audio Recording Only** permission. ScreenCaptureKit remains a fallback and may trigger the broader **Screen & System Audio Recording** prompt.
+
+Validate access by playing a short video or macOS sound while Recall records. The **Call** meter should move. A process tap may start and create `audio/call.m4a` even when the resulting track is silent, so `recall audio-tap-probe` and file existence are not complete signal tests.
 
 ## Swift Helper Commands
 

@@ -15,8 +15,8 @@ use crate::analysis::{analyze, known_agents, AnalyzeOptions, AnalyzeTarget};
 use crate::capture_sources::{detect_sources, SourceSummary};
 use crate::mic_recorder::MicRecorder;
 use crate::session::{
-    append_session_marker, append_session_note, default_storage_dir, start_session, ConsentMode,
-    StartOptions,
+    append_session_marker, append_session_note, default_storage_dir, open_path,
+    primary_document_path, start_session, ConsentMode, StartOptions,
 };
 use crate::system_recorder::SystemRecorder;
 use crate::transcription::{
@@ -46,6 +46,7 @@ pub struct TuiOptions {
     pub agent: Option<String>,
     pub auto_analyze: bool,
     pub preset: String,
+    pub editor: Option<String>,
 }
 
 impl Default for TuiOptions {
@@ -61,6 +62,7 @@ impl Default for TuiOptions {
             agent: None,
             auto_analyze: true,
             preset: "general".to_string(),
+            editor: None,
         }
     }
 }
@@ -116,6 +118,7 @@ struct App {
     model_path: Option<PathBuf>,
     chunk_seconds: u64,
     note_draft: Option<String>,
+    editor: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +225,7 @@ impl App {
             model_path: options.model_path,
             chunk_seconds: options.chunk_seconds,
             note_draft: None,
+            editor: options.editor,
         })
     }
 
@@ -286,6 +290,8 @@ impl App {
             KeyCode::Char('r') => self.refresh_sources(),
             KeyCode::Char('a') => self.toggle_auto_analyze(),
             KeyCode::Char('A') => self.cycle_agent(),
+            KeyCode::Char('o') => self.open_session_folder(),
+            KeyCode::Char('O') => self.open_session_document(),
             _ => {}
         }
 
@@ -578,6 +584,33 @@ impl App {
 
         self.agent = next;
         self.toast = format!("Agent set to {}.", self.agent_label());
+    }
+
+    fn open_session_document(&mut self) {
+        let Some(session_path) = self.session_path.clone() else {
+            self.toast = "No session yet. Start a recording first.".to_string();
+            return;
+        };
+        let document_path = primary_document_path(&session_path);
+        if !document_path.exists() {
+            self.toast = format!("No meeting document in {}", session_path.display());
+            return;
+        }
+        match open_path(&document_path, None) {
+            Ok(()) => self.toast = format!("Opened {}", document_path.display()),
+            Err(error) => self.toast = format!("Could not open meeting: {error}"),
+        }
+    }
+
+    fn open_session_folder(&mut self) {
+        let Some(session_path) = self.session_path.clone() else {
+            self.toast = "No session yet. Start a recording first.".to_string();
+            return;
+        };
+        match open_path(&session_path, self.editor.as_deref()) {
+            Ok(()) => self.toast = format!("Opened {}", session_path.display()),
+            Err(error) => self.toast = format!("Could not open session folder: {error}"),
+        }
     }
 
     fn process_mic_events(&mut self) {
@@ -1391,19 +1424,39 @@ impl App {
         self.agent.clone().unwrap_or_else(|| "none".to_string())
     }
 
+    fn editor_label(&self) -> String {
+        self.editor
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && *value != "open")
+            .unwrap_or("Finder")
+            .to_string()
+    }
+
+    fn open_shortcuts_line(&self) -> Line<'static> {
+        Line::from(vec![
+            Span::styled("Open: ", Style::default().fg(Color::Gray)),
+            Span::styled(" o ", Style::default().fg(Color::Black).bg(Color::Blue)),
+            Span::raw(format!(" folder in {}  ", self.editor_label())),
+            Span::styled(" O ", Style::default().fg(Color::Black).bg(Color::Blue)),
+            Span::raw(" meeting.md"),
+        ])
+    }
+
     fn render_live_recall(&self, frame: &mut Frame, area: Rect) {
         let session = self
             .session_path
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "No session yet".to_string());
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled("Session: ", Style::default().fg(Color::Gray)),
-                Span::raw(session),
-            ]),
-            self.capture_health_line(),
-        ];
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Session: ", Style::default().fg(Color::Gray)),
+            Span::raw(session),
+        ])];
+        if self.session_path.is_some() {
+            lines.push(self.open_shortcuts_line());
+        }
+        lines.push(self.capture_health_line());
         if self.has_background_jobs() {
             lines.push(self.background_jobs_line());
         }
@@ -1459,6 +1512,7 @@ impl App {
                 lines.push(Line::from(vec![
                     Span::styled("Meeting: ", Style::default().fg(Color::Gray)),
                     Span::raw(path.display().to_string()),
+                    Span::styled("  (O)", Style::default().fg(Color::DarkGray)),
                 ]));
             }
             lines.push(Line::raw(""));
@@ -1662,6 +1716,10 @@ impl App {
             Span::raw(" auto-ai  "),
             Span::styled(" A ", Style::default().fg(Color::Black).bg(Color::Green)),
             Span::raw(" agent  "),
+            Span::styled(" o ", Style::default().fg(Color::Black).bg(Color::Blue)),
+            Span::raw(" folder  "),
+            Span::styled(" O ", Style::default().fg(Color::Black).bg(Color::Blue)),
+            Span::raw(" meeting  "),
             Span::styled(" q ", Style::default().fg(Color::Black).bg(Color::Gray)),
             Span::raw(" quit  "),
             Span::styled(
@@ -1774,6 +1832,7 @@ mod tests {
             model_path: None,
             chunk_seconds: TRANSCRIPTION_CHUNK_SECONDS,
             note_draft: None,
+            editor: None,
         }
     }
 

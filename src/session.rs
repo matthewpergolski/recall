@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -270,6 +271,53 @@ pub fn primary_document_path(session_path: &Path) -> PathBuf {
         }
     }
     session_path.join("meeting.md")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorInvocation {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+pub fn editor_invocation(path: &Path, editor: Option<&str>) -> EditorInvocation {
+    let path = path.to_string_lossy().into_owned();
+    match editor
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "open")
+    {
+        None => EditorInvocation {
+            program: "open".to_string(),
+            args: vec![path],
+        },
+        Some(name) if looks_like_mac_app_name(name) => EditorInvocation {
+            program: "open".to_string(),
+            args: vec!["-a".to_string(), name.to_string(), path],
+        },
+        Some(name) => EditorInvocation {
+            program: name.to_string(),
+            args: vec![path],
+        },
+    }
+}
+
+fn looks_like_mac_app_name(name: &str) -> bool {
+    name.ends_with(".app") || name.contains(' ')
+}
+
+pub fn open_path(path: &Path, editor: Option<&str>) -> io::Result<()> {
+    let invocation = editor_invocation(path, editor);
+    let status = Command::new(&invocation.program)
+        .args(&invocation.args)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "`{}` failed to open {}",
+            invocation.program,
+            path.display()
+        )))
+    }
 }
 
 pub fn read_session_title(session_path: &Path) -> io::Result<String> {
@@ -567,12 +615,32 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_session_marker, append_session_note, eastern_offset_hours, escape_json,
-        export_session, list_sessions, mark_transcript_ready, readable_eastern_timestamp_for,
-        slugify, start_session, ConsentMode, StartOptions,
+        append_session_marker, append_session_note, eastern_offset_hours, editor_invocation,
+        escape_json, export_session, list_sessions, mark_transcript_ready,
+        readable_eastern_timestamp_for, slugify, start_session, ConsentMode, StartOptions,
     };
     use std::fs;
+    use std::path::Path;
     use time::{Date, Month};
+
+    #[test]
+    fn editor_invocation_defaults_to_macos_open() {
+        let path = Path::new("/tmp/recall-session");
+        let open = editor_invocation(path, None);
+        assert_eq!(open.program, "open");
+        assert_eq!(open.args, vec!["/tmp/recall-session"]);
+
+        let code = editor_invocation(path, Some("code"));
+        assert_eq!(code.program, "code");
+        assert_eq!(code.args, vec!["/tmp/recall-session"]);
+
+        let app = editor_invocation(path, Some("Visual Studio Code"));
+        assert_eq!(app.program, "open");
+        assert_eq!(
+            app.args,
+            vec!["-a", "Visual Studio Code", "/tmp/recall-session"]
+        );
+    }
 
     #[test]
     fn parses_consent_modes() {

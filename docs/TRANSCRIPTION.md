@@ -123,6 +123,10 @@ Status: initial implementation exists. It is conservative and should be validate
 
 The default documented model, `ggml-base.en.bin`, is fast and convenient, but real casual calls expose its limits. Proper nouns, local place names, fast speech, road noise, speakerphone bleed, and navigation prompts can produce odd words or repeated hallucinated phrases.
 
+On silent or near-silent call audio, Whisper often invents short polite phrases such as `You` or `Thank you.` Those lines are model hallucinations, not meeting speech. A moving **Call** meter during capture is the check that the call track actually had sound. The current local default on this machine is `ggml-large-v3-turbo.bin`, which is stronger than `base.en` but can still hallucinate on empty audio.
+
+A later transcription option is NVIDIA **Parakeet TDT 0.6B v3** (via `parakeet-mlx` on Apple Silicon). It is smaller than Whisper turbo, often more accurate on English, and much faster, but it is a second engine, not a drop-in ggml file. Keep Whisper as the default until that backend exists.
+
 Before over-tuning merge heuristics, also test a larger local model:
 
 ```sh
