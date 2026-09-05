@@ -17,7 +17,7 @@ pub struct StartOptions {
     pub storage_dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsentMode {
     Noted,
     Verbal,
@@ -344,6 +344,60 @@ pub fn latest_session(storage_dir: &Path) -> io::Result<PathBuf> {
         })
 }
 
+pub fn is_session_dir(path: &Path) -> bool {
+    path.is_dir() && metadata_path(path).exists()
+}
+
+pub fn resolve_session_target(storage_dir: &Path, target: &str) -> io::Result<PathBuf> {
+    let target = target.trim();
+    if target.is_empty() || target == "latest" {
+        return latest_session(storage_dir);
+    }
+
+    let as_path = PathBuf::from(target);
+    if as_path.exists() {
+        if is_session_dir(&as_path) {
+            return Ok(as_path.canonicalize().unwrap_or_else(|_| as_path.clone()));
+        }
+        if as_path.is_absolute() || target.contains('/') || target.contains('\\') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a Recall session folder.", as_path.display()),
+            ));
+        }
+    }
+
+    let stored = storage_dir.join(target);
+    if is_session_dir(&stored) {
+        return Ok(stored);
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "No Recall session matching '{target}' in {}. Pass a session folder name, a session path, or latest.",
+            storage_dir.display()
+        ),
+    ))
+}
+
+pub fn read_session_consent(session_path: &Path) -> Option<ConsentMode> {
+    let metadata = fs::read_to_string(metadata_path(session_path)).ok()?;
+    let value = serde_json::from_str::<Value>(&metadata).ok()?;
+    let mode = value.get("consent")?.get("mode")?.as_str()?;
+    ConsentMode::parse(mode)
+}
+
+pub fn resume_hint(session_path: &Path) -> Option<String> {
+    let id = session_path.file_name()?.to_str()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Resume this session with:\n  recall --resume {id}\nOr: recall --resume latest"
+    ))
+}
+
 pub fn export_session(session_path: &Path, output_path: Option<&Path>) -> io::Result<PathBuf> {
     let meeting_path = primary_document_path(session_path);
     if !meeting_path.exists() {
@@ -616,11 +670,12 @@ fn escape_json(value: &str) -> String {
 mod tests {
     use super::{
         append_session_marker, append_session_note, eastern_offset_hours, editor_invocation,
-        escape_json, export_session, list_sessions, mark_transcript_ready,
-        readable_eastern_timestamp_for, slugify, start_session, ConsentMode, StartOptions,
+        escape_json, export_session, list_sessions, mark_transcript_ready, read_session_consent,
+        readable_eastern_timestamp_for, resolve_session_target, resume_hint, slugify,
+        start_session, ConsentMode, StartOptions,
     };
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use time::{Date, Month};
 
     #[test]
@@ -870,5 +925,60 @@ mod tests {
         assert!(exported.contains("The launch is Friday."));
 
         let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn resolves_latest_path_and_session_id_without_creating_a_folder() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "recall-resolve-session-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        let older = storage_dir.join("05-26-2026_7-21pm-et-older");
+        let newer = storage_dir.join("05-26-2026_8-21pm-et-design-sync");
+        fs::create_dir_all(older.join(".recall")).unwrap();
+        fs::create_dir_all(newer.join(".recall")).unwrap();
+        fs::write(
+            older.join(".recall/metadata.json"),
+            r#"{"created_at_unix": 100, "title": "Older", "consent": {"mode": "none"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            newer.join(".recall/metadata.json"),
+            r#"{"created_at_unix": 200, "title": "Design sync", "consent": {"mode": "noted"}}"#,
+        )
+        .unwrap();
+
+        let before = fs::read_dir(&storage_dir).unwrap().count();
+        assert_eq!(
+            resolve_session_target(&storage_dir, "latest").unwrap(),
+            newer
+        );
+        assert_eq!(
+            resolve_session_target(&storage_dir, "05-26-2026_8-21pm-et-design-sync").unwrap(),
+            newer
+        );
+        assert_eq!(
+            resolve_session_target(&storage_dir, newer.to_str().unwrap()).unwrap(),
+            newer.canonicalize().unwrap()
+        );
+        assert_eq!(fs::read_dir(&storage_dir).unwrap().count(), before);
+        assert_eq!(read_session_consent(&newer), Some(ConsentMode::Noted));
+        assert!(resolve_session_target(&storage_dir, "missing-session")
+            .unwrap_err()
+            .to_string()
+            .contains("No Recall session matching"));
+
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn resume_hint_uses_the_session_folder_name() {
+        let path = PathBuf::from("/tmp/sessions/05-26-2026_7-21pm-et-grill-supper-and-weber-gift");
+        assert_eq!(
+            resume_hint(&path).unwrap(),
+            "Resume this session with:\n  recall --resume 05-26-2026_7-21pm-et-grill-supper-and-weber-gift\nOr: recall --resume latest"
+        );
+        assert!(resume_hint(Path::new("/")).is_none());
     }
 }

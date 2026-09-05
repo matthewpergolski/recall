@@ -91,6 +91,8 @@ cargo --version
 cargo run
 cargo run -- --consent provided
 cargo run -- --title "Project sync"
+cargo run -- --resume
+cargo run -- --resume latest
 cargo run -- start --title "Design Sync" --consent verbal
 cargo run -- list
 cargo run -- show latest
@@ -109,6 +111,8 @@ When the app is installed as a binary, those become:
 recall
 recall --consent provided
 recall --title "Project sync"
+recall --resume
+recall --resume latest
 recall start --title "Design Sync" --consent verbal
 recall list
 recall show latest

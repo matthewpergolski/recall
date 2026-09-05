@@ -1014,6 +1014,7 @@ mod tests {
             CaptureProgress {
                 take_count: 2,
                 completed_take: 1,
+                elapsed_ms: 0,
             },
         )
         .unwrap();

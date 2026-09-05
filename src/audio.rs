@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +26,14 @@ pub struct ContinuedTake {
 pub struct CaptureProgress {
     pub take_count: u32,
     pub completed_take: u32,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+}
+
+impl CaptureProgress {
+    pub fn take_in_progress(self) -> bool {
+        self.take_count > self.completed_take
+    }
 }
 
 impl AudioTrack {
@@ -54,6 +62,169 @@ pub fn audio_dir(session_path: &Path) -> PathBuf {
 
 pub fn capture_progress_path(session_path: &Path) -> PathBuf {
     state_dir(session_path).join("capture.json")
+}
+
+pub fn capture_lock_path(session_path: &Path) -> PathBuf {
+    state_dir(session_path).join("capture.lock")
+}
+
+pub struct CaptureLock {
+    path: PathBuf,
+    contents: String,
+}
+
+pub fn acquire_capture_lock(session_path: &Path) -> io::Result<CaptureLock> {
+    let path = capture_lock_path(session_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    for _ in 0..3 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                let contents = new_capture_lock_contents();
+                file.write_all(contents.as_bytes())?;
+                return Ok(CaptureLock { path, contents });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if lock_holder_is_dead(&path) && try_remove_stale_lock(&path) {
+                    continue;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    live_capture_lock_message(session_path, &path),
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        live_capture_lock_message(session_path, &path),
+    ))
+}
+
+impl Drop for CaptureLock {
+    fn drop(&mut self) {
+        // Only unlink if this file is still the instance we created. A stale
+        // cleanup race must not let our Drop delete another process's lock.
+        if lock_file_matches(&self.path, &self.contents) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub fn resume_block_reason(session_path: &Path) -> Option<String> {
+    let lock_path = capture_lock_path(session_path);
+    let progress = read_capture_progress(session_path);
+    if lock_path.exists() && !lock_holder_is_dead(&lock_path) {
+        return Some(live_capture_lock_message(session_path, &lock_path));
+    }
+    // Leave stale lock files in place. Acquire reclaims them with an identity
+    // check so resume inspection cannot unlink a lock another process just created.
+    if progress.take_in_progress() {
+        return Some(unfinished_take_message(session_path));
+    }
+    None
+}
+
+fn new_capture_lock_contents() -> String {
+    let token = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{}\n{token}\n", std::process::id())
+}
+
+fn try_remove_stale_lock(path: &Path) -> bool {
+    let Ok(observed) = fs::read_to_string(path) else {
+        return true;
+    };
+    if !lock_contents_holder_is_dead(&observed) {
+        return false;
+    }
+    remove_lock_if_identity_matches(path, &observed)
+}
+
+pub(crate) fn remove_lock_if_identity_matches(path: &Path, observed: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(file) = fs::File::open(path) else {
+            return !path.exists();
+        };
+        let Ok(fd_meta) = file.metadata() else {
+            return false;
+        };
+        let Ok(path_meta) = fs::metadata(path) else {
+            return !path.exists();
+        };
+        if fd_meta.dev() != path_meta.dev() || fd_meta.ino() != path_meta.ino() {
+            return false;
+        }
+    }
+    if !lock_file_matches(path, observed) {
+        return false;
+    }
+    fs::remove_file(path).is_ok()
+}
+
+fn lock_file_matches(path: &Path, observed: &str) -> bool {
+    fs::read_to_string(path).is_ok_and(|current| current == observed)
+}
+
+fn live_capture_lock_message(session_path: &Path, lock_path: &Path) -> String {
+    let id = session_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("this session");
+    match lock_pid(lock_path) {
+        Some(pid) => {
+            format!("Session {id} is already recording in another Recall process (pid {pid}).")
+        }
+        None => format!("Session {id} is already recording in another Recall process."),
+    }
+}
+
+fn unfinished_take_message(session_path: &Path) -> String {
+    let id = session_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("this session");
+    format!(
+        "Session {id} has an unfinished take. Crash resume is not supported; refuse rather than attach a second recorder."
+    )
+}
+
+fn lock_pid(path: &Path) -> Option<u32> {
+    lock_pid_from_contents(&fs::read_to_string(path).ok()?)
+}
+
+fn lock_pid_from_contents(contents: &str) -> Option<u32> {
+    contents.lines().next()?.trim().parse().ok()
+}
+
+fn lock_contents_holder_is_dead(contents: &str) -> bool {
+    let Some(pid) = lock_pid_from_contents(contents) else {
+        return true;
+    };
+    !process_is_alive(pid)
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 pub fn read_capture_progress(session_path: &Path) -> CaptureProgress {
@@ -132,17 +303,7 @@ fn lock_holder_is_dead(path: &Path) -> bool {
     let Ok(contents) = fs::read_to_string(path) else {
         return true;
     };
-    let Ok(pid) = contents.trim().parse::<u32>() else {
-        return true;
-    };
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| !status.success())
-        .unwrap_or(true)
+    lock_contents_holder_is_dead(&contents)
 }
 
 pub fn generation_is_current(session_path: &Path, generation: u32) -> bool {
@@ -376,9 +537,10 @@ fn segment_take_index(path: &Path) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_track_segments, ffmpeg_concat_list, next_take_index, prepare_continued_take,
-        promote_legacy_aliases_to_take1, read_capture_progress, session_folder_is_sticky,
-        write_capture_progress, AudioTrack, CaptureProgress,
+        acquire_capture_lock, capture_lock_path, discover_track_segments, ffmpeg_concat_list,
+        next_take_index, prepare_continued_take, promote_legacy_aliases_to_take1,
+        read_capture_progress, remove_lock_if_identity_matches, resume_block_reason,
+        session_folder_is_sticky, write_capture_progress, AudioTrack, CaptureProgress,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -455,6 +617,7 @@ mod tests {
             CaptureProgress {
                 take_count: 1,
                 completed_take: 1,
+                elapsed_ms: 0,
             },
         )
         .unwrap();
@@ -515,6 +678,7 @@ mod tests {
             CaptureProgress {
                 take_count: 2,
                 completed_take: 1,
+                elapsed_ms: 0,
             },
         )
         .unwrap();
@@ -524,6 +688,7 @@ mod tests {
             CaptureProgress {
                 take_count: 2,
                 completed_take: 1,
+                elapsed_ms: 0,
             }
         );
         let _ = fs::remove_dir_all(session);
@@ -596,5 +761,159 @@ mod tests {
             "ffmpeg failed to write {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn elapsed_ms_round_trips_through_capture_json() {
+        let session = unique_session_dir("elapsed");
+        fs::create_dir_all(&session).unwrap();
+        write_capture_progress(
+            &session,
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 1,
+                elapsed_ms: 724_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_capture_progress(&session),
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 1,
+                elapsed_ms: 724_000,
+            }
+        );
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn missing_elapsed_ms_deserializes_as_zero() {
+        let session = unique_session_dir("legacy-elapsed");
+        let state = session.join(".recall/state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("capture.json"),
+            r#"{"take_count":1,"completed_take":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_capture_progress(&session),
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 1,
+                elapsed_ms: 0,
+            }
+        );
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn resume_refuses_a_live_capture_lock() {
+        let session = unique_session_dir("live-lock");
+        fs::create_dir_all(&session).unwrap();
+        write_capture_progress(
+            &session,
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 0,
+                elapsed_ms: 0,
+            },
+        )
+        .unwrap();
+        fs::write(
+            capture_lock_path(&session),
+            format!("{}", std::process::id()),
+        )
+        .unwrap();
+
+        let reason = resume_block_reason(&session).expect("live lock should block resume");
+        assert!(reason.contains("already recording"));
+        assert!(capture_lock_path(&session).exists());
+
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn resume_refuses_an_unfinished_take_after_a_stale_lock() {
+        let session = unique_session_dir("stale-lock");
+        fs::create_dir_all(&session).unwrap();
+        write_capture_progress(
+            &session,
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 0,
+                elapsed_ms: 12_000,
+            },
+        )
+        .unwrap();
+        fs::write(capture_lock_path(&session), "not-a-pid").unwrap();
+
+        let reason = resume_block_reason(&session).expect("unfinished take should block resume");
+        assert!(reason.contains("unfinished take"));
+        assert!(
+            capture_lock_path(&session).exists(),
+            "resume inspection must not unlink a lock file"
+        );
+
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn resume_allows_a_completed_session_even_with_a_stale_lock() {
+        let session = unique_session_dir("completed-lock");
+        fs::create_dir_all(&session).unwrap();
+        write_capture_progress(
+            &session,
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 1,
+                elapsed_ms: 5_000,
+            },
+        )
+        .unwrap();
+        fs::write(capture_lock_path(&session), "not-a-pid").unwrap();
+
+        assert!(resume_block_reason(&session).is_none());
+        assert!(capture_lock_path(&session).exists());
+
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn acquire_replaces_a_stale_lock() {
+        let session = unique_session_dir("acquire-stale");
+        let path = capture_lock_path(&session);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "not-a-pid").unwrap();
+
+        let lock = acquire_capture_lock(&session).expect("stale lock should be reclaimable");
+        let contents = fs::read_to_string(capture_lock_path(&session)).unwrap();
+        assert!(contents.starts_with(&format!("{}\n", std::process::id())));
+        drop(lock);
+        assert!(!capture_lock_path(&session).exists());
+
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn stale_lock_cleanup_does_not_unlink_a_replaced_live_lock() {
+        let session = unique_session_dir("identity-lock");
+        fs::create_dir_all(&session).unwrap();
+        let path = capture_lock_path(&session);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, "not-a-pid").unwrap();
+        let observed = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+
+        assert!(!remove_lock_if_identity_matches(&path, &observed));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{}\n", std::process::id())
+        );
+
+        let _ = fs::remove_dir_all(session);
     }
 }

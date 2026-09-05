@@ -36,6 +36,7 @@
 - `recall open latest` opens the primary meeting record.
 - `recall export latest` creates a portable meeting-plus-transcript Markdown file on demand.
 - `recall update` safely discovers, verifies, updates, tests, and reinstalls a clean official checkout.
+- `recall --resume` reopens a previous session folder to record another numbered take.
 
 ## Current Focus
 

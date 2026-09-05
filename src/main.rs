@@ -17,7 +17,7 @@ use capture_sources::{detect_sources, probe_audio_tap};
 use config::{config_path, RecallConfig};
 use session::{
     default_storage_dir, export_session, latest_session, list_sessions, open_path,
-    primary_document_path, start_session, ConsentMode, StartOptions,
+    primary_document_path, resume_hint, start_session, ConsentMode, StartOptions,
 };
 use transcription::{
     find_parakeet_binary, format_bytes, format_model_download_label, parakeet_binary_doctor_level,
@@ -26,7 +26,7 @@ use transcription::{
     TranscribeTarget, TranscriptionEngine, TranscriptionProgress, DEFAULT_PARAKEET_BIN,
     PARAKEET_INSTALL_HINT,
 };
-use tui::TuiOptions;
+use tui::{ResumeTarget, TuiOptions};
 use update::{update, UpdateOptions};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -57,6 +57,7 @@ fn main() {
         Some("analyze") => run_analyze(args.collect(), &tui_defaults),
         Some("agents") => run_agents(args.collect()),
         Some("update") => run_update(args.collect()),
+        Some("resume") => run_resume(args.collect(), tui_defaults),
         Some("doctor") => print_doctor(),
         Some("spec") => print_spec_hint(),
         Some("-h") | Some("--help") | Some("help") => print_help(),
@@ -81,6 +82,9 @@ USAGE:
     recall                                Open the interactive Recall TUI
     recall --consent provided             Open TUI with consent already marked
     recall --title "Project sync"         Open TUI with a session title
+    recall --resume                       Resume the latest session in the TUI
+    recall --resume <session-id>          Resume a named session folder
+    recall resume latest                  Same as --resume latest
     recall start --title "Design Sync"    Create a local session folder
     recall list                           List local sessions
     recall show latest                    Show the latest session path
@@ -114,6 +118,7 @@ TRANSCRIBE OPTIONS:
     --parakeet-cache-dir <path>           Parakeet Hugging Face cache directory
     --storage <path>                      Storage directory for latest lookup
     --chunk-seconds <seconds>             Transcription chunk size, default: 600
+    --generation <n>                      Publish only if this take is still current
     --keep-wav                            Keep temporary converted WAV files
 
 ANALYZE OPTIONS:
@@ -122,9 +127,11 @@ ANALYZE OPTIONS:
     --agent <grok|cline|codex|claude|opencode|pi>  Headless agent profile to run
     --preset <general|work|personal>      Analysis prompt preset, default: general
     --storage <path>                      Storage directory for latest lookup
+    --generation <n>                      Publish only if this take is still current
     --dry-run                             Write analysis prompt without running agent
 
-TUI ANALYSIS OPTIONS:
+TUI OPTIONS:
+    --resume [latest|<session-id>|<path>] Reopen a previous session to append another take
     --storage <path>                      Session storage directory
     --engine <whisper|parakeet>           Auto-transcription engine, default: parakeet on Apple Silicon
     --ffmpeg <path>                       ffmpeg binary path for auto-transcription
@@ -177,10 +184,70 @@ fn run_update(args: Vec<String>) {
 }
 
 fn run_tui_with_options(options: TuiOptions) {
-    if let Err(error) = tui::run_with_options(options) {
-        eprintln!("Recall TUI failed: {error}");
-        std::process::exit(1);
+    let resuming = options.resume.is_some();
+    match tui::run_with_options(options) {
+        Ok(exit) => {
+            if !exit.detached_logs.is_empty() {
+                println!();
+                println!("Processing continues in the background.");
+                for (session_path, log_path) in &exit.detached_logs {
+                    println!("  {}", session_path.display());
+                    println!("    log: {}", log_path.display());
+                }
+            }
+            if let Some(path) = exit.session_path {
+                if let Some(hint) = resume_hint(&path) {
+                    println!();
+                    println!("{hint}");
+                }
+            }
+        }
+        Err(error) => {
+            if resuming {
+                eprintln!("Recall could not resume: {error}");
+            } else {
+                eprintln!("Recall TUI failed: {error}");
+            }
+            std::process::exit(1);
+        }
     }
+}
+
+fn run_resume(args: Vec<String>, mut tui_defaults: TuiOptions) {
+    if let Err(message) = parse_resume_args(args, &mut tui_defaults) {
+        eprintln!("{message}");
+        eprintln!("Usage: recall resume [latest|<session-id>|<path>] [--storage <path>]");
+        std::process::exit(2);
+    }
+    run_tui_with_options(tui_defaults);
+}
+
+fn parse_resume_args(args: Vec<String>, options: &mut TuiOptions) -> Result<(), String> {
+    let mut target = ResumeTarget::Latest;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "latest" => target = ResumeTarget::Latest,
+            "--list" => {
+                return Err(
+                    "Session picker is not implemented. Use `recall list`, then `recall --resume <session-id>`."
+                        .to_string(),
+                );
+            }
+            "--storage" => {
+                options.storage_dir = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--storage requires a value".to_string())?,
+                ));
+            }
+            value if value.starts_with("--") => {
+                return Err(format!("Unknown resume option: {value}"));
+            }
+            value => target = ResumeTarget::Named(value.to_string()),
+        }
+    }
+    options.resume = Some(target);
+    Ok(())
 }
 
 fn run_analyze(args: Vec<String>, tui_defaults: &TuiOptions) {
@@ -648,7 +715,7 @@ fn parse_leading_tui_defaults(args: Vec<String>) -> Result<(TuiOptions, Vec<Stri
     let config = RecallConfig::load();
     let mut options = tui_options_from_config(&config);
     let mut remainder = Vec::new();
-    let mut iter = args.into_iter();
+    let mut iter = args.into_iter().peekable();
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -752,6 +819,15 @@ fn parse_leading_tui_defaults(args: Vec<String>) -> Result<(TuiOptions, Vec<Stri
                         .ok_or_else(|| "--editor requires a value".to_string())?,
                 );
             }
+            "--resume" => {
+                options.resume = Some(match iter.peek().map(String::as_str) {
+                    Some(value) if !value.starts_with('-') => {
+                        let value = iter.next().expect("peeked resume target");
+                        ResumeTarget::from_arg(Some(&value))
+                    }
+                    _ => ResumeTarget::Latest,
+                });
+            }
             other => {
                 remainder.push(other.to_string());
                 remainder.extend(iter);
@@ -852,6 +928,7 @@ fn parse_transcribe_options(
     let mut require_parakeet = false;
     let mut chunk_seconds = tui_defaults.chunk_seconds;
     let mut keep_wav = false;
+    let mut generation = None;
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
@@ -926,6 +1003,18 @@ fn parse_transcribe_options(
                 }
             }
             "--keep-wav" => keep_wav = true,
+            "--generation" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--generation requires a value".to_string())?;
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|_| "--generation must be a positive integer".to_string())?;
+                if parsed == 0 {
+                    return Err("--generation must be greater than zero".to_string());
+                }
+                generation = Some(parsed);
+            }
             value if value.starts_with("--") => {
                 return Err(format!("Unknown transcribe option: {value}"));
             }
@@ -952,7 +1041,7 @@ fn parse_transcribe_options(
         chunk_seconds,
         keep_wav,
         require_parakeet,
-        generation: None,
+        generation,
     })
 }
 
@@ -965,6 +1054,7 @@ fn parse_analyze_options(
     let mut agent = tui_defaults.agent.clone();
     let mut preset = tui_defaults.preset.clone();
     let mut dry_run = false;
+    let mut generation = None;
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
@@ -988,6 +1078,18 @@ fn parse_analyze_options(
                 ));
             }
             "--dry-run" => dry_run = true,
+            "--generation" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--generation requires a value".to_string())?;
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|_| "--generation must be a positive integer".to_string())?;
+                if parsed == 0 {
+                    return Err("--generation must be greater than zero".to_string());
+                }
+                generation = Some(parsed);
+            }
             value if value.starts_with("--") => {
                 return Err(format!("Unknown analyze option: {value}"));
             }
@@ -1020,7 +1122,7 @@ fn parse_analyze_options(
         agent,
         preset,
         dry_run,
-        generation: None,
+        generation,
     })
 }
 
@@ -1268,6 +1370,34 @@ mod tests {
     }
 
     #[test]
+    fn transcribe_parses_generation() {
+        let options = parse_transcribe_options(
+            vec!["latest".into(), "--generation".into(), "2".into()],
+            &TuiOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(options.generation, Some(2));
+    }
+
+    #[test]
+    fn analyze_parses_generation() {
+        let mut defaults = TuiOptions::default();
+        defaults.agent = Some("grok".into());
+        let options = parse_analyze_options(
+            vec![
+                "latest".into(),
+                "--agent".into(),
+                "grok".into(),
+                "--generation".into(),
+                "2".into(),
+            ],
+            &defaults,
+        )
+        .unwrap();
+        assert_eq!(options.generation, Some(2));
+    }
+
+    #[test]
     fn tui_options_from_config_default_engine_is_parakeet() {
         let options = tui_options_from_config(&RecallConfig::default());
         assert_eq!(options.engine, TranscriptionEngine::Parakeet);
@@ -1284,5 +1414,57 @@ mod tests {
         assert_eq!(options.engine, TranscriptionEngine::Parakeet);
         assert!(options.require_parakeet);
         assert_eq!(remainder, vec!["list".to_string()]);
+    }
+
+    #[test]
+    fn leading_resume_without_target_means_latest() {
+        let (options, remainder) = parse_leading_tui_defaults(vec!["--resume".into()]).unwrap();
+        assert_eq!(options.resume, Some(ResumeTarget::Latest));
+        assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn leading_resume_consumes_a_session_id_and_leaves_subcommands() {
+        let (options, remainder) = parse_leading_tui_defaults(vec![
+            "--resume".into(),
+            "05-26-2026_7-21pm-et-design-sync".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            options.resume,
+            Some(ResumeTarget::Named(
+                "05-26-2026_7-21pm-et-design-sync".into()
+            ))
+        );
+        assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn leading_resume_does_not_swallow_the_next_flag() {
+        let (options, remainder) = parse_leading_tui_defaults(vec![
+            "--resume".into(),
+            "--consent".into(),
+            "provided".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.resume, Some(ResumeTarget::Latest));
+        assert!(options.consent_noted);
+        assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn resume_subcommand_parses_a_named_session() {
+        let mut options = TuiOptions::default();
+        parse_resume_args(
+            vec!["05-26-2026_7-21pm-et-design-sync".into()],
+            &mut options,
+        )
+        .unwrap();
+        assert_eq!(
+            options.resume,
+            Some(ResumeTarget::Named(
+                "05-26-2026_7-21pm-et-design-sync".into()
+            ))
+        );
     }
 }

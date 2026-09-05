@@ -167,7 +167,16 @@ Start with a session title:
 recall --title "Project sync"
 ```
 
-When you press Space or Enter to end a recording, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready. If you stay in that TUI session and press Space or Enter again, Recall continues the same meeting folder with a new audio take. Quitting (`q` / Ctrl+C) and launching Recall again starts a new session.
+When you press Space or Enter to end a recording, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready. If you stay in that TUI session and press Space or Enter again, Recall continues the same meeting folder with a new audio take.
+
+Quitting (`q` / Ctrl+C) leaves transcription and analysis running in the background, then prints a copy-paste resume command. Plain `recall` starts a new session; `recall --resume` reopens the latest folder, and `recall --resume <session-id>` reopens that meeting so Space can append another take.
+
+```sh
+recall --resume
+recall --resume latest
+recall --resume 05-26-2026_7-21pm-et-design-sync
+recall resume latest
+```
 
 You can also transcribe manually:
 
@@ -330,6 +339,8 @@ sessions/
 ```sh
 recall
 recall --title "Project sync"
+recall --resume
+recall --resume latest
 recall list
 recall show latest
 recall open latest
