@@ -19,8 +19,10 @@ use session::{
     primary_document_path, start_session, ConsentMode, StartOptions,
 };
 use transcription::{
-    transcribe_with_progress, TrackSelection, TranscribeOptions, TranscribeTarget,
-    TranscriptionProgress,
+    find_parakeet_binary, parakeet_binary_doctor_level, parakeet_model_is_cached,
+    resolve_parakeet_cache_dir_for_options, resolve_parakeet_model_id, transcribe_with_progress,
+    DoctorCheckLevel, TrackSelection, TranscribeOptions, TranscribeTarget, TranscriptionEngine,
+    TranscriptionProgress, DEFAULT_PARAKEET_BIN, PARAKEET_INSTALL_HINT,
 };
 use tui::TuiOptions;
 use update::{update, UpdateOptions};
@@ -100,10 +102,14 @@ START OPTIONS:
 TRANSCRIBE OPTIONS:
     recall transcribe latest [options]
     recall transcribe <session-path> [options]
+    --engine <whisper|parakeet>           ASR engine, default: parakeet on Apple Silicon
     --track <both|call|mic>               Audio track selection, default: both
     --ffmpeg <path>                       ffmpeg binary path
     --model <path>                        Whisper ggml model path
     --whisper <path>                      whisper-cli binary path
+    --parakeet <path>                     parakeet-mlx binary path
+    --parakeet-model <id>                 Parakeet Hugging Face model id
+    --parakeet-cache-dir <path>           Parakeet Hugging Face cache directory
     --storage <path>                      Storage directory for latest lookup
     --chunk-seconds <seconds>             Transcription chunk size, default: 600
     --keep-wav                            Keep temporary converted WAV files
@@ -118,9 +124,13 @@ ANALYZE OPTIONS:
 
 TUI ANALYSIS OPTIONS:
     --storage <path>                      Session storage directory
+    --engine <whisper|parakeet>           Auto-transcription engine, default: parakeet on Apple Silicon
     --ffmpeg <path>                       ffmpeg binary path for auto-transcription
     --model <path>                        Whisper model path for auto-transcription
     --whisper <path>                      whisper-cli path for auto-transcription
+    --parakeet <path>                     parakeet-mlx path for auto-transcription
+    --parakeet-model <id>                 Parakeet Hugging Face model id
+    --parakeet-cache-dir <path>           Parakeet Hugging Face cache directory
     --chunk-seconds <seconds>             Auto-transcription chunk size
     --agent <name>                        Agent to use after transcription
     --auto-analyze                        Run analysis after transcription
@@ -302,15 +312,27 @@ fn run_transcribe(args: Vec<String>, tui_defaults: &TuiOptions) {
         }
     };
 
-    match transcribe_with_progress(&options, |progress| {
-        if let TranscriptionProgress::ChunkStarted {
+    match transcribe_with_progress(&options, |progress| match progress {
+        TranscriptionProgress::Started {
+            engine,
+            model,
+            note,
+            ..
+        } => {
+            eprintln!("Engine: {} ({model})", engine.as_str());
+            if let Some(note) = note {
+                eprintln!("{note}");
+            }
+        }
+        TranscriptionProgress::ChunkStarted {
             track,
             index,
             total,
-        } = progress
-        {
-            eprintln!("Transcribing {track} chunk {index}/{total}...");
+            elapsed_secs,
+        } => {
+            eprintln!("Transcribing {track} chunk {index}/{total} ({elapsed_secs}s)...");
         }
+        _ => {}
     }) {
         Ok(result) => {
             println!("Recall transcription complete");
@@ -623,6 +645,14 @@ fn parse_leading_tui_defaults(args: Vec<String>) -> Result<(TuiOptions, Vec<Stri
                         .ok_or_else(|| "--storage requires a value".to_string())?,
                 ));
             }
+            "--engine" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--engine requires a value".to_string())?;
+                options.engine = TranscriptionEngine::parse(&value)
+                    .ok_or_else(|| format!("Unknown engine '{value}'. Use whisper or parakeet."))?;
+                options.require_parakeet = options.engine == TranscriptionEngine::Parakeet;
+            }
             "--ffmpeg" => {
                 options.ffmpeg_bin = Some(PathBuf::from(
                     iter.next()
@@ -634,6 +664,24 @@ fn parse_leading_tui_defaults(args: Vec<String>) -> Result<(TuiOptions, Vec<Stri
                     iter.next()
                         .ok_or_else(|| "--whisper requires a value".to_string())?,
                 ));
+            }
+            "--parakeet" => {
+                options.parakeet_bin = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--parakeet requires a value".to_string())?,
+                ));
+            }
+            "--parakeet-model" => {
+                options.parakeet_model = Some(
+                    iter.next()
+                        .ok_or_else(|| "--parakeet-model requires a value".to_string())?,
+                );
+            }
+            "--parakeet-cache-dir" => {
+                options.parakeet_cache_dir =
+                    Some(PathBuf::from(iter.next().ok_or_else(|| {
+                        "--parakeet-cache-dir requires a value".to_string()
+                    })?));
             }
             "--model" => {
                 options.model_path = Some(PathBuf::from(
@@ -696,9 +744,13 @@ fn tui_options_from_config(config: &RecallConfig) -> TuiOptions {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or(config.editor.clone());
+    options.engine = config.transcription.engine;
     options.ffmpeg_bin = config.transcription.ffmpeg_bin.clone();
     options.whisper_bin = config.transcription.whisper_bin.clone();
     options.model_path = config.transcription.model_path.clone();
+    options.parakeet_bin = config.transcription.parakeet_bin.clone();
+    options.parakeet_model = config.transcription.parakeet_model.clone();
+    options.parakeet_cache_dir = config.transcription.parakeet_cache_dir.clone();
     if let Some(chunk_seconds) = config.transcription.chunk_seconds {
         options.chunk_seconds = chunk_seconds;
     }
@@ -761,9 +813,14 @@ fn parse_transcribe_options(
     let mut target: Option<TranscribeTarget> = None;
     let mut track = TrackSelection::Both;
     let mut storage_dir = tui_defaults.storage_dir.clone();
+    let mut engine = tui_defaults.engine;
     let mut ffmpeg_bin = tui_defaults.ffmpeg_bin.clone();
     let mut model_path = tui_defaults.model_path.clone();
     let mut whisper_bin = tui_defaults.whisper_bin.clone();
+    let mut parakeet_bin = tui_defaults.parakeet_bin.clone();
+    let mut parakeet_model = tui_defaults.parakeet_model.clone();
+    let mut parakeet_cache_dir = tui_defaults.parakeet_cache_dir.clone();
+    let mut require_parakeet = false;
     let mut chunk_seconds = tui_defaults.chunk_seconds;
     let mut keep_wav = false;
     let mut iter = args.into_iter();
@@ -771,6 +828,14 @@ fn parse_transcribe_options(
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "latest" => target = Some(TranscribeTarget::Latest),
+            "--engine" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--engine requires a value".to_string())?;
+                engine = TranscriptionEngine::parse(&value)
+                    .ok_or_else(|| format!("Unknown engine '{value}'. Use whisper or parakeet."))?;
+                require_parakeet = engine == TranscriptionEngine::Parakeet;
+            }
             "--track" => {
                 let value = iter
                     .next()
@@ -802,6 +867,24 @@ fn parse_transcribe_options(
                     .ok_or_else(|| "--whisper requires a value".to_string())?;
                 whisper_bin = Some(PathBuf::from(value));
             }
+            "--parakeet" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--parakeet requires a value".to_string())?;
+                parakeet_bin = Some(PathBuf::from(value));
+            }
+            "--parakeet-model" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--parakeet-model requires a value".to_string())?;
+                parakeet_model = Some(value);
+            }
+            "--parakeet-cache-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--parakeet-cache-dir requires a value".to_string())?;
+                parakeet_cache_dir = Some(PathBuf::from(value));
+            }
             "--chunk-seconds" => {
                 let value = iter
                     .next()
@@ -830,11 +913,16 @@ fn parse_transcribe_options(
         target: target.unwrap_or(TranscribeTarget::Latest),
         track,
         storage_dir,
+        engine,
         ffmpeg_bin,
         model_path,
         whisper_bin,
+        parakeet_bin,
+        parakeet_model,
+        parakeet_cache_dir,
         chunk_seconds,
         keep_wav,
+        require_parakeet,
     })
 }
 
@@ -918,6 +1006,9 @@ fn parse_storage_arg(
 
 fn print_spec_hint() {
     println!("Read docs/SPEC.md for the v0 product scope and docs/SETUP.md for setup.");
+    println!(
+        "Default transcription engine on Apple Silicon is Parakeet (`parakeet-mlx`, NVIDIA Parakeet TDT 0.6B v3, CC-BY-4.0). Whisper (`whisper-cli`) remains available with --engine whisper. Missing Parakeet falls back to Whisper unless you pass --engine parakeet."
+    );
 }
 
 fn print_doctor() {
@@ -936,6 +1027,20 @@ fn print_doctor() {
     let ffmpeg_bin = env::var_os("RECALL_FFMPEG_BIN")
         .map(PathBuf::from)
         .or(config.transcription.ffmpeg_bin.clone());
+    let parakeet_bin = env::var_os("RECALL_PARAKEET_BIN")
+        .map(PathBuf::from)
+        .or(config.transcription.parakeet_bin.clone());
+    let parakeet_model = env::var("RECALL_PARAKEET_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            resolve_parakeet_model_id(None, config.transcription.parakeet_model.as_deref())
+        });
+    let parakeet_cache_dir = resolve_parakeet_cache_dir_for_options(
+        None,
+        config.transcription.parakeet_cache_dir.as_deref(),
+    );
 
     println!("Recall doctor");
     println!();
@@ -960,6 +1065,13 @@ fn print_doctor() {
         print_binary_check("whisper-cli", "whisper.cpp CLI");
     }
     print_path_check(&model_path, "Whisper model");
+    print_parakeet_doctor(
+        parakeet_bin.as_deref(),
+        &parakeet_model,
+        parakeet_cache_dir.as_deref(),
+        config.transcription.engine,
+        config.transcription.invalid_engine.as_deref(),
+    );
     println!();
     println!("Storage:");
     if let Some(path) = storage_dir {
@@ -1000,5 +1112,146 @@ fn print_path_check(path: &Path, label: &str) {
         println!("  ok   {label}: {}", path.display());
     } else {
         println!("  miss {label}: {} not found", path.display());
+    }
+}
+
+fn print_parakeet_doctor(
+    explicit_bin: Option<&Path>,
+    model: &str,
+    cache_dir: Option<&Path>,
+    engine: TranscriptionEngine,
+    invalid_engine: Option<&str>,
+) {
+    let resolved = find_parakeet_binary(explicit_bin);
+    let role = match engine {
+        TranscriptionEngine::Parakeet => "selected engine",
+        TranscriptionEngine::Whisper => "available fallback",
+    };
+    match parakeet_binary_doctor_level(explicit_bin, engine) {
+        DoctorCheckLevel::Ok => match resolved {
+            Some(path) => println!("  ok   parakeet-mlx ({role}): {}", path.display()),
+            None => println!("  ok   parakeet-mlx ({role}): `{DEFAULT_PARAKEET_BIN}`"),
+        },
+        DoctorCheckLevel::Warn => {
+            println!("  warn parakeet-mlx ({role}): `{DEFAULT_PARAKEET_BIN}` not found");
+            println!("        {PARAKEET_INSTALL_HINT}");
+        }
+        DoctorCheckLevel::Miss => {
+            println!("  miss parakeet-mlx ({role}): `{DEFAULT_PARAKEET_BIN}` not found");
+            println!("        {PARAKEET_INSTALL_HINT}");
+        }
+    }
+
+    if parakeet_model_is_cached(model, cache_dir) {
+        println!("  ok   Parakeet model cache: `{model}`");
+    } else {
+        println!(
+            "  warn Parakeet model cache: `{model}` not cached yet. First Parakeet run may download it."
+        );
+    }
+    println!(
+        "  note Default engine on Apple Silicon is Parakeet (NVIDIA CC-BY-4.0). Whisper remains available with --engine whisper."
+    );
+    if matches!(engine, TranscriptionEngine::Whisper) {
+        println!("  note Config currently selects engine = \"whisper\".");
+    }
+    if let Some(invalid) = invalid_engine {
+        println!(
+            "  warn Unknown [transcription].engine = \"{invalid}\"; using {}.",
+            engine.as_str()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcribe_defaults_to_parakeet_engine() {
+        let options =
+            parse_transcribe_options(vec!["latest".into()], &TuiOptions::default()).unwrap();
+        assert_eq!(options.engine, TranscriptionEngine::Parakeet);
+        assert!(!options.require_parakeet);
+        assert!(options.parakeet_bin.is_none());
+        assert!(options.whisper_bin.is_none());
+    }
+
+    #[test]
+    fn transcribe_parses_parakeet_engine_and_binary() {
+        let options = parse_transcribe_options(
+            vec![
+                "latest".into(),
+                "--engine".into(),
+                "parakeet".into(),
+                "--parakeet".into(),
+                "/tmp/parakeet-mlx".into(),
+                "--whisper".into(),
+                "/tmp/whisper-cli".into(),
+            ],
+            &TuiOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(options.engine, TranscriptionEngine::Parakeet);
+        assert!(options.require_parakeet);
+        assert_eq!(
+            options.parakeet_bin.as_deref(),
+            Some(Path::new("/tmp/parakeet-mlx"))
+        );
+        assert_eq!(
+            options.whisper_bin.as_deref(),
+            Some(Path::new("/tmp/whisper-cli"))
+        );
+    }
+
+    #[test]
+    fn transcribe_engine_whisper_remains_valid_when_parakeet_is_configured() {
+        let mut defaults = TuiOptions::default();
+        defaults.engine = TranscriptionEngine::Parakeet;
+        defaults.parakeet_bin = Some(PathBuf::from("/tmp/parakeet-mlx"));
+
+        let options = parse_transcribe_options(
+            vec!["latest".into(), "--engine".into(), "whisper".into()],
+            &defaults,
+        )
+        .unwrap();
+
+        assert_eq!(options.engine, TranscriptionEngine::Whisper);
+        assert!(!options.require_parakeet);
+        assert_eq!(
+            options.parakeet_bin.as_deref(),
+            Some(Path::new("/tmp/parakeet-mlx"))
+        );
+    }
+
+    #[test]
+    fn transcribe_rejects_unknown_engine() {
+        let error = parse_transcribe_options(
+            vec!["--engine".into(), "nemo".into()],
+            &TuiOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("whisper"));
+        assert!(error.contains("parakeet"));
+    }
+
+    #[test]
+    fn tui_options_from_config_default_engine_is_parakeet() {
+        let options = tui_options_from_config(&RecallConfig::default());
+        assert_eq!(options.engine, TranscriptionEngine::Parakeet);
+        assert!(!options.require_parakeet);
+        assert!(options.parakeet_bin.is_none());
+        assert!(options.whisper_bin.is_none());
+    }
+
+    #[test]
+    fn leading_engine_parakeet_requires_the_parakeet_binary() {
+        let (options, remainder) =
+            parse_leading_tui_defaults(vec!["--engine".into(), "parakeet".into(), "list".into()])
+                .unwrap();
+        assert_eq!(options.engine, TranscriptionEngine::Parakeet);
+        assert!(options.require_parakeet);
+        assert_eq!(remainder, vec!["list".to_string()]);
     }
 }

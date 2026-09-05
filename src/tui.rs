@@ -20,8 +20,8 @@ use crate::session::{
 };
 use crate::system_recorder::SystemRecorder;
 use crate::transcription::{
-    transcribe_with_progress, TrackSelection, TranscribeOptions, TranscribeTarget,
-    TranscriptionProgress, TRANSCRIPTION_CHUNK_SECONDS,
+    engine_status_parts, transcribe_with_progress, TrackSelection, TranscribeOptions,
+    TranscribeTarget, TranscriptionEngine, TranscriptionProgress, TRANSCRIPTION_CHUNK_SECONDS,
 };
 
 const TICK_RATE: Duration = Duration::from_millis(100);
@@ -39,9 +39,14 @@ pub struct TuiOptions {
     pub consent_noted: bool,
     pub title: String,
     pub storage_dir: Option<PathBuf>,
+    pub engine: TranscriptionEngine,
     pub ffmpeg_bin: Option<PathBuf>,
     pub whisper_bin: Option<PathBuf>,
     pub model_path: Option<PathBuf>,
+    pub parakeet_bin: Option<PathBuf>,
+    pub parakeet_model: Option<String>,
+    pub parakeet_cache_dir: Option<PathBuf>,
+    pub require_parakeet: bool,
     pub chunk_seconds: u64,
     pub agent: Option<String>,
     pub auto_analyze: bool,
@@ -55,9 +60,14 @@ impl Default for TuiOptions {
             consent_noted: false,
             title: "Quick Capture".to_string(),
             storage_dir: None,
+            engine: TranscriptionEngine::default(),
             ffmpeg_bin: None,
             whisper_bin: None,
             model_path: None,
+            parakeet_bin: None,
+            parakeet_model: None,
+            parakeet_cache_dir: None,
+            require_parakeet: false,
             chunk_seconds: TRANSCRIPTION_CHUNK_SECONDS,
             agent: None,
             auto_analyze: true,
@@ -113,9 +123,14 @@ struct App {
     agent: Option<String>,
     auto_analyze: bool,
     preset: String,
+    engine: TranscriptionEngine,
     ffmpeg_bin: Option<PathBuf>,
     whisper_bin: Option<PathBuf>,
     model_path: Option<PathBuf>,
+    parakeet_bin: Option<PathBuf>,
+    parakeet_model: Option<String>,
+    parakeet_cache_dir: Option<PathBuf>,
+    require_parakeet: bool,
     chunk_seconds: u64,
     note_draft: Option<String>,
     editor: Option<String>,
@@ -220,9 +235,14 @@ impl App {
             agent: options.agent,
             auto_analyze: options.auto_analyze,
             preset: options.preset,
+            engine: options.engine,
             ffmpeg_bin: options.ffmpeg_bin,
             whisper_bin: options.whisper_bin,
             model_path: options.model_path,
+            parakeet_bin: options.parakeet_bin,
+            parakeet_model: options.parakeet_model,
+            parakeet_cache_dir: options.parakeet_cache_dir,
+            require_parakeet: options.require_parakeet,
             chunk_seconds: options.chunk_seconds,
             note_draft: None,
             editor: options.editor,
@@ -812,9 +832,14 @@ impl App {
         self.live_notes
             .push("Transcription queued for this session.".to_string());
 
+        let engine = self.engine;
         let ffmpeg_bin = self.ffmpeg_bin.clone();
         let whisper_bin = self.whisper_bin.clone();
         let model_path = self.model_path.clone();
+        let parakeet_bin = self.parakeet_bin.clone();
+        let parakeet_model = self.parakeet_model.clone();
+        let parakeet_cache_dir = self.parakeet_cache_dir.clone();
+        let require_parakeet = self.require_parakeet;
         let chunk_seconds = self.chunk_seconds;
 
         thread::spawn(move || {
@@ -823,11 +848,16 @@ impl App {
                 target: TranscribeTarget::Session(session_path),
                 track: TrackSelection::Both,
                 storage_dir: None,
+                engine,
                 ffmpeg_bin,
                 model_path,
                 whisper_bin,
+                parakeet_bin,
+                parakeet_model,
+                parakeet_cache_dir,
                 chunk_seconds,
                 keep_wav: false,
+                require_parakeet,
             };
 
             let progress_sender = sender.clone();
@@ -1065,38 +1095,64 @@ impl App {
 
     fn apply_transcription_progress(&mut self, progress: TranscriptionProgress) {
         match progress {
-            TranscriptionProgress::Started { session_path } => {
-                self.transcription_status.label = "Transcription started".to_string();
-                self.transcription_status.percent = 2;
-                self.live_notes
-                    .push(format!("Transcription started: {}", session_path.display()));
-            }
-            TranscriptionProgress::TrackStarted { track, chunks } => {
+            TranscriptionProgress::Started {
+                session_path,
+                engine,
+                model,
+                note,
+            } => {
+                let model_short = model.rsplit(['/', '\\']).next().unwrap_or(model.as_str());
                 self.transcription_status.label =
-                    format!("Transcribing {track}: {chunks} chunk(s)");
-                self.transcription_status.percent = 5;
+                    format!("Transcription started ({}, {model_short})", engine.as_str());
+                self.transcription_status.percent = 2;
+                self.live_notes.push(format!(
+                    "Transcription started ({}): {}",
+                    engine.as_str(),
+                    session_path.display()
+                ));
+                if let Some(note) = note {
+                    self.live_notes.push(note);
+                    self.toast = self.live_notes.last().cloned().unwrap_or_default();
+                }
+            }
+            TranscriptionProgress::TrackStarted {
+                track,
+                chunks,
+                elapsed_secs,
+            } => {
+                self.transcription_status.label =
+                    format!("Transcribing {track}: {chunks} chunk(s) ({elapsed_secs}s)");
+                self.transcription_status.percent = 8;
             }
             TranscriptionProgress::ChunkStarted {
                 track,
                 index,
                 total,
+                elapsed_secs,
             } => {
                 self.transcription_status.label =
-                    format!("Transcribing {track} chunk {index}/{total}");
+                    format!("Transcribing {track} chunk {index}/{total} ({elapsed_secs}s)");
+                let completed = index.saturating_sub(1) as f64;
                 self.transcription_status.percent =
-                    ((index as f64 / total.max(1) as f64) * 100.0).round() as u16;
+                    (8.0 + (completed / total.max(1) as f64) * 80.0).round() as u16;
             }
             TranscriptionProgress::TrackFinished {
                 track,
                 text_len,
                 chunks,
+                elapsed_secs,
+            } => {
+                self.transcription_status.label = format!(
+                    "Finished {track}: {text_len} chars across {chunks} chunk(s) ({elapsed_secs}s)"
+                );
+                self.transcription_status.percent = 90;
+            }
+            TranscriptionProgress::Finished {
+                transcript_path,
+                elapsed_secs,
             } => {
                 self.transcription_status.label =
-                    format!("Finished {track}: {text_len} chars across {chunks} chunk(s)");
-                self.transcription_status.percent = 100;
-            }
-            TranscriptionProgress::Finished { transcript_path } => {
-                self.transcription_status.label = "Finalizing transcript".to_string();
+                    format!("Finalizing transcript ({elapsed_secs}s)");
                 self.transcription_status.percent = 99;
                 self.transcription_status.transcript_path = Some(transcript_path);
             }
@@ -1424,6 +1480,14 @@ impl App {
         self.agent.clone().unwrap_or_else(|| "none".to_string())
     }
 
+    fn engine_status_parts(&self) -> (String, String) {
+        engine_status_parts(
+            self.engine,
+            self.parakeet_model.as_deref(),
+            self.model_path.as_deref(),
+        )
+    }
+
     fn editor_label(&self) -> String {
         self.editor
             .as_deref()
@@ -1485,6 +1549,13 @@ impl App {
             lines.push(Line::raw(""));
         }
 
+        let (engine, model) = self.engine_status_parts();
+        lines.push(Line::from(vec![
+            Span::styled("Engine: ", Style::default().fg(Color::Gray)),
+            Span::raw(engine),
+            Span::styled("  model: ", Style::default().fg(Color::Gray)),
+            Span::raw(model),
+        ]));
         lines.push(Line::from(vec![
             Span::styled("Agent: ", Style::default().fg(Color::Gray)),
             Span::raw(self.agent_label()),
@@ -1827,13 +1898,36 @@ mod tests {
             agent: None,
             auto_analyze: false,
             preset: "general".to_string(),
+            engine: TranscriptionEngine::default(),
             ffmpeg_bin: None,
             whisper_bin: None,
             model_path: None,
+            parakeet_bin: None,
+            parakeet_model: None,
+            parakeet_cache_dir: None,
+            require_parakeet: false,
             chunk_seconds: TRANSCRIPTION_CHUNK_SECONDS,
             note_draft: None,
             editor: None,
         }
+    }
+
+    #[test]
+    fn live_recall_engine_label_uses_configured_engine_and_short_model() {
+        let mut app = test_app(PathBuf::from("/tmp/recall-current-session"));
+        app.engine = TranscriptionEngine::Parakeet;
+        app.parakeet_model = None;
+        let (engine, model) = app.engine_status_parts();
+        assert_eq!(engine, "parakeet");
+        assert_eq!(model, "parakeet-tdt-0.6b-v3");
+
+        app.engine = TranscriptionEngine::Whisper;
+        app.model_path = Some(PathBuf::from(
+            "/Users/me/Models/whisper.cpp/ggml-large-v3-turbo.bin",
+        ));
+        let (engine, model) = app.engine_status_parts();
+        assert_eq!(engine, "whisper");
+        assert_eq!(model, "ggml-large-v3-turbo.bin");
     }
 
     #[test]

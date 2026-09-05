@@ -131,6 +131,7 @@ auto_analyze = true
 preset = "general"
 
 [transcription]
+engine = "parakeet"
 ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
 whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
 model_path = "~/Documents/Recall/models/ggml-base.en.bin"

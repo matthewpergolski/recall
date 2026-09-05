@@ -169,7 +169,7 @@ Recall transcribes automatically after ending a TUI session. You can also rerun 
 recall transcribe latest
 ```
 
-This requires `ffmpeg`, a local `whisper.cpp` CLI, and a local ggml Whisper model.
+This requires `ffmpeg` and, by default, `parakeet-mlx` (`uv tool install parakeet-mlx`). Whisper remains available with `--engine whisper`.
 
 If agent analysis is configured, Recall can also generate a complete `meeting.md` after transcription:
 
