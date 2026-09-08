@@ -1427,14 +1427,12 @@ mod tests {
     fn leading_resume_consumes_a_session_id_and_leaves_subcommands() {
         let (options, remainder) = parse_leading_tui_defaults(vec![
             "--resume".into(),
-            "05-26-2026_7-21pm-et-design-sync".into(),
+            "2026-05-26_1921-et-design-sync".into(),
         ])
         .unwrap();
         assert_eq!(
             options.resume,
-            Some(ResumeTarget::Named(
-                "05-26-2026_7-21pm-et-design-sync".into()
-            ))
+            Some(ResumeTarget::Named("2026-05-26_1921-et-design-sync".into()))
         );
         assert!(remainder.is_empty());
     }
@@ -1455,16 +1453,10 @@ mod tests {
     #[test]
     fn resume_subcommand_parses_a_named_session() {
         let mut options = TuiOptions::default();
-        parse_resume_args(
-            vec!["05-26-2026_7-21pm-et-design-sync".into()],
-            &mut options,
-        )
-        .unwrap();
+        parse_resume_args(vec!["2026-05-26_1921-et-design-sync".into()], &mut options).unwrap();
         assert_eq!(
             options.resume,
-            Some(ResumeTarget::Named(
-                "05-26-2026_7-21pm-et-design-sync".into()
-            ))
+            Some(ResumeTarget::Named("2026-05-26_1921-et-design-sync".into()))
         );
     }
 }

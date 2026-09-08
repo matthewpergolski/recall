@@ -95,7 +95,9 @@ The installed `~/.cargo/bin/recall` is a separate binary. Source edits are verif
 
 ## Versioning
 
-`recall --version` and `recall update` copy `version` from `Cargo.toml` (`CARGO_PKG_VERSION`). That field has stayed `0.1.0` while git `main` moved. Up-to-date-ness of an installed binary is the embedded git commit, not the crate version.
+`recall --version` is `CARGO_PKG_VERSION` of the running binary. Installed freshness is the embedded git commit (`RECALL_BUILD_COMMIT`), not the crate version.
+
+`recall update` already-up-to-date uses that running version. After a refresh or fast-forward install, print the checkout crate version from `cargo metadata` (`packages[].version` where `name == "recall"`), not the old binary's compile-time version.
 
 On a user-facing push (new TUI/CLI behavior people will notice), bump `Cargo.toml` `version` in the same commit:
 

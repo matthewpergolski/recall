@@ -869,18 +869,12 @@ fn readable_eastern_timestamp() -> String {
 
 fn readable_eastern_timestamp_for(now_utc: OffsetDateTime) -> String {
     let now = now_utc + Duration::hours(i64::from(eastern_offset_hours(now_utc)));
-    let hour = now.hour();
-    let suffix = if hour < 12 { "am" } else { "pm" };
-    let hour_12 = match hour % 12 {
-        0 => 12,
-        value => value,
-    };
     format!(
-        "{:02}-{:02}-{:04}_{}-{:02}{suffix}",
+        "{:04}-{:02}-{:02}_{:02}{:02}",
+        now.year(),
         u8::from(now.month()),
         now.day(),
-        now.year(),
-        hour_12,
+        now.hour(),
         now.minute()
     )
 }
@@ -1074,7 +1068,45 @@ mod tests {
             .unwrap()
             .assume_utc();
 
-        assert_eq!(readable_eastern_timestamp_for(utc), "05-26-2026_7-21pm");
+        assert_eq!(readable_eastern_timestamp_for(utc), "2026-05-26_1921");
+    }
+
+    #[test]
+    fn eastern_timestamps_sort_lexically_in_chronological_order() {
+        let two_am = readable_eastern_timestamp_for(
+            Date::from_calendar_date(2026, Month::September, 8)
+                .unwrap()
+                .with_hms(6, 5, 0)
+                .unwrap()
+                .assume_utc(),
+        );
+        let noon = readable_eastern_timestamp_for(
+            Date::from_calendar_date(2026, Month::September, 8)
+                .unwrap()
+                .with_hms(16, 4, 0)
+                .unwrap()
+                .assume_utc(),
+        );
+        let two_pm = readable_eastern_timestamp_for(
+            Date::from_calendar_date(2026, Month::September, 8)
+                .unwrap()
+                .with_hms(18, 5, 0)
+                .unwrap()
+                .assume_utc(),
+        );
+        let three_pm = readable_eastern_timestamp_for(
+            Date::from_calendar_date(2026, Month::September, 8)
+                .unwrap()
+                .with_hms(19, 0, 0)
+                .unwrap()
+                .assume_utc(),
+        );
+
+        assert_eq!(two_am, "2026-09-08_0205");
+        assert_eq!(noon, "2026-09-08_1204");
+        assert_eq!(two_pm, "2026-09-08_1405");
+        assert_eq!(three_pm, "2026-09-08_1500");
+        assert!(two_am < noon && noon < two_pm && two_pm < three_pm);
     }
 
     #[test]
@@ -1293,10 +1325,10 @@ mod tests {
 
     #[test]
     fn resume_hint_uses_the_session_folder_name() {
-        let path = PathBuf::from("/tmp/sessions/05-26-2026_7-21pm-et-grill-supper-and-weber-gift");
+        let path = PathBuf::from("/tmp/sessions/2026-05-26_1921-et-grill-supper-and-weber-gift");
         assert_eq!(
             resume_hint(&path).unwrap(),
-            "Resume this session with:\n  recall --resume 05-26-2026_7-21pm-et-grill-supper-and-weber-gift\nOr: recall --resume latest"
+            "Resume this session with:\n  recall --resume 2026-05-26_1921-et-grill-supper-and-weber-gift\nOr: recall --resume latest"
         );
         assert!(resume_hint(Path::new("/")).is_none());
     }

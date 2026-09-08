@@ -74,7 +74,7 @@ Recall should feel polished and calm, with a Claude Code-style terminal interfac
 
 ```text
 sessions/
-  05-26-2026_7-21pm-et-design-sync/
+  2026-05-26_1921-et-design-sync/
     meeting.md
     transcript.md
     audio/
@@ -104,7 +104,7 @@ sessions/
 
 ```json
 {
-  "id": "05-26-2026_7-21pm-et-design-sync",
+  "id": "2026-05-26_1921-et-design-sync",
   "title": "Design sync",
   "created_at_unix": 1778281380,
   "status": "initialized",
@@ -116,13 +116,13 @@ sessions/
 }
 ```
 
-`recall show latest`, `recall transcribe latest`, `recall analyze latest`, and `recall --resume latest` sort sessions by `created_at_unix` rather than folder name.
+New folder names use a US Eastern `YYYY-MM-DD_HHMM` prefix so they sort in date order in Finder, `ls`, and editors. Older `MM-DD-YYYY_H-MMapm` folders remain valid session IDs. `recall show latest`, `recall transcribe latest`, `recall analyze latest`, and `recall --resume latest` still sort by `created_at_unix` so mixed old and new names stay in true time order.
 
 After a TUI session that created or resumed a folder, quitting restores the terminal and prints:
 
 ```text
 Resume this session with:
-  recall --resume 05-26-2026_7-21pm-et-design-sync
+  recall --resume 2026-05-26_1921-et-design-sync
 Or: recall --resume latest
 ```
 

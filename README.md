@@ -174,7 +174,7 @@ Quitting (`q` / Ctrl+C) leaves transcription and analysis running in the backgro
 ```sh
 recall --resume
 recall --resume latest
-recall --resume 05-26-2026_7-21pm-et-design-sync
+recall --resume 2026-05-26_1921-et-design-sync
 recall resume latest
 ```
 
@@ -307,7 +307,7 @@ Recall writes sessions under `sessions/`:
 
 ```text
 sessions/
-  05-26-2026_7-21pm-et-project-sync/
+  2026-05-26_1921-et-project-sync/
     meeting.md
     transcript.md
     audio/

@@ -135,7 +135,7 @@ By default, sessions are written relative to the directory where you run Recall:
 
 ```text
 sessions/
-  <MM-DD-YYYY_H-MMapm>-et-quick-capture/
+  <YYYY-MM-DD_HHMM>-et-quick-capture/
     meeting.md
     transcript.md
     audio/
@@ -159,7 +159,7 @@ Example stable storage config:
 storage_dir = "~/Documents/Recall/sessions"
 ```
 
-Session IDs use Eastern Time for the timestamp prefix and include `et` in the folder name so names are stable for the user's preferred meeting timezone even when the project is run from another local timezone. If agent analysis returns a useful title, Recall can rename a generic folder such as `05-26-2026_7-21pm-et-quick-capture` to a topic-based name such as `05-26-2026_7-21pm-et-rain-birthdays-and-jersey-mikes-chat`.
+Session IDs use a US Eastern `YYYY-MM-DD_HHMM` prefix plus `et` plus slug so folder names sort in date order in Finder, `ls`, and editors. The timezone marker keeps names stable even when the project is run from another local timezone. Older `MM-DD-YYYY_H-MMapm` folders remain valid session IDs. If agent analysis returns a useful title, Recall can rename a generic folder such as `2026-05-26_1921-et-quick-capture` to a topic-based name such as `2026-05-26_1921-et-rain-birthdays-and-jersey-mikes-chat`.
 
 ## Current Caveat
 
