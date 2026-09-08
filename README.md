@@ -167,14 +167,14 @@ Start with a session title:
 recall --title "Project sync"
 ```
 
-When you press Space or Enter to end a recording, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready. The header `next:` indicator (toggle with `s`, like consent) chooses what the next Space or Enter does after ENDED: append another take in this folder, or start a new session.
+When you press Enter to end a recording, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready. The header `next:` indicator (toggle with `s`, like consent) chooses what the next Enter does after ENDED: append another take in this folder, or start a new session.
 
-Quitting (`q` / Ctrl+C) leaves transcription and analysis running in the background, then prints a copy-paste resume command. Plain `recall` starts a new session; `recall --resume` reopens the latest folder, and `recall --resume <session-id>` reopens that meeting so Space can append another take.
+Quitting (`q` / Ctrl+C) leaves transcription and analysis running in the background, then prints a copy-paste resume command. Plain `recall` starts a new session; `recall --resume` reopens the latest folder, and `recall --resume <session-id>` reopens that meeting so Enter can append another take.
 
 ```sh
 recall --resume
 recall --resume latest
-recall --resume 2026-05-26_1921-et-design-sync
+recall --resume 797394737678-2026-05-26_1921-et-design-sync
 recall resume latest
 ```
 
@@ -289,7 +289,8 @@ recall export latest --output ~/Desktop/project-sync.md
 ## TUI Keys
 
 - `c`: toggle consent noted
-- `Space` or `Enter`: start recording when idle; end and finalize when recording; continue the same session after it ends
+- `Enter`: start recording when idle; end and finalize when recording; continue the same session after it ends
+- `Space`: mute or unmute Recall's microphone track while recording. Zoom/Teams/Meet stay unmuted; call audio keeps recording. Space does not start or end a take.
 - transcript progress starts after recording ends; a continued take re-transcribes the full concatenated audio
 - `r`: refresh detected sources
 - `m`: add a timestamped marker to the session
@@ -307,7 +308,7 @@ Recall writes sessions under `sessions/`:
 
 ```text
 sessions/
-  2026-05-26_1921-et-project-sync/
+  797394737678-2026-05-26_1921-et-project-sync/
     meeting.md
     transcript.md
     audio/
@@ -332,6 +333,8 @@ sessions/
         agent-raw-output.json or agent-raw-output.jsonl
         agent-result.json
 ```
+
+New folders are `{inverted-utc-key}-{YYYY-MM-DD_HHMM}-et-{slug}`. The 12-digit key is `999999999999` minus the UTC `YYYYMMDDHHMM`, so VS Code Explorer, Finder, and `ls` A-Z list newest first. The readable stamp stays US Eastern 24-hour time. Older ISO `YYYY-MM-DD_HHMM-et-…` and am/pm `MM-DD-YYYY_H-MMapm-et-…` folders remain valid session IDs.
 
 `meeting.md` is the normal reading view. `transcript.md` is the clean source record. Pasted note images are ordinary files under `images/`, linked from `.recall/notes.md` and `meeting.md`. Audio and internal/debug artifacts remain available without crowding the session root. Recall continues to recognize sessions created with the older expanded layout.
 

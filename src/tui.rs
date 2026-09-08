@@ -34,7 +34,7 @@ use crate::capture_sources::{
     detect_sources, read_clipboard_text, write_clipboard_image, ClipboardImageOutcome,
     ClipboardTextOutcome, SourceSummary,
 };
-use crate::mic_recorder::MicRecorder;
+use crate::mic_recorder::{clear_mute_mic, set_mute_mic, MicRecorder};
 use crate::session::{
     append_session_marker, append_session_note, append_session_note_with_images,
     copy_image_into_session, default_storage_dir, discard_unused_note_images,
@@ -235,6 +235,7 @@ struct App {
     mic_device_label: Option<String>,
     mic_device_id: Option<String>,
     mic_capture_warning: Option<String>,
+    mic_muted: bool,
     call_level_percent: u16,
     call_level_db: Option<f32>,
     system_capture_failed: bool,
@@ -929,9 +930,9 @@ impl App {
             session_path: None,
             storage_dir: options.storage_dir.unwrap_or(default_storage_dir()?),
             toast: if consent_noted {
-                "Ready with consent provided. Press Space or Enter to start.".to_string()
+                "Ready with consent provided. Press Enter to start.".to_string()
             } else {
-                "Ready. Press c after consent, then Space or Enter to start.".to_string()
+                "Ready. Press c after consent, then Enter to start.".to_string()
             },
             markers: Vec::new(),
             live_notes: vec![
@@ -950,6 +951,7 @@ impl App {
             mic_device_label: None,
             mic_device_id: None,
             mic_capture_warning: None,
+            mic_muted: false,
             call_level_percent: 0,
             call_level_db: None,
             system_capture_failed: false,
@@ -999,7 +1001,7 @@ impl App {
         let id = Self::session_label(&resume.path);
         let clock = self.elapsed_label();
         self.toast = format!(
-            "Resumed {id}. Space appends take {next_take}. Clock continues from {clock} (break not added)."
+            "Resumed {id}. Enter appends take {next_take}. Clock continues from {clock} (break not added)."
         );
         self.live_notes = vec![
             format!("Resumed {}", resume.path.display()),
@@ -1016,7 +1018,7 @@ impl App {
                     "not noted"
                 }
             ),
-            "Space or Enter records another take in this session.".to_string(),
+            "Enter records another take in this session.".to_string(),
             "q leaves; next plain recall starts a new session.".to_string(),
         ];
     }
@@ -1068,12 +1070,13 @@ impl App {
             KeyCode::Char('q') => {
                 return self.request_quit();
             }
-            KeyCode::Enter | KeyCode::Char(' ') => self.primary_recording_action()?,
+            KeyCode::Enter => self.primary_recording_action()?,
+            KeyCode::Char(' ') => self.toggle_mic_mute()?,
             KeyCode::Char('c') => self.toggle_consent(),
             KeyCode::Char('s') => self.toggle_append_next(),
             KeyCode::Char('p') => {
-                self.toast = "Pause is disabled for real recording. Press Space or Enter to end."
-                    .to_string();
+                self.toast =
+                    "Pause is disabled for real recording. Press Enter to end.".to_string();
             }
             KeyCode::Char('e') => self.end_capture(),
             KeyCode::Char('m') => self.add_marker(),
@@ -1139,6 +1142,59 @@ impl App {
                 self.end_capture();
                 Ok(())
             }
+        }
+    }
+
+    fn toggle_mic_mute(&mut self) -> io::Result<()> {
+        if !matches!(self.state, CaptureState::Recording) {
+            self.toast = "Start recording before muting the mic.".to_string();
+            return Ok(());
+        }
+
+        let elapsed = self.elapsed_label();
+        if self.mic_muted {
+            self.set_mic_muted(false)?;
+            self.toast = "Mic unmuted.".to_string();
+            self.record_mute_note(&elapsed, "Mic unmuted");
+        } else {
+            self.set_mic_muted(true)?;
+            self.toast = "Mic muted for Recall. Call audio still recording. You are not muted in Zoom/Teams."
+                .to_string();
+            self.record_mute_note(&elapsed, "Mic muted for Recall");
+        }
+        Ok(())
+    }
+
+    fn record_mute_note(&mut self, elapsed: &str, caption: &str) {
+        let live = format!("{caption} at `{elapsed}`.");
+        if let Some(session_path) = &self.session_path {
+            if let Err(error) = append_session_note(session_path, elapsed, caption) {
+                self.live_notes.push(live);
+                self.toast = format!("Mute noted in memory, but failed to save: {error}");
+                return;
+            }
+        }
+        self.live_notes.push(live);
+    }
+
+    fn set_mic_muted(&mut self, muted: bool) -> io::Result<()> {
+        self.mic_muted = muted;
+        if muted {
+            self.mic_level_percent = 0;
+            self.mic_level_db = Some(f32::NEG_INFINITY);
+        }
+        if let Some(recorder) = &self.mic_recorder {
+            recorder.set_muted(muted)?;
+        } else if let Some(path) = &self.session_path {
+            set_mute_mic(path, muted)?;
+        }
+        Ok(())
+    }
+
+    fn clear_mic_mute(&mut self) {
+        self.mic_muted = false;
+        if let Some(path) = &self.session_path {
+            clear_mute_mic(path);
         }
     }
 
@@ -1485,6 +1541,7 @@ impl App {
         self.completed_take = 0;
         self.resumed = false;
         self.reset_capture_health();
+        self.clear_mic_mute();
         match acquire_capture_lock(&session.path) {
             Ok(lock) => self.capture_lock = Some(lock),
             Err(error) => {
@@ -1532,7 +1589,7 @@ impl App {
             "Mic source changes are detected while recording.".to_string(),
             "System audio capture writes audio/call-001.m4a via CoreAudio process taps."
                 .to_string(),
-            "Press Space or Enter to end and start transcription.".to_string(),
+            "Press Enter to end and start transcription.".to_string(),
         ];
         for failure in failures {
             self.live_notes.push(failure);
@@ -1561,6 +1618,7 @@ impl App {
         let continued = prepare_continued_take(&session_path)?;
         self.take_index = continued.take_index;
         self.reset_capture_health();
+        self.clear_mic_mute();
         match acquire_capture_lock(&session_path) {
             Ok(lock) => self.capture_lock = Some(lock),
             Err(error) => {
@@ -1671,9 +1729,9 @@ impl App {
     fn toggle_append_next(&mut self) {
         self.append_next = !self.append_next;
         self.toast = if self.append_next {
-            "Next Space or Enter will append another take to this session.".to_string()
+            "Next Enter will append another take to this session.".to_string()
         } else {
-            "Next Space or Enter will start a new session folder.".to_string()
+            "Next Enter will start a new session folder.".to_string()
         };
         if matches!(self.state, CaptureState::Ended) {
             self.replace_next_action_notes();
@@ -1682,15 +1740,15 @@ impl App {
 
     fn replace_next_action_notes(&mut self) {
         self.live_notes.retain(|note| {
-            !note.contains("Space or Enter continues this session")
-                && !note.contains("Space or Enter starts a new session")
+            !note.contains("Enter continues this session")
+                && !note.contains("Enter starts a new session")
                 && !note.contains("q leaves (next start is a new session)")
                 && !note.contains("q leaves.")
         });
         self.live_notes.push(if self.append_next {
-            "Audio finalized. Space or Enter continues this session.".to_string()
+            "Audio finalized. Enter continues this session.".to_string()
         } else {
-            "Audio finalized. Space or Enter starts a new session folder.".to_string()
+            "Audio finalized. Enter starts a new session folder.".to_string()
         });
         self.live_notes
             .push("s toggles append vs new. q leaves.".to_string());
@@ -1703,11 +1761,12 @@ impl App {
                     self.accumulated += started_at.elapsed();
                 }
                 self.stop_recorders();
+                self.clear_mic_mute();
                 self.ended_at = Some(Instant::now());
                 self.state = CaptureState::Ended;
                 self.completed_take = self.take_index.max(1);
                 self.live_notes
-                    .retain(|note| !note.contains("Press Space or Enter to end"));
+                    .retain(|note| !note.contains("Press Enter to end"));
                 self.replace_next_action_notes();
                 if let Some(session_path) = &self.session_path {
                     if let Err(error) = write_capture_progress(
@@ -1958,7 +2017,10 @@ impl App {
                     if event.device_id.is_some() {
                         self.mic_device_id = event.device_id.clone();
                     }
-                    if let Some(level_db) = event.level_db {
+                    if self.mic_muted {
+                        self.mic_level_db = Some(f32::NEG_INFINITY);
+                        self.mic_level_percent = 0;
+                    } else if let Some(level_db) = event.level_db {
                         self.mic_level_db = Some(level_db);
                         self.mic_level_percent = db_to_percent(level_db);
                     }
@@ -1971,6 +2033,7 @@ impl App {
                         .unwrap_or_default();
                     self.toast = format!("Mic recording saved{elapsed}: {path}");
                     clear_recorder = true;
+                    self.clear_mic_mute();
                     self.mic_level_percent = 0;
                     self.mic_level_db = None;
                     break;
@@ -1982,6 +2045,7 @@ impl App {
                     self.mic_capture_warning = Some(self.toast.clone());
                     self.live_notes.push(format!("mic failed: {}", self.toast));
                     clear_recorder = true;
+                    self.clear_mic_mute();
                     self.mic_level_percent = 0;
                     self.mic_level_db = None;
                     break;
@@ -2006,6 +2070,7 @@ impl App {
                     self.toast = warning.clone();
                     self.live_notes.push(warning);
                     self.mic_recorder = None;
+                    self.clear_mic_mute();
                     self.mic_level_percent = 0;
                     self.mic_level_db = None;
                 }
@@ -2565,6 +2630,7 @@ impl App {
                 }
             }
         }
+        self.clear_mic_mute();
     }
 
     fn stop_system_recorder(&mut self) {
@@ -2673,7 +2739,7 @@ impl App {
         } else {
             "next: new"
         };
-        let title = Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 " Recall ",
                 Style::default().fg(Color::Black).bg(Color::Cyan),
@@ -2687,11 +2753,24 @@ impl App {
                     .fg(self.status_color())
                     .add_modifier(Modifier::BOLD),
             ),
+        ];
+        if self.mic_muted && matches!(self.state, CaptureState::Recording) {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                "MIC MUTED",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.extend([
             Span::raw("  "),
             Span::styled(consent, Style::default().fg(Color::Gray)),
             Span::raw("  "),
             Span::styled(next, Style::default().fg(Color::Gray)),
         ]);
+        let title = Line::from(spans);
         frame.render_widget(
             Paragraph::new(title).block(Block::default().borders(Borders::ALL)),
             area,
@@ -2737,6 +2816,10 @@ impl App {
     }
 
     fn active_mic_source_label(&self) -> String {
+        if self.mic_muted && matches!(self.state, CaptureState::Recording) {
+            return "MIC MUTED for Recall".to_string();
+        }
+
         if let Some(warning) = &self.mic_capture_warning {
             return warning.clone();
         }
@@ -2817,7 +2900,9 @@ impl App {
     }
 
     fn mic_signal_value(&self) -> u16 {
-        if self.mic_recorder.is_some() {
+        if self.mic_muted {
+            0
+        } else if self.mic_recorder.is_some() {
             self.mic_level_percent
         } else {
             self.meter_value(0)
@@ -2835,7 +2920,9 @@ impl App {
     }
 
     fn mic_signal_color(&self) -> Color {
-        if self.mic_capture_warning.is_some() {
+        if (self.mic_muted && matches!(self.state, CaptureState::Recording))
+            || self.mic_capture_warning.is_some()
+        {
             Color::Yellow
         } else if self.mic_recorder.is_some() {
             Color::Cyan
@@ -3064,7 +3151,15 @@ impl App {
     }
 
     fn capture_health_line(&self) -> Line<'static> {
-        let mic_state = if let Some(warning) = &self.mic_capture_warning {
+        let mic_state = if self.mic_muted && matches!(self.state, CaptureState::Recording) {
+            Span::styled(
+                "MIC MUTED for Recall (call still recording)",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if let Some(warning) = &self.mic_capture_warning {
             Span::styled(
                 format!("Mic warning: {warning}"),
                 Style::default().fg(Color::Yellow),
@@ -3138,7 +3233,7 @@ impl App {
             CaptureState::Ready => vec![
                 "No session yet".to_string(),
                 "Press c after consent".to_string(),
-                "Press Space or Enter to start".to_string(),
+                "Press Enter to start".to_string(),
             ],
             CaptureState::Recording => vec![
                 format!(
@@ -3149,7 +3244,11 @@ impl App {
                     "System audio targets audio/{}",
                     AudioTrack::Call.segment_name(self.take_index.max(1))
                 ),
-                "Space or Enter ends and starts transcription".to_string(),
+                if self.mic_muted {
+                    "MIC MUTED for Recall. Space unmutes. Enter ends.".to_string()
+                } else {
+                    "Enter ends and starts transcription. Space mutes Recall mic.".to_string()
+                },
                 format!("Analysis agent: {}", self.agent_label()),
             ],
             CaptureState::Ended => vec![
@@ -3159,9 +3258,9 @@ impl App {
                     "Audio finalized".to_string()
                 },
                 if self.append_next {
-                    "Space or Enter records another take in this session".to_string()
+                    "Enter records another take in this session".to_string()
                 } else {
-                    "Space or Enter starts a new session folder".to_string()
+                    "Enter starts a new session folder".to_string()
                 },
                 "s toggles append vs new. q leaves.".to_string(),
                 self.transcription_status.label.clone(),
@@ -3270,10 +3369,15 @@ impl App {
 
         let help = Line::from(vec![
             Span::styled(
-                " Space/Enter ",
+                " Enter ",
                 Style::default().fg(Color::Black).bg(Color::Green),
             ),
             Span::raw(" start/end/continue  "),
+            Span::styled(
+                " Space ",
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ),
+            Span::raw(" mute  "),
             Span::styled(" c ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::raw(" consent  "),
             Span::styled(" s ", Style::default().fg(Color::Black).bg(Color::Cyan)),
@@ -3563,6 +3667,7 @@ mod tests {
             mic_device_label: None,
             mic_device_id: None,
             mic_capture_warning: None,
+            mic_muted: false,
             call_level_percent: 0,
             call_level_db: None,
             system_capture_failed: false,
@@ -3864,7 +3969,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_opens_ended_session_and_space_continues_the_same_folder() {
+    fn resume_opens_ended_session_and_enter_continues_the_same_folder() {
         let storage = std::env::temp_dir().join(format!(
             "recall-tui-resume-{}-{}",
             std::process::id(),
@@ -4432,5 +4537,151 @@ mod tests {
         assert!(notes.contains("[image](images/12-04-note-2.png)"));
 
         let _ = fs::remove_dir_all(storage);
+    }
+
+    fn space_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)
+    }
+
+    fn enter_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn space_does_not_start_end_or_continue_outside_recording() {
+        let mut ready = test_app(PathBuf::from("/tmp/recall-space-ready"));
+        ready.state = CaptureState::Ready;
+        ready.session_path = None;
+        ready.handle_key(space_key()).unwrap();
+        assert_eq!(ready.state, CaptureState::Ready);
+        assert!(!ready.mic_muted);
+        assert_eq!(ready.toast, "Start recording before muting the mic.");
+
+        let mut ended = test_app(PathBuf::from("/tmp/recall-space-ended"));
+        ended.state = CaptureState::Ended;
+        ended.handle_key(space_key()).unwrap();
+        assert_eq!(ended.state, CaptureState::Ended);
+        assert!(!ended.mic_muted);
+        assert_eq!(ended.toast, "Start recording before muting the mic.");
+        assert_eq!(
+            next_recording_action(ended.state, ended.session_path.is_some(), ended.append_next),
+            RecordingAction::Continue
+        );
+    }
+
+    #[test]
+    fn space_toggles_mute_only_while_recording() {
+        let (storage, session_path) = note_session("mute-toggle");
+        let mut app = test_app(session_path.clone());
+        app.state = CaptureState::Recording;
+        app.started_at = Some(Instant::now());
+        app.mic_level_percent = 40;
+
+        app.handle_key(space_key()).unwrap();
+        assert_eq!(app.state, CaptureState::Recording);
+        assert!(app.mic_muted);
+        assert_eq!(app.mic_signal_value(), 0);
+        assert!(app.toast.contains("Mic muted for Recall"));
+        assert!(app.toast.contains("You are not muted in Zoom/Teams."));
+        assert!(app
+            .live_notes
+            .iter()
+            .any(|note| note.contains("Mic muted for Recall at `")));
+        assert!(crate::mic_recorder::mute_mic_path(&session_path).exists());
+        let notes = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        assert!(notes.contains("Mic muted for Recall"));
+
+        app.handle_key(space_key()).unwrap();
+        assert_eq!(app.state, CaptureState::Recording);
+        assert!(!app.mic_muted);
+        assert_eq!(app.toast, "Mic unmuted.");
+        assert!(app
+            .live_notes
+            .iter()
+            .any(|note| note.contains("Mic unmuted at `")));
+        assert!(!crate::mic_recorder::mute_mic_path(&session_path).exists());
+        let notes = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        assert!(notes.contains("Mic unmuted"));
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn space_in_note_draft_inserts_a_space_and_does_not_mute() {
+        let (storage, session_path) = note_session("mute-note-space");
+        let mut app = test_app(session_path.clone());
+        app.state = CaptureState::Recording;
+        app.start_manual_note();
+        type_note(&mut app, "hello");
+        app.handle_key(space_key()).unwrap();
+        type_note(&mut app, "world");
+        assert_eq!(app.note_draft.as_ref().unwrap().caption(), "hello world");
+        assert!(!app.mic_muted);
+        assert_eq!(app.state, CaptureState::Recording);
+        assert!(!crate::mic_recorder::mute_mic_path(&session_path).exists());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn enter_still_ends_a_take_and_m_still_drops_a_marker() {
+        let (storage, session_path) = note_session("enter-end-marker");
+        let mut app = test_app(session_path.clone());
+        app.state = CaptureState::Recording;
+        app.started_at = Some(Instant::now());
+        app.take_index = 1;
+        app.completed_take = 0;
+        app.auto_analyze = false;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.state, CaptureState::Recording);
+        assert!(app.markers.iter().any(|marker| marker.contains("marker")));
+        let markers = fs::read_to_string(session_path.join(".recall/markers.md")).unwrap();
+        assert!(markers.contains("Marker"));
+
+        app.handle_key(space_key()).unwrap();
+        assert!(app.mic_muted);
+        app.handle_key(enter_key()).unwrap();
+        assert_eq!(app.state, CaptureState::Ended);
+        assert!(!app.mic_muted);
+        assert!(!crate::mic_recorder::mute_mic_path(&session_path).exists());
+        assert_eq!(
+            next_recording_action(app.state, app.session_path.is_some(), app.append_next),
+            RecordingAction::Continue
+        );
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn ending_a_take_clears_mute_without_a_second_space() {
+        let (storage, session_path) = note_session("end-clears-mute");
+        let mut app = test_app(session_path.clone());
+        app.state = CaptureState::Recording;
+        app.started_at = Some(Instant::now());
+        app.take_index = 1;
+        app.completed_take = 0;
+        app.auto_analyze = false;
+        app.handle_key(space_key()).unwrap();
+        assert!(app.mic_muted);
+        app.end_capture();
+        assert_eq!(app.state, CaptureState::Ended);
+        assert!(!app.mic_muted);
+        assert_eq!(app.mic_signal_value(), 0);
+        assert!(!crate::mic_recorder::mute_mic_path(&session_path).exists());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn muted_level_events_stay_at_zero_percent() {
+        assert_eq!(db_to_percent(f32::NEG_INFINITY), 0);
+        assert_eq!(db_to_percent(-160.0), 0);
+        let mut app = test_app(PathBuf::from("/tmp/recall-muted-meter"));
+        app.state = CaptureState::Recording;
+        app.mic_muted = true;
+        app.mic_level_percent = 88;
+        assert_eq!(app.mic_signal_value(), 0);
     }
 }

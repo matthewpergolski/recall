@@ -554,7 +554,11 @@ fn compact_timestamp_to_iso(prefix: &str) -> Option<String> {
     let day = &name[6..8];
     let hour = &name[9..11];
     let minute = &name[11..13];
-    Some(format!("{year}-{month}-{day}_{hour}{minute}"))
+    let date: u64 = name[0..8].parse().ok()?;
+    let hm: u64 = name[9..13].parse().ok()?;
+    let compact = date * 10_000 + hm;
+    let key = 999_999_999_999u64.checked_sub(compact)?;
+    Some(format!("{key:012}-{year}-{month}-{day}_{hour}{minute}"))
 }
 
 fn unique_session_path(parent: &Path, base_name: &str) -> PathBuf {
@@ -870,11 +874,11 @@ mod tests {
     fn derives_session_prefix_and_title_slug() {
         assert_eq!(
             session_timestamp_prefix("20260526-185332-quick-capture"),
-            Some("2026-05-26_1853".to_string())
+            Some("797394738146-2026-05-26_1853".to_string())
         );
         assert_eq!(
             session_timestamp_prefix("20260526-185332-et-rain-chat"),
-            Some("2026-05-26_1853".to_string())
+            Some("797394738146-2026-05-26_1853".to_string())
         );
         assert_eq!(
             session_timestamp_prefix("05-26-2026_7-21pm-et-rain-chat"),
@@ -883,6 +887,14 @@ mod tests {
         assert_eq!(
             session_timestamp_prefix("2026-09-08_1405-et-release-version"),
             Some("2026-09-08_1405".to_string())
+        );
+        assert_eq!(
+            session_timestamp_prefix("797390918099-2026-09-08_1500-et-empty-quick-capture"),
+            Some("797390918099-2026-09-08_1500".to_string())
+        );
+        assert_eq!(
+            session_timestamp_prefix("797394737678-2026-05-26_1921-et-design-sync"),
+            Some("797394737678-2026-05-26_1921".to_string())
         );
         assert_eq!(
             title_slug("Rain, Birthdays and Jersey Mike's Chat"),

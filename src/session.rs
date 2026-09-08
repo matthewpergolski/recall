@@ -868,15 +868,27 @@ fn readable_eastern_timestamp() -> String {
 }
 
 fn readable_eastern_timestamp_for(now_utc: OffsetDateTime) -> String {
+    // Inverted UTC YYYYMMDDHHMM so A-Z folder sort is newest first, including DST fallback.
+    let key = inverted_utc_minute_key(now_utc);
     let now = now_utc + Duration::hours(i64::from(eastern_offset_hours(now_utc)));
-    format!(
+    let readable = format!(
         "{:04}-{:02}-{:02}_{:02}{:02}",
         now.year(),
         u8::from(now.month()),
         now.day(),
         now.hour(),
         now.minute()
-    )
+    );
+    format!("{key:012}-{readable}")
+}
+
+fn inverted_utc_minute_key(utc: OffsetDateTime) -> u64 {
+    let compact = i64::from(utc.year()) * 100_000_000
+        + i64::from(u8::from(utc.month())) * 1_000_000
+        + i64::from(utc.day()) * 10_000
+        + i64::from(utc.hour()) * 100
+        + i64::from(utc.minute());
+    999_999_999_999u64.saturating_sub(u64::try_from(compact).unwrap_or(0))
 }
 
 fn eastern_offset_hours(utc: OffsetDateTime) -> i8 {
@@ -1068,11 +1080,14 @@ mod tests {
             .unwrap()
             .assume_utc();
 
-        assert_eq!(readable_eastern_timestamp_for(utc), "2026-05-26_1921");
+        assert_eq!(
+            readable_eastern_timestamp_for(utc),
+            "797394737678-2026-05-26_1921"
+        );
     }
 
     #[test]
-    fn eastern_timestamps_sort_lexically_in_chronological_order() {
+    fn eastern_timestamps_sort_lexically_newest_first() {
         let two_am = readable_eastern_timestamp_for(
             Date::from_calendar_date(2026, Month::September, 8)
                 .unwrap()
@@ -1102,11 +1117,11 @@ mod tests {
                 .assume_utc(),
         );
 
-        assert_eq!(two_am, "2026-09-08_0205");
-        assert_eq!(noon, "2026-09-08_1204");
-        assert_eq!(two_pm, "2026-09-08_1405");
-        assert_eq!(three_pm, "2026-09-08_1500");
-        assert!(two_am < noon && noon < two_pm && two_pm < three_pm);
+        assert_eq!(two_am, "797390919394-2026-09-08_0205");
+        assert_eq!(noon, "797390918395-2026-09-08_1204");
+        assert_eq!(two_pm, "797390918194-2026-09-08_1405");
+        assert_eq!(three_pm, "797390918099-2026-09-08_1500");
+        assert!(three_pm < two_pm && two_pm < noon && noon < two_am);
     }
 
     #[test]
