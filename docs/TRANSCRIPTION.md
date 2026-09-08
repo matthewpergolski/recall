@@ -153,9 +153,9 @@ Larger models cost more local compute time but should improve transcript quality
 
 ## Current Behavior
 
-The TUI starts transcription automatically after the user presses Space or Enter to end a recording. The status area shows current transcript progress, including the active track/chunk, and shows the final `transcript.md` path when complete.
+The TUI starts transcription automatically after the user presses Enter to end a recording. The status area shows current transcript progress, including the active track/chunk, and shows the final `transcript.md` path when complete.
 
-If you stay in that TUI session, Space or Enter follows the header `next:` indicator (`s` toggles it, like consent). `next: append` records another numbered take in the same folder (`mic-002.m4a` / `call-002.m4a`). `next: new` starts a new session folder. Ending an appended take concatenates every take in order and re-transcribes the full mic and call tracks. Transcript timestamps follow concatenated audio time, not the TUI clock; the TUI clock includes the break between takes, and the audio does not insert silence for that gap.
+If you stay in that TUI session, Enter follows the header `next:` indicator (`s` toggles it, like consent). `next: append` records another numbered take in the same folder (`mic-002.m4a` / `call-002.m4a`). `next: new` starts a new session folder. Ending an appended take concatenates every take in order and re-transcribes the full mic and call tracks. Transcript timestamps follow concatenated audio time, not the TUI clock; the TUI clock includes the break between takes, and the audio does not insert silence for that gap.
 
 A continued take can start while take 1 is still transcribing or analyzing. Those jobs keep running. The later take's full re-transcribe and analysis replace `transcript.md` and `meeting.md`. A late take-1 completion does not overwrite newer take outputs. Notes and markers accumulate.
 

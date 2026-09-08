@@ -74,7 +74,7 @@ Recall should feel polished and calm, with a Claude Code-style terminal interfac
 
 ```text
 sessions/
-  2026-05-26_1921-et-design-sync/
+  797394737678-2026-05-26_1921-et-design-sync/
     meeting.md
     transcript.md
     audio/
@@ -104,7 +104,7 @@ sessions/
 
 ```json
 {
-  "id": "2026-05-26_1921-et-design-sync",
+  "id": "797394737678-2026-05-26_1921-et-design-sync",
   "title": "Design sync",
   "created_at_unix": 1778281380,
   "status": "initialized",
@@ -116,14 +116,14 @@ sessions/
 }
 ```
 
-New folder names use a US Eastern `YYYY-MM-DD_HHMM` prefix so they sort in date order in Finder, `ls`, and editors. Older `MM-DD-YYYY_H-MMapm` folders remain valid session IDs. `recall show latest`, `recall transcribe latest`, `recall analyze latest`, and `recall --resume latest` still sort by `created_at_unix` so mixed old and new names stay in true time order.
+New folder names use a 12-digit inverted UTC key plus a US Eastern `YYYY-MM-DD_HHMM` stamp plus `et` plus slug, for example `797394737678-2026-05-26_1921-et-design-sync`. The key is `999999999999` minus the UTC `YYYYMMDDHHMM`, so VS Code Explorer, Finder, and `ls` A-Z list newest first. Older ISO `YYYY-MM-DD_HHMM-et-…` and `MM-DD-YYYY_H-MMapm` folders remain valid session IDs. `recall show latest`, `recall transcribe latest`, `recall analyze latest`, and `recall --resume latest` still sort by `created_at_unix` so mixed old and new names stay in true time order.
 
 After a TUI session that created or resumed a folder, quitting restores the terminal and prints:
 
 ```text
 Resume this session with:
-  recall --resume 2026-05-26_1921-et-design-sync
+  recall --resume 797394737678-2026-05-26_1921-et-design-sync
 Or: recall --resume latest
 ```
 
-`--resume` reopens that folder in the ENDED TUI state. Space or Enter records the next numbered take (`mic-002.m4a` / `call-002.m4a`). Plain `recall` still starts a new session. Resume refuses if another Recall process is already recording into that folder, or if `capture.json` shows an unfinished take.
+`--resume` reopens that folder in the ENDED TUI state. Enter records the next numbered take (`mic-002.m4a` / `call-002.m4a`). Plain `recall` still starts a new session. Resume refuses if another Recall process is already recording into that folder, or if `capture.json` shows an unfinished take.

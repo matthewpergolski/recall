@@ -69,7 +69,7 @@ recall --agent grok
 Flow:
 
 1. Start recording.
-2. Press Space or Enter to end.
+2. Press Enter to end.
 3. Recall finalizes audio.
 4. Recall transcribes locally.
 5. Recall runs the selected agent.

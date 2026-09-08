@@ -75,6 +75,7 @@ struct RecordMicOptions {
     let sessionDir: URL
     let durationSeconds: TimeInterval
     let stopFile: URL?
+    let muteFile: URL?
     let outputName: String
 }
 
@@ -310,6 +311,7 @@ struct RecallCapture {
         var sessionDir: URL?
         var durationSeconds: TimeInterval = 8 * 60 * 60
         var stopFile: URL?
+        var muteFile: URL?
         var outputName = "mic.m4a"
         var index = 0
 
@@ -338,6 +340,12 @@ struct RecallCapture {
                 }
                 stopFile = URL(fileURLWithPath: args[index + 1])
                 index += 2
+            case "--mute-file":
+                guard index + 1 < args.count else {
+                    throw CaptureError.missingValue(arg)
+                }
+                muteFile = URL(fileURLWithPath: args[index + 1])
+                index += 2
             case "--output-name":
                 guard index + 1 < args.count else {
                     throw CaptureError.missingValue(arg)
@@ -358,6 +366,7 @@ struct RecallCapture {
             sessionDir: sessionDir,
             durationSeconds: durationSeconds,
             stopFile: stopFile,
+            muteFile: muteFile,
             outputName: outputName
         )
     }
@@ -551,82 +560,11 @@ struct RecallCapture {
             try FileManager.default.removeItem(at: outputURL)
         }
 
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 44_100,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
-        ]
-
-        let recorder = try AVAudioRecorder(url: outputURL, settings: settings)
-        recorder.isMeteringEnabled = true
-        recorder.prepareToRecord()
-
-        guard recorder.record() else {
-            throw CaptureError.recorderCreationFailed
-        }
-
-        var currentInputDevice = defaultInputDevice()
-
-        try RecallCapture.printJSONLine(CaptureEvent(
-            type: "recording_started",
-            source: "mic",
-            path: outputURL.path,
-            elapsedSeconds: 0,
-            levelDb: nil,
-            message: currentInputDevice.map { "Mic input: \($0.name)" },
-            deviceName: currentInputDevice?.name,
-            deviceID: currentInputDevice?.uid
-        ))
-
-        let startedAt = Date()
-        while Date().timeIntervalSince(startedAt) < options.durationSeconds
-            && !shouldStopRecording(stopFile: options.stopFile)
-        {
-            Thread.sleep(forTimeInterval: 0.25)
-            let latestInputDevice = defaultInputDevice()
-            if latestInputDevice != currentInputDevice {
-                currentInputDevice = latestInputDevice
-                try printJSONLine(CaptureEvent(
-                    type: "device_changed",
-                    source: "mic",
-                    path: nil,
-                    elapsedSeconds: Date().timeIntervalSince(startedAt),
-                    levelDb: nil,
-                    message: latestInputDevice.map { "Mic input changed to \($0.name)" }
-                        ?? "Mic input changed, but current default input could not be resolved.",
-                    deviceName: latestInputDevice?.name,
-                    deviceID: latestInputDevice?.uid
-                ))
-            }
-            recorder.updateMeters()
-            try printJSONLine(CaptureEvent(
-                type: "level",
-                source: "mic",
-                path: nil,
-                elapsedSeconds: Date().timeIntervalSince(startedAt),
-                levelDb: recorder.averagePower(forChannel: 0),
-                message: nil,
-                deviceName: currentInputDevice?.name,
-                deviceID: currentInputDevice?.uid
-            ))
-        }
-
-        recorder.stop()
-
-        try RecallCapture.printJSONLine(CaptureEvent(
-            type: "recording_stopped",
-            source: "mic",
-            path: outputURL.path,
-            elapsedSeconds: Date().timeIntervalSince(startedAt),
-            levelDb: nil,
-            message: currentInputDevice.map { "Mic input at stop: \($0.name)" },
-            deviceName: currentInputDevice?.name,
-            deviceID: currentInputDevice?.uid
-        ))
+        let recorder = MicTapRecorder(outputURL: outputURL, muteFile: options.muteFile)
+        try recorder.record(durationSeconds: options.durationSeconds, stopFile: options.stopFile)
     }
 
-    private static func defaultInputDevice() -> DefaultInputDevice? {
+    fileprivate static func defaultInputDevice() -> DefaultInputDevice? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultInputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -772,6 +710,14 @@ struct RecallCapture {
         }
 
         return FileManager.default.fileExists(atPath: stopFile.path)
+    }
+
+    fileprivate static func muteFileExists(muteFile: URL?) -> Bool {
+        guard let muteFile else {
+            return false
+        }
+
+        return FileManager.default.fileExists(atPath: muteFile.path)
     }
 
     private static func ensureMicrophonePermission() throws {
@@ -933,7 +879,7 @@ struct RecallCapture {
 
             USAGE:
                 recall-capture list-sources
-                recall-capture record-mic --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
+                recall-capture record-mic --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--mute-file <path>] [--output-name <file.m4a>]
                 recall-capture record-audio-tap --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
                 recall-capture record-system --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
                 recall-capture probe-audio-tap
@@ -944,6 +890,7 @@ struct RecallCapture {
             COMMANDS:
                 list-sources    Emit candidate meeting apps and microphones as JSON.
                 record-mic      Record default microphone audio into <session-dir>/audio/<output-name>.
+                                --mute-file writes digital silence into the same m4a while present.
                 record-audio-tap Record system audio with CoreAudio process taps into <session-dir>/audio/<output-name>.
                 record-system   Record app/system audio into <session-dir>/audio/<output-name>.
                 probe-audio-tap Probe CoreAudio's process-tap API without writing audio.
@@ -958,6 +905,250 @@ struct RecallCapture {
             """,
             file
         )
+    }
+}
+
+final class MicTapRecorder: @unchecked Sendable {
+    private static let mutedLevelDb: Float = -160
+
+    private let outputURL: URL
+    private let muteFile: URL?
+    private let writerQueue = DispatchQueue(label: "recall.mic.writer")
+    private let startedAt = Date()
+    private let engine = AVAudioEngine()
+    private let muteLock = NSLock()
+    private var audioFile: AVAudioFile?
+    private var converter: AVAudioConverter?
+    private var writeFormat: AVAudioFormat?
+    private var lastLevelEventAt = Date.distantPast
+    private var writeError: Error?
+    private var muted = false
+    private var currentInputDevice: DefaultInputDevice?
+
+    init(outputURL: URL, muteFile: URL?) {
+        self.outputURL = outputURL
+        self.muteFile = muteFile
+    }
+
+    func record(durationSeconds: TimeInterval, stopFile: URL?) throws {
+        try start()
+        updateInputDevice(RecallCapture.defaultInputDevice())
+        let startedDevice = snapshotInputDevice()
+
+        try RecallCapture.printJSONLine(CaptureEvent(
+            type: "recording_started",
+            source: "mic",
+            path: outputURL.path,
+            elapsedSeconds: 0,
+            levelDb: nil,
+            message: startedDevice.map { "Mic input: \($0.name)" },
+            deviceName: startedDevice?.name,
+            deviceID: startedDevice?.uid
+        ))
+
+        while Date().timeIntervalSince(startedAt) < durationSeconds
+            && !RecallCapture.shouldStopRecording(stopFile: stopFile)
+        {
+            refreshMuteState()
+            let latestInputDevice = RecallCapture.defaultInputDevice()
+            if latestInputDevice != snapshotInputDevice() {
+                updateInputDevice(latestInputDevice)
+                try RecallCapture.printJSONLine(CaptureEvent(
+                    type: "device_changed",
+                    source: "mic",
+                    path: nil,
+                    elapsedSeconds: Date().timeIntervalSince(startedAt),
+                    levelDb: nil,
+                    message: latestInputDevice.map { "Mic input changed to \($0.name)" }
+                        ?? "Mic input changed, but current default input could not be resolved.",
+                    deviceName: latestInputDevice?.name,
+                    deviceID: latestInputDevice?.uid
+                ))
+            }
+            if let writeError {
+                stop()
+                throw writeError
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+
+        stop()
+        let stoppedDevice = snapshotInputDevice()
+
+        try RecallCapture.printJSONLine(CaptureEvent(
+            type: "recording_stopped",
+            source: "mic",
+            path: outputURL.path,
+            elapsedSeconds: Date().timeIntervalSince(startedAt),
+            levelDb: nil,
+            message: stoppedDevice.map { "Mic input at stop: \($0.name)" },
+            deviceName: stoppedDevice?.name,
+            deviceID: stoppedDevice?.uid
+        ))
+    }
+
+    private func start() throws {
+        let input = engine.inputNode
+        engine.prepare()
+        let hardwareFormat = input.inputFormat(forBus: 0)
+        let tapFormat: AVAudioFormat
+        if hardwareFormat.channelCount > 0, hardwareFormat.sampleRate > 0 {
+            tapFormat = hardwareFormat
+        } else if let fallback = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1) {
+            tapFormat = fallback
+        } else {
+            throw CaptureError.audioFormatUnavailable
+        }
+        guard let monoFormat = AVAudioFormat(
+            standardFormatWithSampleRate: tapFormat.sampleRate,
+            channels: 1
+        ) else {
+            throw CaptureError.audioFormatUnavailable
+        }
+        writeFormat = monoFormat
+        if tapFormat.channelCount != 1
+            || tapFormat.commonFormat != monoFormat.commonFormat
+            || tapFormat.isInterleaved != monoFormat.isInterleaved
+        {
+            guard let converter = AVAudioConverter(from: tapFormat, to: monoFormat) else {
+                throw CaptureError.audioFormatUnavailable
+            }
+            self.converter = converter
+        } else {
+            converter = nil
+        }
+
+        audioFile = try AVAudioFile(
+            forWriting: outputURL,
+            settings: [
+                AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+                AVSampleRateKey: tapFormat.sampleRate,
+                AVNumberOfChannelsKey: 1,
+                AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+            ],
+            commonFormat: monoFormat.commonFormat,
+            interleaved: monoFormat.isInterleaved
+        )
+
+        input.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
+            self?.handleTap(buffer)
+        }
+
+        do {
+            try engine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            throw CaptureError.recorderCreationFailed
+        }
+    }
+
+    private func stop() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        writerQueue.sync {
+            self.audioFile = nil
+        }
+    }
+
+    private func handleTap(_ buffer: AVAudioPCMBuffer) {
+        let muted = isMuted()
+        let device = snapshotInputDevice()
+        writerQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+            do {
+                guard let toWrite = self.monoBuffer(from: buffer) else {
+                    throw CaptureError.audioFormatUnavailable
+                }
+                if muted {
+                    if let silent = silentBuffer(matching: toWrite) {
+                        try self.audioFile?.write(from: silent)
+                    }
+                    self.maybeEmitLevel(Self.mutedLevelDb, device: device)
+                } else {
+                    try self.audioFile?.write(from: toWrite)
+                    self.maybeEmitLevel(audioLevelDb(toWrite) ?? Self.mutedLevelDb, device: device)
+                }
+            } catch {
+                self.writeError = error
+            }
+        }
+    }
+
+    private func monoBuffer(from buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let converter, let writeFormat else {
+            return buffer
+        }
+        let frameCapacity = max(buffer.frameLength, 1)
+        guard let converted = AVAudioPCMBuffer(pcmFormat: writeFormat, frameCapacity: frameCapacity)
+        else {
+            return nil
+        }
+        final class Once: @unchecked Sendable { var done = false }
+        let once = Once()
+        var convertError: NSError?
+        converter.reset()
+        let status = converter.convert(to: converted, error: &convertError) { _, outStatus in
+            if once.done {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            once.done = true
+            outStatus.pointee = .haveData
+            return buffer
+        }
+        if status == .error || convertError != nil {
+            return nil
+        }
+        return converted
+    }
+
+    private func refreshMuteState() {
+        setMuted(RecallCapture.muteFileExists(muteFile: muteFile))
+    }
+
+    private func setMuted(_ value: Bool) {
+        muteLock.lock()
+        muted = value
+        muteLock.unlock()
+    }
+
+    private func isMuted() -> Bool {
+        muteLock.lock()
+        defer { muteLock.unlock() }
+        return muted
+    }
+
+    private func updateInputDevice(_ device: DefaultInputDevice?) {
+        muteLock.lock()
+        currentInputDevice = device
+        muteLock.unlock()
+    }
+
+    private func snapshotInputDevice() -> DefaultInputDevice? {
+        muteLock.lock()
+        defer { muteLock.unlock() }
+        return currentInputDevice
+    }
+
+    private func maybeEmitLevel(_ levelDb: Float, device: DefaultInputDevice?) {
+        let now = Date()
+        guard now.timeIntervalSince(lastLevelEventAt) >= 0.25 else {
+            return
+        }
+        lastLevelEventAt = now
+
+        try? RecallCapture.printJSONLine(CaptureEvent(
+            type: "level",
+            source: "mic",
+            path: nil,
+            elapsedSeconds: now.timeIntervalSince(startedAt),
+            levelDb: levelDb,
+            message: nil,
+            deviceName: device?.name,
+            deviceID: device?.uid
+        ))
     }
 }
 
@@ -1193,44 +1384,6 @@ final class CoreAudioTapRecorder: @unchecked Sendable {
             message: nil
         ))
     }
-
-    private func audioLevelDb(_ buffer: AVAudioPCMBuffer) -> Float? {
-        let channelCount = Int(buffer.format.channelCount)
-        let frameLength = Int(buffer.frameLength)
-        guard frameLength > 0 else {
-            return nil
-        }
-
-        var sumSquares = 0.0
-        var sampleCount = 0
-
-        if let floatChannelData = buffer.floatChannelData {
-            for channel in 0..<channelCount {
-                let samples = floatChannelData[channel]
-                for frame in 0..<frameLength {
-                    let value = Double(samples[frame])
-                    sumSquares += value * value
-                    sampleCount += 1
-                }
-            }
-        } else if let int16ChannelData = buffer.int16ChannelData {
-            for channel in 0..<channelCount {
-                let samples = int16ChannelData[channel]
-                for frame in 0..<frameLength {
-                    let value = Double(samples[frame]) / Double(Int16.max)
-                    sumSquares += value * value
-                    sampleCount += 1
-                }
-            }
-        }
-
-        guard sampleCount > 0, sumSquares > 0 else {
-            return -60
-        }
-
-        let rms = sqrt(sumSquares / Double(sampleCount))
-        return max(20 * Float(log10(rms)), -60)
-    }
 }
 
 @available(macOS 14.2, *)
@@ -1244,6 +1397,61 @@ private let coreAudioTapIOProc: AudioDeviceIOProc = {
         .fromOpaque(clientData)
         .takeUnretainedValue()
     return recorder.handleInput(inputData)
+}
+
+private func silentBuffer(matching buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    guard let silent = AVAudioPCMBuffer(
+        pcmFormat: buffer.format,
+        frameCapacity: buffer.frameLength
+    ) else {
+        return nil
+    }
+    silent.frameLength = buffer.frameLength
+    let audioBuffers = UnsafeMutableAudioBufferListPointer(silent.mutableAudioBufferList)
+    for audioBuffer in audioBuffers {
+        if let data = audioBuffer.mData {
+            memset(data, 0, Int(audioBuffer.mDataByteSize))
+        }
+    }
+    return silent
+}
+
+private func audioLevelDb(_ buffer: AVAudioPCMBuffer) -> Float? {
+    let channelCount = Int(buffer.format.channelCount)
+    let frameLength = Int(buffer.frameLength)
+    guard frameLength > 0 else {
+        return nil
+    }
+
+    var sumSquares = 0.0
+    var sampleCount = 0
+
+    if let floatChannelData = buffer.floatChannelData {
+        for channel in 0..<channelCount {
+            let samples = floatChannelData[channel]
+            for frame in 0..<frameLength {
+                let value = Double(samples[frame])
+                sumSquares += value * value
+                sampleCount += 1
+            }
+        }
+    } else if let int16ChannelData = buffer.int16ChannelData {
+        for channel in 0..<channelCount {
+            let samples = int16ChannelData[channel]
+            for frame in 0..<frameLength {
+                let value = Double(samples[frame]) / Double(Int16.max)
+                sumSquares += value * value
+                sampleCount += 1
+            }
+        }
+    }
+
+    guard sampleCount > 0, sumSquares > 0 else {
+        return -60
+    }
+
+    let rms = sqrt(sumSquares / Double(sampleCount))
+    return max(20 * Float(log10(rms)), -60)
 }
 
 private func readAudioObjectString(
