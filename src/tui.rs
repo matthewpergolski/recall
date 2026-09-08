@@ -10,15 +10,17 @@ use std::time::{Duration, Instant};
 use std::os::unix::process::CommandExt;
 
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::analysis::{
     analyze, known_agents, maybe_rename_session_dir_for_title, AnalyzeOptions, AnalyzeTarget,
@@ -180,9 +182,24 @@ pub fn run_with_options(options: TuiOptions) -> io::Result<TuiExit> {
         None => None,
     };
     let mut terminal = ratatui::try_init()?;
-    let _ = execute!(io::stdout(), EnableBracketedPaste);
+    // Negotiate keys in-app (Ghostty/kitty protocol) so Shift+Enter and Cmd+V
+    // work without a separate /terminal-setup step. Ignore terminals that refuse.
+    let _ = execute!(
+        io::stdout(),
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        ),
+    );
     let result = App::new(options, resume)?.run(&mut terminal);
-    let _ = execute!(io::stdout(), DisableBracketedPaste);
+    let _ = execute!(
+        io::stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     let restore_result = ratatui::try_restore();
 
     match (result, restore_result) {
@@ -239,6 +256,7 @@ struct App {
     require_parakeet: bool,
     chunk_seconds: u64,
     note_draft: Option<NoteDraft>,
+    note_footer: Rect,
     editor: Option<String>,
     resumed: bool,
     append_next: bool,
@@ -311,61 +329,588 @@ enum AnalysisUiEvent {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+const NOTE_LABEL: &str = " Note >";
+const NOTE_GAP: &str = " ";
+const NOTE_CONT: &str = "        ";
+const NOTE_PREVIEW_LINES: usize = 3;
+
+fn note_prefix_width() -> u16 {
+    (UnicodeWidthStr::width(NOTE_LABEL) + UnicodeWidthStr::width(NOTE_GAP)) as u16
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NotePiece {
+    Text(String),
+    Image(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NoteDraft {
-    caption: String,
-    images: Vec<String>,
+    pieces: Vec<NotePiece>,
+    caret_piece: usize,
+    /// Char offset in a text piece, or `0` before / `1` after an image chip.
+    caret_offset: usize,
+}
+
+impl Default for NoteDraft {
+    fn default() -> Self {
+        Self {
+            pieces: vec![NotePiece::Text(String::new())],
+            caret_piece: 0,
+            caret_offset: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NoteRun {
+    piece: usize,
+    start_offset: usize,
+    text: String,
+    image: bool,
+    chip_index: usize,
 }
 
 impl NoteDraft {
-    fn chip_suffix(&self) -> String {
-        let mut out = String::new();
-        for (index, _) in self.images.iter().enumerate() {
-            if !out.is_empty() {
-                out.push(' ');
+    fn char_len(text: &str) -> usize {
+        text.chars().count()
+    }
+
+    fn display_width(text: &str) -> usize {
+        UnicodeWidthStr::width(text)
+    }
+
+    fn char_index_at_cells(text: &str, target_cells: usize) -> usize {
+        let mut cells = 0;
+        let mut index = 0;
+        for ch in text.chars() {
+            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cells + width > target_cells {
+                return index;
             }
-            if index == 0 {
-                out.push_str("[img]");
-            } else {
-                out.push_str(&format!("[img {}]", index + 1));
+            cells += width;
+            index += 1;
+            if cells == target_cells {
+                return index;
+            }
+        }
+        index
+    }
+
+    fn chip_label(index: usize) -> String {
+        format!("[Image #{}]", index + 1)
+    }
+
+    fn caption(&self) -> String {
+        let mut out = String::new();
+        for piece in &self.pieces {
+            if let NotePiece::Text(text) = piece {
+                out.push_str(text);
             }
         }
         out
     }
 
-    fn display_lines(&self) -> Vec<String> {
-        let mut lines: Vec<String> = self.caption.split('\n').map(str::to_string).collect();
-        if lines.is_empty() {
-            lines.push(String::new());
+    fn images(&self) -> Vec<String> {
+        self.pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                NotePiece::Image(path) => Some(path.clone()),
+                NotePiece::Text(_) => None,
+            })
+            .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.caption().trim().is_empty() && self.images().is_empty()
+    }
+
+    fn clamp_caret(&mut self) {
+        if self.pieces.is_empty() {
+            self.pieces.push(NotePiece::Text(String::new()));
         }
-        let chips = self.chip_suffix();
-        if !chips.is_empty() {
-            if let Some(last) = lines.last_mut() {
-                if !last.is_empty() && !last.ends_with(' ') {
-                    last.push(' ');
-                }
-                last.push_str(&chips);
+        self.caret_piece = self.caret_piece.min(self.pieces.len() - 1);
+        match &self.pieces[self.caret_piece] {
+            NotePiece::Text(text) => {
+                self.caret_offset = self.caret_offset.min(Self::char_len(text));
             }
+            NotePiece::Image(_) => {
+                self.caret_offset = self.caret_offset.min(1);
+            }
+        }
+    }
+
+    fn merge_text(&mut self) {
+        let mut merged: Vec<NotePiece> = Vec::new();
+        let (caret_piece, caret_offset) = (self.caret_piece, self.caret_offset);
+        let mut new_caret_piece = 0;
+        let mut new_caret_offset = caret_offset;
+        let mut mapped = false;
+        for (index, piece) in self.pieces.drain(..).enumerate() {
+            let is_caret = index == caret_piece;
+            let merge_into_prev = matches!(
+                (merged.last(), &piece),
+                (Some(NotePiece::Text(_)), NotePiece::Text(_))
+            );
+            if merge_into_prev {
+                let dest = merged.len() - 1;
+                let NotePiece::Text(left) = merged.last_mut().unwrap() else {
+                    unreachable!("merge_into_prev requires trailing text");
+                };
+                let left_len = Self::char_len(left);
+                let NotePiece::Text(right) = piece else {
+                    unreachable!("merge_into_prev requires incoming text");
+                };
+                left.push_str(&right);
+                if is_caret {
+                    new_caret_piece = dest;
+                    new_caret_offset = left_len + caret_offset;
+                    mapped = true;
+                }
+            } else {
+                if is_caret {
+                    new_caret_piece = merged.len();
+                    new_caret_offset = caret_offset;
+                    mapped = true;
+                }
+                merged.push(piece);
+            }
+        }
+        if merged.is_empty() {
+            merged.push(NotePiece::Text(String::new()));
+        }
+        self.pieces = merged;
+        if mapped {
+            self.caret_piece = new_caret_piece;
+            self.caret_offset = new_caret_offset;
+        }
+        self.clamp_caret();
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if normalized.is_empty() {
+            return;
+        }
+        self.clamp_caret();
+        match &self.pieces[self.caret_piece] {
+            NotePiece::Image(_) if self.caret_offset >= 1 => {
+                let next = self.caret_piece + 1;
+                if matches!(self.pieces.get(next), Some(NotePiece::Text(_))) {
+                    self.caret_piece = next;
+                    self.caret_offset = 0;
+                } else {
+                    self.pieces.insert(next, NotePiece::Text(String::new()));
+                    self.caret_piece = next;
+                    self.caret_offset = 0;
+                }
+            }
+            NotePiece::Image(_) => {
+                self.pieces
+                    .insert(self.caret_piece, NotePiece::Text(String::new()));
+                self.caret_offset = 0;
+            }
+            NotePiece::Text(_) => {}
+        }
+        if let NotePiece::Text(existing) = &mut self.pieces[self.caret_piece] {
+            let mut chars = existing.chars();
+            let left: String = chars.by_ref().take(self.caret_offset).collect();
+            let right: String = chars.collect();
+            let inserted = Self::char_len(&normalized);
+            *existing = format!("{left}{normalized}{right}");
+            self.caret_offset += inserted;
+        }
+        self.merge_text();
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.insert_str(&ch.to_string());
+    }
+
+    fn insert_image(&mut self, path: String) {
+        self.clamp_caret();
+        match &self.pieces[self.caret_piece] {
+            NotePiece::Text(text) => {
+                let mut chars = text.chars();
+                let left: String = chars.by_ref().take(self.caret_offset).collect();
+                let right: String = chars.collect();
+                let idx = self.caret_piece;
+                self.pieces[idx] = NotePiece::Text(left);
+                self.pieces.insert(idx + 1, NotePiece::Image(path));
+                self.pieces.insert(idx + 2, NotePiece::Text(right));
+                self.caret_piece = idx + 1;
+                self.caret_offset = 1;
+            }
+            NotePiece::Image(_) => {
+                let idx = if self.caret_offset >= 1 {
+                    self.caret_piece + 1
+                } else {
+                    self.caret_piece
+                };
+                self.pieces.insert(idx, NotePiece::Image(path));
+                self.caret_piece = idx;
+                self.caret_offset = 1;
+            }
+        }
+        self.merge_text();
+    }
+
+    fn backspace(&mut self) -> bool {
+        self.clamp_caret();
+        match &self.pieces[self.caret_piece] {
+            NotePiece::Image(_) if self.caret_offset >= 1 => false,
+            NotePiece::Image(_) => {
+                if self.caret_piece == 0 {
+                    return false;
+                }
+                self.caret_piece -= 1;
+                match &self.pieces[self.caret_piece] {
+                    NotePiece::Text(text) => self.caret_offset = Self::char_len(text),
+                    NotePiece::Image(_) => self.caret_offset = 1,
+                }
+                self.backspace()
+            }
+            NotePiece::Text(text) if self.caret_offset > 0 => {
+                let mut chars = text.chars();
+                let mut left: String = chars.by_ref().take(self.caret_offset - 1).collect();
+                chars.next();
+                left.push_str(&chars.collect::<String>());
+                self.pieces[self.caret_piece] = NotePiece::Text(left);
+                self.caret_offset -= 1;
+                self.merge_text();
+                true
+            }
+            NotePiece::Text(_) if self.caret_piece > 0 => {
+                self.caret_piece -= 1;
+                match &self.pieces[self.caret_piece] {
+                    NotePiece::Text(text) => {
+                        self.caret_offset = Self::char_len(text);
+                        self.backspace()
+                    }
+                    NotePiece::Image(_) => {
+                        self.caret_offset = 1;
+                        false
+                    }
+                }
+            }
+            NotePiece::Text(_) => false,
+        }
+    }
+
+    fn take_chip_at_caret(&mut self) -> Option<String> {
+        self.clamp_caret();
+        let NotePiece::Image(path) = &self.pieces[self.caret_piece] else {
+            return None;
+        };
+        if self.caret_offset == 0 {
+            return None;
+        }
+        let path = path.clone();
+        self.pieces.remove(self.caret_piece);
+        if self.pieces.is_empty() {
+            self.pieces.push(NotePiece::Text(String::new()));
+        }
+        if self.caret_piece >= self.pieces.len() {
+            self.caret_piece = self.pieces.len() - 1;
+        }
+        match &self.pieces[self.caret_piece] {
+            NotePiece::Text(_) => self.caret_offset = 0,
+            NotePiece::Image(_) => self.caret_offset = 1,
+        }
+        self.merge_text();
+        Some(path)
+    }
+
+    fn delete_forward(&mut self) -> Option<String> {
+        self.clamp_caret();
+        match &self.pieces[self.caret_piece] {
+            NotePiece::Text(text) if self.caret_offset < Self::char_len(text) => {
+                let mut chars = text.chars();
+                let mut left: String = chars.by_ref().take(self.caret_offset).collect();
+                chars.next();
+                left.push_str(&chars.collect::<String>());
+                self.pieces[self.caret_piece] = NotePiece::Text(left);
+                self.merge_text();
+                None
+            }
+            NotePiece::Image(_) if self.caret_offset == 0 => self.take_chip_at_caret_before(),
+            _ if self.caret_piece + 1 < self.pieces.len() => {
+                self.caret_piece += 1;
+                self.caret_offset = 0;
+                match &self.pieces[self.caret_piece] {
+                    NotePiece::Image(_) => self.take_chip_at_caret_before(),
+                    NotePiece::Text(_) => {
+                        let _ = self.delete_forward();
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn take_chip_at_caret_before(&mut self) -> Option<String> {
+        self.clamp_caret();
+        let NotePiece::Image(path) = &self.pieces[self.caret_piece] else {
+            return None;
+        };
+        let path = path.clone();
+        self.pieces.remove(self.caret_piece);
+        if self.pieces.is_empty() {
+            self.pieces.push(NotePiece::Text(String::new()));
+        }
+        if self.caret_piece >= self.pieces.len() {
+            self.caret_piece = self.pieces.len() - 1;
+        }
+        self.caret_offset = 0;
+        self.merge_text();
+        Some(path)
+    }
+
+    fn move_left(&mut self) {
+        self.clamp_caret();
+        match &self.pieces[self.caret_piece] {
+            NotePiece::Text(_) if self.caret_offset > 0 => self.caret_offset -= 1,
+            NotePiece::Image(_) if self.caret_offset >= 1 => self.caret_offset = 0,
+            _ if self.caret_piece > 0 => {
+                self.caret_piece -= 1;
+                match &self.pieces[self.caret_piece] {
+                    NotePiece::Text(text) => self.caret_offset = Self::char_len(text),
+                    NotePiece::Image(_) => self.caret_offset = 1,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_right(&mut self) {
+        self.clamp_caret();
+        match &self.pieces[self.caret_piece] {
+            NotePiece::Text(text) if self.caret_offset < Self::char_len(text) => {
+                self.caret_offset += 1;
+            }
+            NotePiece::Image(_) if self.caret_offset == 0 => self.caret_offset = 1,
+            _ if self.caret_piece + 1 < self.pieces.len() => {
+                self.caret_piece += 1;
+                self.caret_offset = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn visual_lines(&self) -> Vec<Vec<NoteRun>> {
+        let mut lines: Vec<Vec<NoteRun>> = vec![Vec::new()];
+        let mut chip = 0usize;
+        for (index, piece) in self.pieces.iter().enumerate() {
+            match piece {
+                NotePiece::Text(text) => {
+                    let parts: Vec<&str> = text.split('\n').collect();
+                    for (part_index, part) in parts.iter().enumerate() {
+                        if part_index > 0 {
+                            lines.push(Vec::new());
+                        }
+                        let start = if part_index == 0 {
+                            0
+                        } else {
+                            parts
+                                .iter()
+                                .take(part_index)
+                                .map(|p| Self::char_len(p) + 1)
+                                .sum()
+                        };
+                        // Keep empty lines (trailing Shift+Enter) so the caret
+                        // can sit on the new row before the next character.
+                        lines.last_mut().unwrap().push(NoteRun {
+                            piece: index,
+                            start_offset: start,
+                            text: (*part).to_string(),
+                            image: false,
+                            chip_index: 0,
+                        });
+                    }
+                }
+                NotePiece::Image(_) => {
+                    lines.last_mut().unwrap().push(NoteRun {
+                        piece: index,
+                        start_offset: 0,
+                        text: format!(" {}", Self::chip_label(chip)),
+                        image: true,
+                        chip_index: chip,
+                    });
+                    chip += 1;
+                }
+            }
+        }
+        if lines.is_empty() {
+            lines.push(Vec::new());
         }
         lines
     }
 
-    fn preview_lines(&self, max: usize) -> Vec<String> {
-        let lines = self.display_lines();
-        if lines.len() <= max {
-            return lines;
-        }
-        let mut view = lines[lines.len() - max..].to_vec();
-        if let Some(first) = view.first_mut() {
-            if !first.starts_with('…') {
-                first.insert(0, '…');
+    fn caret_line_cells(&self) -> (usize, usize) {
+        let lines = self.visual_lines();
+        for (line_index, runs) in lines.iter().enumerate() {
+            let mut cells = 0;
+            for run in runs {
+                if run.piece != self.caret_piece {
+                    cells += Self::display_width(&run.text);
+                    continue;
+                }
+                if run.image {
+                    if self.caret_offset >= 1 {
+                        return (line_index, cells + Self::display_width(&run.text));
+                    }
+                    return (line_index, cells);
+                }
+                let local = self.caret_offset.saturating_sub(run.start_offset);
+                if self.caret_offset < run.start_offset {
+                    continue;
+                }
+                let run_len = Self::char_len(&run.text);
+                if local > run_len {
+                    cells += Self::display_width(&run.text);
+                    continue;
+                }
+                let prefix: String = run.text.chars().take(local).collect();
+                return (line_index, cells + Self::display_width(&prefix));
             }
         }
-        view
+        (0, 0)
     }
 
-    fn is_empty(&self) -> bool {
-        self.caption.trim().is_empty() && self.images.is_empty()
+    #[cfg(test)]
+    fn caret_cell_col(&self) -> usize {
+        self.caret_line_cells().1
+    }
+
+    fn click_to_cursor(&mut self, line: usize, cells: usize) {
+        let lines = self.visual_lines();
+        if lines.is_empty() {
+            return;
+        }
+        let line = line.min(lines.len() - 1);
+        let mut remaining = cells;
+        for run in &lines[line] {
+            let width = Self::display_width(&run.text);
+            if remaining > width {
+                remaining -= width;
+                continue;
+            }
+            if run.image {
+                self.caret_piece = run.piece;
+                self.caret_offset = 1;
+                return;
+            }
+            let index = Self::char_index_at_cells(&run.text, remaining);
+            self.caret_piece = run.piece;
+            self.caret_offset = run.start_offset + index;
+            return;
+        }
+        if let Some(run) = lines[line].last() {
+            self.caret_piece = run.piece;
+            self.caret_offset = if run.image {
+                1
+            } else {
+                run.start_offset + Self::char_len(&run.text)
+            };
+        }
+    }
+
+    fn first_visible_line(&self, max: usize) -> usize {
+        let total = self.visual_lines().len();
+        if total <= max {
+            return 0;
+        }
+        let (line, _) = self.caret_line_cells();
+        let max_first = total - max;
+        line.saturating_sub(max.saturating_sub(1)).min(max_first)
+    }
+
+    fn move_line_start(&mut self) {
+        let (line, _) = self.caret_line_cells();
+        self.click_to_cursor(line, 0);
+    }
+
+    fn move_line_end(&mut self) {
+        let (line, _) = self.caret_line_cells();
+        self.click_to_cursor(line, usize::MAX / 4);
+    }
+
+    fn move_up(&mut self) {
+        let (line, cells) = self.caret_line_cells();
+        if line == 0 {
+            self.click_to_cursor(0, 0);
+            return;
+        }
+        self.click_to_cursor(line - 1, cells);
+    }
+
+    fn move_down(&mut self) {
+        let (line, cells) = self.caret_line_cells();
+        let last = self.visual_lines().len().saturating_sub(1);
+        if line >= last {
+            self.click_to_cursor(last, usize::MAX / 4);
+            return;
+        }
+        self.click_to_cursor(line + 1, cells);
+    }
+
+    fn preview_runs(&self, max: usize) -> Vec<Vec<NoteRun>> {
+        let first = self.first_visible_line(max);
+        self.visual_lines()
+            .into_iter()
+            .skip(first)
+            .take(max)
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn caption_cursor(&self) -> usize {
+        let mut chars = 0;
+        for (index, piece) in self.pieces.iter().enumerate() {
+            match piece {
+                NotePiece::Text(text) => {
+                    if index == self.caret_piece {
+                        return chars + self.caret_offset;
+                    }
+                    chars += Self::char_len(text);
+                }
+                NotePiece::Image(_) if index == self.caret_piece => return chars,
+                NotePiece::Image(_) => {}
+            }
+        }
+        chars
+    }
+
+    #[cfg(test)]
+    fn set_caption_cursor(&mut self, target: usize) {
+        let mut chars = 0;
+        for (index, piece) in self.pieces.iter().enumerate() {
+            if let NotePiece::Text(text) = piece {
+                let len = Self::char_len(text);
+                if target <= chars + len {
+                    self.caret_piece = index;
+                    self.caret_offset = target - chars;
+                    return;
+                }
+                chars += len;
+            }
+        }
+        self.clamp_caret();
+    }
+
+    #[cfg(test)]
+    fn caret_after_chip(&self) -> Option<usize> {
+        match self.pieces.get(self.caret_piece) {
+            Some(NotePiece::Image(_)) if self.caret_offset >= 1 => {
+                let chip = self.pieces[..self.caret_piece]
+                    .iter()
+                    .filter(|piece| matches!(piece, NotePiece::Image(_)))
+                    .count();
+                Some(chip)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -426,6 +971,7 @@ impl App {
             require_parakeet: options.require_parakeet,
             chunk_seconds: options.chunk_seconds,
             note_draft: None,
+            note_footer: Rect::default(),
             editor: options.editor,
             resumed: false,
             append_next: true,
@@ -495,7 +1041,10 @@ impl App {
                         });
                     }
                     Event::Paste(text) if self.note_draft.is_some() => {
-                        self.handle_note_paste(&text);
+                        self.handle_terminal_paste(&text);
+                    }
+                    Event::Mouse(mouse) if self.note_draft.is_some() => {
+                        self.handle_note_mouse(mouse);
                     }
                     _ => {}
                 }
@@ -605,8 +1154,52 @@ impl App {
             KeyCode::Enter => self.save_manual_note(),
             KeyCode::Esc => self.cancel_manual_note(),
             KeyCode::Backspace => self.backspace_note_draft(),
+            KeyCode::Delete => self.delete_note_forward(),
+            KeyCode::Left => {
+                if let Some(draft) = &mut self.note_draft {
+                    draft.move_left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(draft) = &mut self.note_draft {
+                    draft.move_right();
+                }
+            }
+            KeyCode::Up => {
+                if let Some(draft) = &mut self.note_draft {
+                    draft.move_up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(draft) = &mut self.note_draft {
+                    draft.move_down();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(draft) = &mut self.note_draft {
+                    draft.move_line_start();
+                }
+            }
+            KeyCode::End => {
+                if let Some(draft) = &mut self.note_draft {
+                    draft.move_line_end();
+                }
+            }
             KeyCode::Tab => self.paste_clipboard_image(false),
             KeyCode::Char('\n') | KeyCode::Char('\r') => self.insert_note_newline(),
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.insert_note_newline();
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(draft) = &mut self.note_draft {
+                    draft.move_line_start();
+                }
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(draft) = &mut self.note_draft {
+                    draft.move_line_end();
+                }
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cancel_manual_note();
             }
@@ -623,7 +1216,7 @@ impl App {
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
                 if let Some(draft) = &mut self.note_draft {
-                    draft.caption.push(ch);
+                    draft.insert_char(ch);
                 }
             }
             _ => {}
@@ -632,8 +1225,20 @@ impl App {
 
     fn insert_note_newline(&mut self) {
         if let Some(draft) = &mut self.note_draft {
-            draft.caption.push('\n');
+            draft.insert_char('\n');
         }
+    }
+
+    fn handle_terminal_paste(&mut self, text: &str) {
+        // Ghostty Cmd+V is often a paste event, not Super+V. Image clipboards
+        // may arrive as empty paste; still read NSPasteboard.
+        if self.try_attach_clipboard_image() {
+            return;
+        }
+        if text.is_empty() {
+            return;
+        }
+        self.handle_note_paste(text);
     }
 
     fn handle_note_paste(&mut self, text: &str) {
@@ -646,19 +1251,58 @@ impl App {
             return;
         }
         if let Some(draft) = &mut self.note_draft {
-            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-            draft.caption.push_str(&normalized);
+            draft.insert_str(text);
         }
     }
 
-    fn paste_clipboard_image(&mut self, allow_text: bool) {
-        let Some(session_path) = self.session_path.clone() else {
-            return;
-        };
-        if self.note_draft.is_none() {
+    fn handle_note_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
+        let area = self.note_footer;
+        if area.width < 3 || area.height < 3 {
+            return;
+        }
+        let inner_x = area.x.saturating_add(1);
+        let inner_y = area.y.saturating_add(1);
+        let inner_width = area.width.saturating_sub(2);
+        let inner_height = area.height.saturating_sub(2);
+        if mouse.column < inner_x
+            || mouse.row < inner_y
+            || mouse.column >= inner_x.saturating_add(inner_width)
+            || mouse.row >= inner_y.saturating_add(inner_height)
+        {
+            return;
+        }
+        let row = (mouse.row - inner_y) as usize;
+        if row >= NOTE_PREVIEW_LINES {
+            return;
+        }
+        let Some(draft) = self.note_draft.as_mut() else {
+            return;
+        };
+        let first = draft.first_visible_line(NOTE_PREVIEW_LINES);
+        let caption_line = first + row;
+        let prefix = if row == 0 {
+            note_prefix_width()
+        } else {
+            UnicodeWidthStr::width(NOTE_CONT) as u16
+        };
+        let col = if mouse.column <= inner_x + prefix {
+            0
+        } else {
+            (mouse.column - inner_x - prefix) as usize
+        };
+        draft.click_to_cursor(caption_line, col);
+    }
 
+    fn try_attach_clipboard_image(&mut self) -> bool {
+        let Some(session_path) = self.session_path.clone() else {
+            return false;
+        };
+        if self.note_draft.is_none() {
+            return false;
+        }
         let elapsed = self.elapsed_label();
         let relative = next_note_image_relative_path(&session_path, &elapsed, "png");
         let dest = session_path.join(&relative);
@@ -671,31 +1315,40 @@ impl App {
                     .filter(|value| !value.is_empty())
                     .unwrap_or(relative);
                 self.attach_note_image(relative);
+                true
             }
             Ok(ClipboardImageOutcome::NoImage) => {
                 let _ = fs::remove_file(&dest);
                 let _ = remove_empty_images_dir(&session_path);
-                if allow_text {
-                    match read_clipboard_text() {
-                        Ok(ClipboardTextOutcome::Text(text)) => {
-                            self.handle_note_paste(&text);
-                            return;
-                        }
-                        Ok(ClipboardTextOutcome::NoText) => {}
-                        Err(error) => {
-                            self.toast = format!("Could not paste clipboard text: {error}");
-                            return;
-                        }
-                    }
-                }
-                self.toast = "Clipboard has no image. Copy a screenshot first.".to_string();
+                false
             }
             Err(error) => {
                 let _ = fs::remove_file(&dest);
                 let _ = remove_empty_images_dir(&session_path);
                 self.toast = format!("Could not paste image: {error}");
+                false
             }
         }
+    }
+
+    fn paste_clipboard_image(&mut self, allow_text: bool) {
+        if self.try_attach_clipboard_image() {
+            return;
+        }
+        if allow_text {
+            match read_clipboard_text() {
+                Ok(ClipboardTextOutcome::Text(text)) => {
+                    self.handle_note_paste(&text);
+                    return;
+                }
+                Ok(ClipboardTextOutcome::NoText) => {}
+                Err(error) => {
+                    self.toast = format!("Could not paste clipboard text: {error}");
+                    return;
+                }
+            }
+        }
+        self.toast = "Clipboard has no image. Copy a screenshot first.".to_string();
     }
 
     fn import_note_image_from_path(&mut self, source: &Path) {
@@ -716,8 +1369,21 @@ impl App {
 
     fn attach_note_image(&mut self, relative: String) {
         if let Some(draft) = &mut self.note_draft {
-            draft.images.push(relative.clone());
-            self.toast = format!("Image {} saved as {relative}", draft.images.len());
+            draft.insert_image(relative.clone());
+            let number = draft.images().len().saturating_sub(1);
+            self.toast = format!("{} saved as {relative}", NoteDraft::chip_label(number));
+        }
+    }
+
+    fn delete_note_forward(&mut self) {
+        let Some(draft) = self.note_draft.as_mut() else {
+            return;
+        };
+        let Some(relative) = draft.delete_forward() else {
+            return;
+        };
+        if let Some(session_path) = &self.session_path {
+            let _ = discard_unused_note_images(session_path, std::slice::from_ref(&relative));
         }
     }
 
@@ -726,25 +1392,36 @@ impl App {
             let Some(draft) = self.note_draft.as_mut() else {
                 return;
             };
-            if !draft.caption.is_empty() {
-                draft.caption.pop();
+            if let Some(relative) = draft.take_chip_at_caret() {
+                relative
+            } else if draft.backspace() {
+                return;
+            } else if let Some(relative) = draft.take_chip_at_caret() {
+                relative
+            } else {
                 return;
             }
-            let Some(relative) = draft.images.pop() else {
-                return;
-            };
-            relative
         };
         if let Some(session_path) = &self.session_path {
             let _ = discard_unused_note_images(session_path, std::slice::from_ref(&relative));
         }
     }
 
+    fn set_note_mouse_capture(enable: bool) {
+        if enable {
+            let _ = execute!(io::stdout(), EnableMouseCapture);
+        } else {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
+    }
+
     fn cancel_manual_note(&mut self) {
+        Self::set_note_mouse_capture(false);
         let draft = self.note_draft.take();
         if let (Some(session_path), Some(draft)) = (self.session_path.clone(), draft) {
-            if !draft.images.is_empty() {
-                if let Err(error) = discard_unused_note_images(&session_path, &draft.images) {
+            let images = draft.images();
+            if !images.is_empty() {
+                if let Err(error) = discard_unused_note_images(&session_path, &images) {
                     self.toast = format!("Note cancelled, but unused images remain: {error}");
                     return;
                 }
@@ -1087,8 +1764,9 @@ impl App {
 
         // Opening `n` must not read the pasteboard. Paste is explicit (Cmd+V / Ctrl+I / Paste).
         self.note_draft = Some(NoteDraft::default());
+        Self::set_note_mouse_capture(true);
         self.toast =
-            "Type a note, then press Enter to save or Esc to cancel. Shift+Enter adds a newline. Cmd+V or Ctrl+I pastes."
+            "Click or use arrows to move. Enter saves, Ctrl+J or Shift+Enter newline, Cmd+V pastes."
                 .to_string();
     }
 
@@ -1096,29 +1774,33 @@ impl App {
         let Some(draft) = self.note_draft.take() else {
             return;
         };
+        Self::set_note_mouse_capture(false);
         if draft.is_empty() {
             self.toast = "Empty note discarded.".to_string();
             return;
         }
 
-        let caption = draft.caption.trim();
+        let caption = draft.caption();
+        let caption = caption.trim();
+        let images = draft.images();
         let elapsed = self.elapsed_label();
         let Some(session_path) = self.session_path.clone() else {
             self.toast = "Start or resume a session before adding notes.".to_string();
             return;
         };
-        let save_result = if draft.images.is_empty() {
+        let save_result = if images.is_empty() {
             append_session_note(&session_path, &elapsed, caption)
         } else {
-            append_session_note_with_images(&session_path, &elapsed, caption, &draft.images)
+            append_session_note_with_images(&session_path, &elapsed, caption, &images)
         };
         if let Err(error) = save_result {
             self.note_draft = Some(draft);
+            Self::set_note_mouse_capture(true);
             self.toast = format!("Note created in memory, but failed to save: {error}");
             return;
         }
 
-        let live = format_session_note_bullet(&elapsed, caption, &draft.images)
+        let live = format_session_note_bullet(&elapsed, caption, &images)
             .map(|note| {
                 let body = note.strip_prefix("- ").unwrap_or(&note);
                 match body.split_once('\n') {
@@ -1944,7 +2626,7 @@ impl App {
         }
     }
 
-    fn render(&self, frame: &mut Frame) {
+    fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let footer_height = if self.note_draft.is_some() { 6 } else { 3 };
         let main = Layout::default()
@@ -2322,9 +3004,9 @@ impl App {
         }
 
         if let Some(draft) = &self.note_draft {
-            let preview = draft.preview_lines(2);
+            let preview = draft.preview_runs(2);
             let last = preview.len().saturating_sub(1);
-            for (index, line) in preview.into_iter().enumerate() {
+            for (index, runs) in preview.into_iter().enumerate() {
                 let mut spans = if index == 0 {
                     vec![Span::styled(
                         "Note draft: ",
@@ -2333,7 +3015,16 @@ impl App {
                 } else {
                     vec![Span::raw("            ")]
                 };
-                spans.push(Span::raw(line));
+                for run in runs {
+                    if run.image {
+                        spans.push(Span::styled(
+                            run.text,
+                            Style::default().fg(Color::Black).bg(Color::Magenta),
+                        ));
+                    } else {
+                        spans.push(Span::raw(run.text));
+                    }
+                }
                 if index == last {
                     spans.push(Span::styled("_", Style::default().fg(Color::Blue)));
                 }
@@ -2504,24 +3195,34 @@ impl App {
         );
     }
 
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
+    fn render_footer(&mut self, frame: &mut Frame, area: Rect) {
         if let Some(draft) = &self.note_draft {
-            let preview = draft.preview_lines(3);
-            let last = preview.len().saturating_sub(1);
+            self.note_footer = area;
+            let first = draft.first_visible_line(NOTE_PREVIEW_LINES);
+            let (caret_line, caret_cells) = draft.caret_line_cells();
+            let preview = draft.preview_runs(NOTE_PREVIEW_LINES);
             let mut text = Vec::new();
-            for (index, line) in preview.into_iter().enumerate() {
+            for (index, runs) in preview.into_iter().enumerate() {
                 let mut spans = Vec::new();
                 if index == 0 {
                     spans.push(Span::styled(
-                        " Note > ",
+                        NOTE_LABEL,
                         Style::default().fg(Color::Black).bg(Color::Blue),
                     ));
+                    spans.push(Span::raw(NOTE_GAP));
                 } else {
-                    spans.push(Span::raw("         "));
+                    spans.push(Span::raw(NOTE_CONT));
                 }
-                spans.push(Span::raw(line));
-                if index == last {
-                    spans.push(Span::styled("_", Style::default().fg(Color::Blue)));
+                for run in runs {
+                    if run.image {
+                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled(
+                            NoteDraft::chip_label(run.chip_index),
+                            Style::default().fg(Color::Black).bg(Color::Magenta),
+                        ));
+                    } else {
+                        spans.push(Span::raw(run.text));
+                    }
                 }
                 text.push(Line::from(spans));
             }
@@ -2532,22 +3233,38 @@ impl App {
                 ),
                 Span::raw(" save  "),
                 Span::styled(
-                    " Shift+Enter ",
+                    " Ctrl+J ",
                     Style::default().fg(Color::Black).bg(Color::Cyan),
                 ),
                 Span::raw(" newline  "),
                 Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
                 Span::raw(" cancel  "),
                 Span::styled(
-                    " Cmd+V / Ctrl+I ",
+                    " Cmd+V ",
                     Style::default().fg(Color::Black).bg(Color::Magenta),
                 ),
-                Span::raw(" paste"),
+                Span::raw(" paste  click to move"),
             ]));
             frame.render_widget(
                 Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
                 area,
             );
+            if caret_line >= first && caret_line < first + NOTE_PREVIEW_LINES {
+                let row = (caret_line - first) as u16;
+                let prefix = if row == 0 {
+                    note_prefix_width()
+                } else {
+                    UnicodeWidthStr::width(NOTE_CONT) as u16
+                };
+                let x = area
+                    .x
+                    .saturating_add(1)
+                    .saturating_add(prefix)
+                    .saturating_add(caret_cells as u16);
+                let y = area.y.saturating_add(1).saturating_add(row);
+                let max_x = area.x.saturating_add(area.width.saturating_sub(2));
+                frame.set_cursor_position(Position::new(x.min(max_x), y));
+            }
             return;
         }
 
@@ -2867,6 +3584,7 @@ mod tests {
             require_parakeet: false,
             chunk_seconds: TRANSCRIPTION_CHUNK_SECONDS,
             note_draft: None,
+            note_footer: Rect::default(),
             editor: None,
             resumed: false,
             append_next: true,
@@ -3390,8 +4108,8 @@ mod tests {
         let mut app = test_app(session_path.clone());
         app.start_manual_note();
         assert_eq!(app.note_draft, Some(NoteDraft::default()));
-        assert!(app.note_draft.as_ref().unwrap().caption.is_empty());
-        assert!(app.note_draft.as_ref().unwrap().images.is_empty());
+        assert!(app.note_draft.as_ref().unwrap().caption().is_empty());
+        assert!(app.note_draft.as_ref().unwrap().images().is_empty());
         assert!(!session_path.join("images").exists());
         let _ = fs::remove_dir_all(storage);
     }
@@ -3498,7 +4216,7 @@ mod tests {
         app.handle_note_paste("first line\nsecond line");
         assert!(app.note_draft.is_some());
         assert_eq!(
-            app.note_draft.as_ref().unwrap().caption,
+            app.note_draft.as_ref().unwrap().caption(),
             "first line\nsecond line"
         );
         let notes_before = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
@@ -3523,19 +4241,156 @@ mod tests {
         app.start_manual_note();
         type_note(&mut app, "first");
         app.handle_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.note_draft.as_ref().unwrap().caption(), "first\n");
+        assert_eq!(app.note_draft.as_ref().unwrap().caret_line_cells(), (1, 0));
         type_note(&mut app, "second");
-        assert_eq!(app.note_draft.as_ref().unwrap().caption, "first\nsecond");
+        assert_eq!(app.note_draft.as_ref().unwrap().caption(), "first\nsecond");
         let notes_before = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
         assert!(!notes_before.contains("first"));
 
         for _ in 0.."\nsecond".len() {
             app.handle_note_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         }
-        assert_eq!(app.note_draft.as_ref().unwrap().caption, "first");
+        assert_eq!(app.note_draft.as_ref().unwrap().caption(), "first");
 
         app.handle_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
-        assert_eq!(app.note_draft.as_ref().unwrap().caption, "first\n");
+        assert_eq!(app.note_draft.as_ref().unwrap().caption(), "first\n");
         assert!(app.note_draft.is_some());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn typing_inserts_at_the_cursor_not_only_at_the_end() {
+        let (storage, session_path) = note_session("cursor-insert");
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        type_note(&mut app, "testing 123");
+        app.note_draft
+            .as_mut()
+            .unwrap()
+            .set_caption_cursor("testing ".chars().count());
+        type_note(&mut app, "xx");
+        assert_eq!(app.note_draft.as_ref().unwrap().caption(), "testing xx123");
+        assert_eq!(
+            app.note_draft.as_ref().unwrap().caption_cursor(),
+            "testing xx".chars().count()
+        );
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn click_moves_the_note_cursor() {
+        let mut draft = NoteDraft::default();
+        draft.insert_str("testing 123testing123");
+        draft.click_to_cursor(0, 8);
+        assert_eq!(draft.caption_cursor(), 8);
+        draft.click_to_cursor(0, 0);
+        assert_eq!(draft.caption_cursor(), 0);
+        draft.insert_str("hello\nworld");
+        draft.click_to_cursor(1, 2);
+        assert_eq!(draft.caption_cursor(), "hello\nwo".chars().count());
+    }
+
+    #[test]
+    fn caret_and_click_use_terminal_cell_width() {
+        let mut draft = NoteDraft::default();
+        draft.insert_str("测a试");
+        // 测 is two cells, a is one, 试 is two.
+        draft.set_caption_cursor(1);
+        assert_eq!(draft.caret_cell_col(), 2);
+        draft.click_to_cursor(0, 2);
+        assert_eq!(draft.caption_cursor(), 1);
+        draft.click_to_cursor(0, 1);
+        assert_eq!(draft.caption_cursor(), 0);
+        draft.click_to_cursor(0, 3);
+        assert_eq!(draft.caption_cursor(), 2);
+        draft.set_caption_cursor(2);
+        assert_eq!(draft.caret_cell_col(), 3);
+    }
+
+    #[test]
+    fn pasted_images_are_numbered_chips_the_caret_can_reach() {
+        let (storage, session_path) = note_session("image-chips");
+        let source = storage.join("board.png");
+        fs::write(&source, tiny_png()).unwrap();
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        type_note(&mut app, "testing");
+        app.handle_note_paste(&source.to_string_lossy());
+        app.handle_note_paste(&source.to_string_lossy());
+        let draft = app.note_draft.as_ref().unwrap();
+        assert_eq!(NoteDraft::chip_label(0), "[Image #1]");
+        assert_eq!(NoteDraft::chip_label(1), "[Image #2]");
+        assert_eq!(draft.caret_after_chip(), Some(1));
+        assert_eq!(draft.images().len(), 2);
+
+        let mut app_end = app;
+        app_end.handle_note_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app_end.handle_note_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(
+            app_end.note_draft.as_ref().unwrap().caret_after_chip(),
+            Some(0)
+        );
+        app_end.handle_note_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app_end.handle_note_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let draft = app_end.note_draft.as_ref().unwrap();
+        assert_eq!(draft.caret_after_chip(), None);
+        assert_eq!(draft.caption_cursor(), "testing".chars().count());
+        app_end.handle_note_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let (line, cells) = app_end.note_draft.as_ref().unwrap().caret_line_cells();
+        assert_eq!(line, 0);
+        assert!(cells > "testing".chars().count());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn ctrl_j_inserts_a_newline_without_saving() {
+        let (storage, session_path) = note_session("ctrl-j");
+        let mut app = test_app(session_path.clone());
+        app.accumulated = Duration::from_secs(12 * 60 + 4);
+        app.start_manual_note();
+        type_note(&mut app, "first");
+        app.handle_note_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        type_note(&mut app, "second");
+        assert_eq!(app.note_draft.as_ref().unwrap().caption(), "first\nsecond");
+        let notes_before = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        assert!(!notes_before.contains("first"));
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn forward_delete_at_end_does_not_backspace() {
+        let mut draft = NoteDraft::default();
+        draft.insert_str("hello");
+        assert_eq!(draft.delete_forward(), None);
+        assert_eq!(draft.caption(), "hello");
+        draft.set_caption_cursor(1);
+        assert_eq!(draft.delete_forward(), None);
+        assert_eq!(draft.caption(), "hllo");
+    }
+
+    #[test]
+    fn typing_after_an_image_chip_stays_to_the_right() {
+        let (storage, session_path) = note_session("type-after-chip");
+        let source = storage.join("board.png");
+        fs::write(&source, tiny_png()).unwrap();
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        type_note(&mut app, "test");
+        app.handle_note_paste(&source.to_string_lossy());
+        assert_eq!(app.note_draft.as_ref().unwrap().caret_after_chip(), Some(0));
+        type_note(&mut app, " word");
+        let draft = app.note_draft.as_ref().unwrap();
+        assert_eq!(draft.caption(), "test word");
+        assert_eq!(draft.caret_after_chip(), None);
+        assert_eq!(draft.caption_cursor(), "test word".chars().count());
+        let lines = draft.visual_lines();
+        assert!(lines[0].iter().any(|run| run.image));
+        assert_eq!(lines[0].last().map(|run| run.text.as_str()), Some(" word"));
 
         let _ = fs::remove_dir_all(storage);
     }
