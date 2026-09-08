@@ -294,7 +294,7 @@ recall export latest --output ~/Desktop/project-sync.md
 - `r`: refresh detected sources
 - `m`: add a timestamped marker to the session
 - `n`: type a timestamped note, then `Enter` saves it with the session
-- While the note draft is open: `Enter` saves; `Shift+Enter` or `Alt+Enter` inserts a newline; `Cmd+V` / `Ctrl+V` tries a clipboard image first, then text; `Ctrl+I` inserts a clipboard image (needed in Apple Terminal). Opening `n` does not read the clipboard. Bare `http(s)` / `www.` URLs become markdown links on save. Esc cancels and deletes unused pasted files. Optional Ghostty bind: `keybind = cmd+v=unbind` so Recall sees `Cmd+V`.
+- While the note draft is open: click or arrow keys move the caret; pasted pictures show as `[Image #1]`, `[Image #2]`, … and the caret can sit after a chip (Backspace removes it). `Enter` saves; `Ctrl+J`, `Shift+Enter`, or `Alt+Enter` inserts a newline; `Cmd+V` / `Ctrl+V` pastes a clipboard image (or text); `Ctrl+I` / Tab is image-only. Recall enables the terminal keyboard protocol itself so those chords work in Ghostty without a separate setup command. Opening `n` does not read the clipboard. Bare `http(s)` / `www.` URLs become markdown links on save. Esc cancels and deletes unused pasted files.
 - `o`: open the session folder in Finder or the configured editor
 - `O`: open the meeting document
 - `q` or `Ctrl+C`: quit
