@@ -69,7 +69,9 @@ cargo clippy -- -D warnings
 
 `cargo test` already runs unit tests and `tests/cli_smoke.rs`, which invokes the compiled `recall` binary. Use that (or `cargo run -- <args>`) to verify CLI behavior from this checkout. Do not ask the user to `cargo install` or start a live meeting just to prove flag parsing, resume errors, or other non-TUI paths.
 
-The interactive TUI needs a real terminal. Agent command output is not a TTY (`TERM=dumb`, piped stdin/stdout), so `cargo run` cannot drive the dashboard or press Space here.
+The interactive TUI needs a real terminal. Agent command output is not a TTY (`TERM=dumb`, piped stdin/stdout), so `cargo run` cannot drive the dashboard from this shell.
+
+For a TUI smoke of capture/resume/session-mode changes, drive **Ghostty** through its own AppleScript (not System Events): `new window with configuration` to run `target/debug/recall --storage <temp> --consent provided --no-auto-analyze`, then `focus` and `send key` with press+release. **Enter** starts/ends a take; **Space** was unreliable. Identify the window by the id returned at create time (title stays `👻`). Close only that window. Do not quit Ghostty or touch the user's other tabs. Screen Recording and Accessibility are optional; without them, infer state from the temp session folder and `pgrep`. This is Ghostty-specific. Apple Terminal can `do script` to launch a command, but has no `send key`. There is no generic “any terminal” API.
 
 ### Feature capture tests
 
@@ -90,6 +92,18 @@ swift run --package-path capture-helper recall-capture record-audio-tap --sessio
 - Do not commit those files. macOS may still prompt for Microphone / System Audio Recording; if permission is denied, report that and stop rather than bypassing it.
 
 The installed `~/.cargo/bin/recall` is a separate binary. Source edits are verified with `cargo test` / `cargo run`; install only when the user wants their shell `recall` command refreshed.
+
+## Versioning
+
+`recall --version` and `recall update` copy `version` from `Cargo.toml` (`CARGO_PKG_VERSION`). That field has stayed `0.1.0` while git `main` moved. Up-to-date-ness of an installed binary is the embedded git commit, not the crate version.
+
+On a user-facing push (new TUI/CLI behavior people will notice), bump `Cargo.toml` `version` in the same commit:
+
+- `0.x.y` while the product is still pre-1.0
+- **minor** (`0.2.0`) for features (resume, session append/new, capture changes)
+- **patch** (`0.2.1`) for fixes and docs-only user-visible corrections
+
+Do not bump for agent-only notes or test-only changes. Do not add a public changelog unless the user asks.
 
 For docs-only changes, run:
 
