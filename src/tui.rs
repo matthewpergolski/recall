@@ -229,6 +229,7 @@ struct App {
     note_draft: Option<String>,
     editor: Option<String>,
     resumed: bool,
+    append_next: bool,
     capture_lock: Option<CaptureLock>,
     detached_logs: Vec<(PathBuf, PathBuf)>,
 }
@@ -357,6 +358,7 @@ impl App {
             note_draft: None,
             editor: options.editor,
             resumed: false,
+            append_next: true,
             capture_lock: None,
             detached_logs: Vec::new(),
         };
@@ -443,6 +445,7 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.primary_recording_action()?,
             KeyCode::Char('c') => self.toggle_consent(),
+            KeyCode::Char('s') => self.toggle_append_next(),
             KeyCode::Char('p') => {
                 self.toast = "Pause is disabled for real recording. Press Space or Enter to end."
                     .to_string();
@@ -504,7 +507,7 @@ impl App {
     }
 
     fn primary_recording_action(&mut self) -> io::Result<()> {
-        match next_recording_action(self.state, self.session_path.is_some()) {
+        match next_recording_action(self.state, self.session_path.is_some(), self.append_next) {
             RecordingAction::StartNew => self.start_capture(),
             RecordingAction::Continue => self.continue_capture(),
             RecordingAction::End => {
@@ -779,6 +782,34 @@ impl App {
         };
     }
 
+    fn toggle_append_next(&mut self) {
+        self.append_next = !self.append_next;
+        self.toast = if self.append_next {
+            "Next Space or Enter will append another take to this session.".to_string()
+        } else {
+            "Next Space or Enter will start a new session folder.".to_string()
+        };
+        if matches!(self.state, CaptureState::Ended) {
+            self.replace_next_action_notes();
+        }
+    }
+
+    fn replace_next_action_notes(&mut self) {
+        self.live_notes.retain(|note| {
+            !note.contains("Space or Enter continues this session")
+                && !note.contains("Space or Enter starts a new session")
+                && !note.contains("q leaves (next start is a new session)")
+                && !note.contains("q leaves.")
+        });
+        self.live_notes.push(if self.append_next {
+            "Audio finalized. Space or Enter continues this session.".to_string()
+        } else {
+            "Audio finalized. Space or Enter starts a new session folder.".to_string()
+        });
+        self.live_notes
+            .push("s toggles append vs new. q leaves.".to_string());
+    }
+
     fn end_capture(&mut self) {
         match self.state {
             CaptureState::Recording => {
@@ -791,10 +822,7 @@ impl App {
                 self.completed_take = self.take_index.max(1);
                 self.live_notes
                     .retain(|note| !note.contains("Press Space or Enter to end"));
-                self.live_notes
-                    .push("Audio finalized. Space or Enter continues this session.".to_string());
-                self.live_notes
-                    .push("q leaves (next start is a new session).".to_string());
+                self.replace_next_action_notes();
                 if let Some(session_path) = &self.session_path {
                     if let Err(error) = write_capture_progress(
                         session_path,
@@ -1726,6 +1754,11 @@ impl App {
         } else {
             "consent: not noted"
         };
+        let next = if self.append_next {
+            "next: append"
+        } else {
+            "next: new"
+        };
         let title = Line::from(vec![
             Span::styled(
                 " Recall ",
@@ -1742,6 +1775,8 @@ impl App {
             ),
             Span::raw("  "),
             Span::styled(consent, Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::styled(next, Style::default().fg(Color::Gray)),
         ]);
         frame.render_widget(
             Paragraph::new(title).block(Block::default().borders(Borders::ALL)),
@@ -2188,8 +2223,12 @@ impl App {
                 } else {
                     "Audio finalized".to_string()
                 },
-                "Space or Enter records another take in this session".to_string(),
-                "q leaves (next plain recall starts a new session)".to_string(),
+                if self.append_next {
+                    "Space or Enter records another take in this session".to_string()
+                } else {
+                    "Space or Enter starts a new session folder".to_string()
+                },
+                "s toggles append vs new. q leaves.".to_string(),
                 self.transcription_status.label.clone(),
                 self.analysis_status.label.clone(),
             ],
@@ -2262,6 +2301,8 @@ impl App {
             Span::raw(" start/end/continue  "),
             Span::styled(" c ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::raw(" consent  "),
+            Span::styled(" s ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::raw(" append/new  "),
             Span::styled(" m ", Style::default().fg(Color::Black).bg(Color::Magenta)),
             Span::raw(" marker  "),
             Span::styled(" n ", Style::default().fg(Color::Black).bg(Color::Blue)),
@@ -2493,10 +2534,14 @@ enum RecordingAction {
     End,
 }
 
-fn next_recording_action(state: CaptureState, has_session: bool) -> RecordingAction {
+fn next_recording_action(
+    state: CaptureState,
+    has_session: bool,
+    append_next: bool,
+) -> RecordingAction {
     match state {
         CaptureState::Ready => RecordingAction::StartNew,
-        CaptureState::Ended if has_session => RecordingAction::Continue,
+        CaptureState::Ended if has_session && append_next => RecordingAction::Continue,
         CaptureState::Ended => RecordingAction::StartNew,
         CaptureState::Recording => RecordingAction::End,
     }
@@ -2557,6 +2602,7 @@ mod tests {
             note_draft: None,
             editor: None,
             resumed: false,
+            append_next: true,
             capture_lock: None,
             detached_logs: Vec::new(),
         }
@@ -2686,15 +2732,15 @@ mod tests {
     #[test]
     fn ended_session_continues_instead_of_starting_a_new_folder() {
         assert_eq!(
-            next_recording_action(CaptureState::Ended, true),
+            next_recording_action(CaptureState::Ended, true, true),
             RecordingAction::Continue
         );
         assert_eq!(
-            next_recording_action(CaptureState::Ready, false),
+            next_recording_action(CaptureState::Ready, false, true),
             RecordingAction::StartNew
         );
         assert_eq!(
-            next_recording_action(CaptureState::Recording, true),
+            next_recording_action(CaptureState::Recording, true, true),
             RecordingAction::End
         );
     }
@@ -2702,13 +2748,38 @@ mod tests {
     #[test]
     fn quit_then_new_start_creates_a_new_session_action() {
         assert_eq!(
-            next_recording_action(CaptureState::Ready, false),
+            next_recording_action(CaptureState::Ready, false, true),
             RecordingAction::StartNew
         );
         assert_eq!(
-            next_recording_action(CaptureState::Ended, false),
+            next_recording_action(CaptureState::Ended, false, true),
             RecordingAction::StartNew
         );
+    }
+
+    #[test]
+    fn ended_session_starts_a_new_folder_when_append_is_off() {
+        assert_eq!(
+            next_recording_action(CaptureState::Ended, true, false),
+            RecordingAction::StartNew
+        );
+        let mut app = test_app(PathBuf::from("/tmp/recall-append-toggle"));
+        app.state = CaptureState::Ended;
+        app.replace_next_action_notes();
+        app.toggle_append_next();
+        assert!(!app.append_next);
+        assert!(app.toast.contains("new session"));
+        assert!(app
+            .live_notes
+            .iter()
+            .any(|note| note.contains("starts a new session folder")));
+        app.toggle_append_next();
+        assert!(app.append_next);
+        assert!(app.toast.contains("append"));
+        assert!(app
+            .live_notes
+            .iter()
+            .any(|note| note.contains("continues this session")));
     }
 
     #[test]
@@ -2762,7 +2833,7 @@ mod tests {
         });
 
         assert_eq!(
-            next_recording_action(app.state, app.session_path.is_some()),
+            next_recording_action(app.state, app.session_path.is_some(), app.append_next),
             RecordingAction::Continue
         );
         assert!(app.has_background_jobs());
@@ -2849,7 +2920,7 @@ mod tests {
         assert_eq!(app.accumulated, Duration::from_millis(724_000));
         assert!(app.ended_at.is_none());
         assert_eq!(
-            next_recording_action(app.state, app.session_path.is_some()),
+            next_recording_action(app.state, app.session_path.is_some(), app.append_next),
             RecordingAction::Continue
         );
         assert!(app.toast.contains("Resumed"));

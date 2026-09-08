@@ -167,7 +167,7 @@ Start with a session title:
 recall --title "Project sync"
 ```
 
-When you press Space or Enter to end a recording, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready. If you stay in that TUI session and press Space or Enter again, Recall continues the same meeting folder with a new audio take.
+When you press Space or Enter to end a recording, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready. The header `next:` indicator (toggle with `s`, like consent) chooses what the next Space or Enter does after ENDED: append another take in this folder, or start a new session.
 
 Quitting (`q` / Ctrl+C) leaves transcription and analysis running in the background, then prints a copy-paste resume command. Plain `recall` starts a new session; `recall --resume` reopens the latest folder, and `recall --resume <session-id>` reopens that meeting so Space can append another take.
 
