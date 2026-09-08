@@ -92,11 +92,13 @@ struct ClipboardImageOptions {
 struct ClipboardImageResponse: Encodable {
     let type: String
     let path: String?
+    let text: String?
     let message: String?
 
     enum CodingKeys: String, CodingKey {
         case type
         case path
+        case text
         case message
     }
 
@@ -105,6 +107,9 @@ struct ClipboardImageResponse: Encodable {
         try container.encode(type, forKey: .type)
         if let path {
             try container.encode(path, forKey: .path)
+        }
+        if let text {
+            try container.encode(text, forKey: .text)
         }
         if let message {
             try container.encode(message, forKey: .message)
@@ -135,6 +140,7 @@ enum CaptureError: Error, CustomStringConvertible {
     case unsupportedOS(String)
     case missingOutPath
     case clipboardHasNoImage
+    case clipboardHasNoText
     case clipboardImageConversionFailed
 
     var description: String {
@@ -175,6 +181,8 @@ enum CaptureError: Error, CustomStringConvertible {
             return "clipboard-image requires --out <path>"
         case .clipboardHasNoImage:
             return "Clipboard has no image"
+        case .clipboardHasNoText:
+            return "Clipboard has no text"
         case .clipboardImageConversionFailed:
             return "Failed to convert clipboard image to PNG"
         }
@@ -257,6 +265,21 @@ struct RecallCapture {
                 try printJSONLine(ClipboardImageResponse(
                     type: "error",
                     path: nil,
+                    text: nil,
+                    message: "\(error)"
+                ))
+                Foundation.exit(1)
+            }
+        case "clipboard-text":
+            do {
+                try await MainActor.run {
+                    try clipboardText()
+                }
+            } catch {
+                try printJSONLine(ClipboardImageResponse(
+                    type: "error",
+                    path: nil,
+                    text: nil,
                     message: "\(error)"
                 ))
                 Foundation.exit(1)
@@ -440,6 +463,24 @@ struct RecallCapture {
         try printJSONLine(ClipboardImageResponse(
             type: "ok",
             path: outURL.path,
+            text: nil,
+            message: nil
+        ))
+    }
+
+    @MainActor
+    private static func clipboardText() throws {
+        _ = NSApplication.shared
+        let pasteboard = NSPasteboard.general
+        guard let text = pasteboard.string(forType: .string),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            throw CaptureError.clipboardHasNoText
+        }
+        try printJSONLine(ClipboardImageResponse(
+            type: "ok",
+            path: nil,
+            text: text,
             message: nil
         ))
     }
@@ -897,6 +938,7 @@ struct RecallCapture {
                 recall-capture record-system --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
                 recall-capture probe-audio-tap
                 recall-capture clipboard-image --out <path>
+                recall-capture clipboard-text
                 recall-capture version
 
             COMMANDS:
@@ -906,6 +948,7 @@ struct RecallCapture {
                 record-system   Record app/system audio into <session-dir>/audio/<output-name>.
                 probe-audio-tap Probe CoreAudio's process-tap API without writing audio.
                 clipboard-image Write the macOS pasteboard image as PNG to --out.
+                clipboard-text  Emit the macOS pasteboard string as JSON.
                 version         Print helper version.
 
             NOTE:

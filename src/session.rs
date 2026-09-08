@@ -149,19 +149,121 @@ pub fn format_session_note_bullet(
     caption: &str,
     image_relative_paths: &[String],
 ) -> Option<String> {
-    let caption = caption.trim();
+    let caption = linkify_note_caption(caption.trim());
     if caption.is_empty() && image_relative_paths.is_empty() {
         return None;
     }
 
-    let mut parts = Vec::new();
-    if !caption.is_empty() {
-        parts.push(caption.to_string());
+    if caption.is_empty() {
+        let mut line = format!("- `{elapsed}`");
+        for (index, image) in image_relative_paths.iter().enumerate() {
+            if index == 0 {
+                line.push_str(&format!(" [image]({image})"));
+            } else {
+                line.push_str(&format!("\n  · [image]({image})"));
+            }
+        }
+        return Some(line);
     }
-    for image in image_relative_paths {
-        parts.push(format!("[image]({image})"));
+
+    let caption_lines: Vec<&str> = caption.split('\n').collect();
+    let mut block = format!("- `{elapsed}` {}", caption_lines[0]);
+    for extra in caption_lines.iter().skip(1) {
+        block.push_str("\n  ");
+        block.push_str(extra);
     }
-    Some(format!("- `{elapsed}` {}", parts.join(" · ")))
+    if caption_lines.len() == 1 {
+        for image in image_relative_paths {
+            block.push_str(&format!(" · [image]({image})"));
+        }
+    } else {
+        for image in image_relative_paths {
+            block.push_str(&format!("\n  · [image]({image})"));
+        }
+    }
+    Some(block)
+}
+
+pub fn linkify_note_caption(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while !rest.is_empty() {
+        if let Some(link) = take_markdown_link(rest) {
+            out.push_str(link);
+            rest = &rest[link.len()..];
+            continue;
+        }
+        if let Some((url, consumed)) = take_bare_url(rest) {
+            let href = if url.starts_with("www.") {
+                format!("https://{url}")
+            } else {
+                url.to_string()
+            };
+            out.push_str(&format!("[{url}]({href})"));
+            rest = &rest[consumed..];
+            continue;
+        }
+        let ch = rest.chars().next().expect("rest is non-empty");
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+fn take_markdown_link(input: &str) -> Option<&str> {
+    if !input.starts_with('[') {
+        return None;
+    }
+    let close_text = input.find("](")?;
+    let rest = &input[close_text + 2..];
+    let close_url = rest.find(')')?;
+    Some(&input[..close_text + 2 + close_url + 1])
+}
+
+fn take_bare_url(input: &str) -> Option<(&str, usize)> {
+    let prefix = ["https://", "http://", "www."]
+        .into_iter()
+        .find(|candidate| input.starts_with(candidate))?;
+    let mut end = prefix.len();
+    let mut paren_depth = 0i32;
+    for ch in input[prefix.len()..].chars() {
+        if ch == '(' {
+            paren_depth += 1;
+            end += ch.len_utf8();
+            continue;
+        }
+        if ch == ')' {
+            if paren_depth == 0 {
+                break;
+            }
+            paren_depth -= 1;
+            end += ch.len_utf8();
+            continue;
+        }
+        if ch.is_whitespace()
+            || matches!(
+                ch,
+                '<' | '>' | '"' | '\'' | '`' | '[' | ']' | '{' | '}' | '|'
+            )
+        {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    while end > prefix.len() {
+        let Some(last) = input[..end].chars().next_back() else {
+            break;
+        };
+        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?') {
+            end -= last.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end <= prefix.len() {
+        return None;
+    }
+    Some((&input[..end], end))
 }
 
 pub fn images_dir(session_path: &Path) -> PathBuf {
@@ -683,16 +785,30 @@ fn refresh_meeting_capture_context(session_path: &Path) -> io::Result<()> {
     fs::write(meeting_path, updated)
 }
 
-fn session_entries(path: &Path) -> io::Result<Vec<String>> {
+pub fn session_entries(path: &Path) -> io::Result<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    Ok(fs::read_to_string(path)?
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("- `"))
-        .map(str::to_string)
-        .collect())
+
+    let mut entries = Vec::new();
+    let mut current: Option<String> = None;
+    for line in fs::read_to_string(path)?.lines() {
+        if line.starts_with("- `") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some(line.to_string());
+        } else if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(entry) = &mut current {
+                entry.push('\n');
+                entry.push_str(line.trim_end());
+            }
+        }
+    }
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 fn append_entry_section(output: &mut String, heading: &str, entries: &[String]) {
@@ -871,10 +987,11 @@ mod tests {
     use super::{
         append_session_marker, append_session_note, append_session_note_with_images,
         copy_image_into_session, discard_unused_note_images, eastern_offset_hours,
-        editor_invocation, escape_json, export_session, format_session_note_bullet, list_sessions,
-        mark_transcript_ready, next_note_image_relative_path, pasted_image_path,
-        read_session_consent, readable_eastern_timestamp_for, resolve_session_target, resume_hint,
-        slugify, start_session, ConsentMode, StartOptions,
+        editor_invocation, escape_json, export_session, format_session_note_bullet,
+        linkify_note_caption, list_sessions, mark_transcript_ready, next_note_image_relative_path,
+        pasted_image_path, read_session_consent, readable_eastern_timestamp_for,
+        resolve_session_target, resume_hint, session_entries, slugify, start_session, ConsentMode,
+        StartOptions,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1217,6 +1334,70 @@ mod tests {
             format_session_note_bullet("12:04", "", &["images/12-04-note.png".to_string()]),
             Some("- `12:04` [image](images/12-04-note.png)".to_string())
         );
+    }
+
+    #[test]
+    fn multiline_note_bullet_indents_continuation_lines() {
+        assert_eq!(
+            format_session_note_bullet(
+                "12:04",
+                "first line\nsecond line",
+                &["images/12-04-note.png".to_string()]
+            ),
+            Some(
+                "- `12:04` first line\n  second line\n  · [image](images/12-04-note.png)"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn linkify_turns_bare_urls_into_markdown_links() {
+        assert_eq!(
+            linkify_note_caption("see https://example.com/foo"),
+            "see [https://example.com/foo](https://example.com/foo)"
+        );
+        assert_eq!(
+            linkify_note_caption("www.example.com"),
+            "[www.example.com](https://www.example.com)"
+        );
+        assert_eq!(
+            linkify_note_caption("already [docs](https://example.com/foo)"),
+            "already [docs](https://example.com/foo)"
+        );
+        assert_eq!(
+            linkify_note_caption("https://example.com/wiki/Foo_(bar)"),
+            "[https://example.com/wiki/Foo_(bar)](https://example.com/wiki/Foo_(bar))"
+        );
+        assert_eq!(
+            linkify_note_caption("see https://example.com/foo)."),
+            "see [https://example.com/foo](https://example.com/foo))."
+        );
+    }
+
+    #[test]
+    fn session_entries_keep_indented_continuation_lines() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "recall-note-multiline-entries-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        fs::create_dir_all(session_dir.join(".recall")).unwrap();
+        fs::write(
+            session_dir.join(".recall/notes.md"),
+            "# Notes\n\n- `12:04` first line\n  second line\n  · [image](images/12-04-note.png)\n- `12:05` later\n",
+        )
+        .unwrap();
+        let entries = session_entries(&session_dir.join(".recall/notes.md")).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                "- `12:04` first line\n  second line\n  · [image](images/12-04-note.png)"
+                    .to_string(),
+                "- `12:05` later".to_string(),
+            ]
+        );
+        let _ = fs::remove_dir_all(session_dir);
     }
 
     #[test]

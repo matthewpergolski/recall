@@ -26,6 +26,7 @@ swift run recall-capture record-audio-tap --session-dir ../sessions/example --du
 swift run recall-capture record-system --session-dir ../sessions/example --duration 5 --output-name call-001.m4a
 swift run recall-capture probe-audio-tap
 swift run recall-capture clipboard-image --out /tmp/recall-clipboard.png
+swift run recall-capture clipboard-text
 ```
 
 Planned command shape:
@@ -78,6 +79,12 @@ If the pasteboard has no image, the helper exits 1 with:
 
 ```json
 {"message":"Clipboard has no image","type":"error"}
+```
+
+`clipboard-text` emits the pasteboard string:
+
+```json
+{"text":"first line\nsecond line","type":"ok"}
 ```
 
 Potential future event output:

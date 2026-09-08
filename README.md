@@ -294,7 +294,7 @@ recall export latest --output ~/Desktop/project-sync.md
 - `r`: refresh detected sources
 - `m`: add a timestamped marker to the session
 - `n`: type a timestamped note, then `Enter` saves it with the session
-- While the note draft is open: `Cmd+V` or `Ctrl+V` pastes a clipboard image when the terminal lets that chord through; `Ctrl+I` always inserts a clipboard image (needed in Apple Terminal). Caption text is optional. Esc cancels and deletes unused pasted files. Optional Ghostty bind: `keybind = cmd+v=unbind` so Recall sees `Cmd+V`.
+- While the note draft is open: `Enter` saves; `Shift+Enter` or `Alt+Enter` inserts a newline; `Cmd+V` / `Ctrl+V` tries a clipboard image first, then text; `Ctrl+I` inserts a clipboard image (needed in Apple Terminal). Opening `n` does not read the clipboard. Bare `http(s)` / `www.` URLs become markdown links on save. Esc cancels and deletes unused pasted files. Optional Ghostty bind: `keybind = cmd+v=unbind` so Recall sees `Cmd+V`.
 - `o`: open the session folder in Finder or the configured editor
 - `O`: open the meeting document
 - `q` or `Ctrl+C`: quit
