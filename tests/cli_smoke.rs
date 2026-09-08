@@ -73,7 +73,7 @@ fn resume_missing_session_id_errors_clearly() {
         .arg("--storage")
         .arg(&storage)
         .arg("--resume")
-        .arg("05-26-2026_7-21pm-et-does-not-exist")
+        .arg("2026-05-26_1921-et-does-not-exist")
         .output()
         .expect("failed to run recall --resume missing");
     assert!(!output.status.success(), "{}", output_text(&output));
@@ -88,7 +88,7 @@ fn resume_missing_session_id_errors_clearly() {
 #[test]
 fn resume_refuses_an_unfinished_take_from_the_cli() {
     let storage = unique_storage("unfinished");
-    let session = storage.join("05-26-2026_7-21pm-et-unfinished");
+    let session = storage.join("2026-05-26_1921-et-unfinished");
     fs::create_dir_all(session.join(".recall/state")).unwrap();
     fs::write(
         session.join(".recall/metadata.json"),
@@ -105,7 +105,7 @@ fn resume_refuses_an_unfinished_take_from_the_cli() {
         .arg("--storage")
         .arg(&storage)
         .arg("--resume")
-        .arg("05-26-2026_7-21pm-et-unfinished")
+        .arg("2026-05-26_1921-et-unfinished")
         .output()
         .expect("failed to run recall --resume unfinished");
     assert!(!output.status.success(), "{}", output_text(&output));

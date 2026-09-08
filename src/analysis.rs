@@ -530,13 +530,13 @@ fn session_timestamp_prefix(name: &str) -> Option<String> {
         if prefix.is_empty() {
             return None;
         }
-        return compact_timestamp_to_readable(prefix).or_else(|| Some(prefix.to_string()));
+        return compact_timestamp_to_iso(prefix).or_else(|| Some(prefix.to_string()));
     }
 
-    compact_timestamp_to_readable(name)
+    compact_timestamp_to_iso(name)
 }
 
-fn compact_timestamp_to_readable(prefix: &str) -> Option<String> {
+fn compact_timestamp_to_iso(prefix: &str) -> Option<String> {
     let name = prefix;
     let bytes = name.as_bytes();
     if bytes.len() < 15 {
@@ -552,15 +552,9 @@ fn compact_timestamp_to_readable(prefix: &str) -> Option<String> {
     let year = &name[0..4];
     let month = &name[4..6];
     let day = &name[6..8];
-    let hour_24: u8 = name[9..11].parse().ok()?;
+    let hour = &name[9..11];
     let minute = &name[11..13];
-    let suffix = if hour_24 < 12 { "am" } else { "pm" };
-    let hour_12 = match hour_24 % 12 {
-        0 => 12,
-        value => value,
-    };
-
-    Some(format!("{month}-{day}-{year}_{hour_12}-{minute}{suffix}"))
+    Some(format!("{year}-{month}-{day}_{hour}{minute}"))
 }
 
 fn unique_session_path(parent: &Path, base_name: &str) -> PathBuf {
@@ -876,15 +870,19 @@ mod tests {
     fn derives_session_prefix_and_title_slug() {
         assert_eq!(
             session_timestamp_prefix("20260526-185332-quick-capture"),
-            Some("05-26-2026_6-53pm".to_string())
+            Some("2026-05-26_1853".to_string())
         );
         assert_eq!(
             session_timestamp_prefix("20260526-185332-et-rain-chat"),
-            Some("05-26-2026_6-53pm".to_string())
+            Some("2026-05-26_1853".to_string())
         );
         assert_eq!(
             session_timestamp_prefix("05-26-2026_7-21pm-et-rain-chat"),
             Some("05-26-2026_7-21pm".to_string())
+        );
+        assert_eq!(
+            session_timestamp_prefix("2026-09-08_1405-et-release-version"),
+            Some("2026-09-08_1405".to_string())
         );
         assert_eq!(
             title_slug("Rain, Birthdays and Jersey Mike's Chat"),

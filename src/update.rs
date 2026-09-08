@@ -78,13 +78,13 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
         )?;
     }
 
-    validate_checkout(&checkout)?;
+    let crate_version = validate_checkout(&checkout)?;
     ensure_clean(&checkout)?;
     ensure_at_origin_main(&checkout)?;
 
     let current_commit = git_output(&checkout, &["rev-parse", "HEAD"])?;
     if previous_commit == current_commit {
-        println!("Refreshing Recall {}...", env!("CARGO_PKG_VERSION"));
+        println!("Refreshing Recall {crate_version}...");
     } else {
         println!(
             "Updating Recall {} -> {}...",
@@ -121,11 +121,10 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     )?;
 
     if previous_commit == current_commit {
-        println!("Recall refreshed ({}).", env!("CARGO_PKG_VERSION"));
+        println!("Recall refreshed ({crate_version}).");
     } else {
         println!(
-            "Recall updated to {} ({}).",
-            env!("CARGO_PKG_VERSION"),
+            "Recall updated to {crate_version} ({}).",
             short_commit(&current_commit)
         );
     }
@@ -201,7 +200,7 @@ fn require_checkout(path: &Path, source: &str) -> io::Result<PathBuf> {
     canonical_path(path)
 }
 
-fn validate_checkout(path: &Path) -> io::Result<()> {
+fn validate_checkout(path: &Path) -> io::Result<String> {
     if !path.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -231,6 +230,10 @@ fn validate_checkout(path: &Path) -> io::Result<()> {
         ));
     }
 
+    version_from_metadata(&cargo_metadata(path)?)
+}
+
+fn cargo_metadata(path: &Path) -> io::Result<serde_json::Value> {
     let metadata = command_output(
         Command::new("cargo")
             .arg("metadata")
@@ -242,24 +245,32 @@ fn validate_checkout(path: &Path) -> io::Result<()> {
             .arg(path.join("Cargo.toml")),
         "read Cargo metadata",
     )?;
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&metadata.stdout).map_err(|error| {
+    serde_json::from_slice(&metadata.stdout).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Cargo metadata was not valid JSON: {error}"),
+        )
+    })
+}
+
+fn version_from_metadata(metadata: &serde_json::Value) -> io::Result<String> {
+    let package = metadata["packages"]
+        .as_array()
+        .and_then(|packages| packages.iter().find(|package| package["name"] == "recall"))
+        .ok_or_else(|| {
             io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Cargo metadata was not valid JSON: {error}"),
+                io::ErrorKind::InvalidInput,
+                "Cargo package is not named recall",
             )
         })?;
-    let is_recall = metadata["packages"]
-        .as_array()
-        .is_some_and(|packages| packages.iter().any(|package| package["name"] == "recall"));
-    if !is_recall {
+    let version = package["version"].as_str().unwrap_or("").trim();
+    if version.is_empty() {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Cargo package is not named recall",
+            io::ErrorKind::InvalidData,
+            "Recall package is missing a version",
         ));
     }
-
-    Ok(())
+    Ok(version.to_string())
 }
 
 fn ensure_clean(checkout: &Path) -> io::Result<()> {
@@ -435,7 +446,7 @@ fn normalized_remote(remote: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         build_matches, deduplicate_paths, ensure_at_origin_main, ensure_clean, normalized_remote,
-        short_commit, validate_checkout, UpdateOptions, RECALL_REMOTE,
+        short_commit, validate_checkout, version_from_metadata, UpdateOptions, RECALL_REMOTE,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -572,7 +583,39 @@ mod tests {
     fn validates_an_official_recall_checkout() {
         let fixture = CheckoutFixture::new();
 
-        assert!(validate_checkout(&fixture.path).is_ok());
+        assert_eq!(validate_checkout(&fixture.path).unwrap(), "0.0.0");
+    }
+
+    #[test]
+    fn reads_the_recall_package_version_from_metadata() {
+        let metadata = serde_json::json!({
+            "packages": [
+                {"name": "other", "version": "9.9.9"},
+                {"name": "recall", "version": "0.3.0"}
+            ]
+        });
+
+        assert_eq!(version_from_metadata(&metadata).unwrap(), "0.3.0");
+    }
+
+    #[test]
+    fn rejects_metadata_without_a_recall_package() {
+        let metadata = serde_json::json!({
+            "packages": [{"name": "other", "version": "1.0.0"}]
+        });
+        let error = version_from_metadata(&metadata).unwrap_err();
+
+        assert!(error.to_string().contains("not named recall"));
+    }
+
+    #[test]
+    fn rejects_a_recall_package_with_a_blank_version() {
+        let metadata = serde_json::json!({
+            "packages": [{"name": "recall", "version": "  "}]
+        });
+        let error = version_from_metadata(&metadata).unwrap_err();
+
+        assert!(error.to_string().contains("missing a version"));
     }
 
     #[test]
