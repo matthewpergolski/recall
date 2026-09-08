@@ -57,6 +57,7 @@ v0 should include:
 - Source detection: done
 - Local session folder creation: done
 - Session metadata, markers, and typed notes: done
+- Paste clipboard images into live notes (`n`, then `Cmd+V` / `Ctrl+I`): v1 done
 
 Success criteria:
 

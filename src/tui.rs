@@ -9,7 +9,11 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+use crossterm::execute;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -24,12 +28,16 @@ use crate::audio::{
     read_capture_progress, resume_block_reason, write_capture_progress, AudioTrack, CaptureLock,
     CaptureProgress,
 };
-use crate::capture_sources::{detect_sources, SourceSummary};
+use crate::capture_sources::{
+    detect_sources, write_clipboard_image, ClipboardImageOutcome, SourceSummary,
+};
 use crate::mic_recorder::MicRecorder;
 use crate::session::{
-    append_session_marker, append_session_note, default_storage_dir, internal_dir, open_path,
-    primary_document_path, read_session_consent, read_session_title, resolve_session_target,
-    start_session, ConsentMode, StartOptions,
+    append_session_marker, append_session_note, append_session_note_with_images,
+    copy_image_into_session, default_storage_dir, discard_unused_note_images,
+    format_session_note_bullet, internal_dir, next_note_image_relative_path, open_path,
+    pasted_image_path, primary_document_path, read_session_consent, read_session_title,
+    remove_empty_images_dir, resolve_session_target, start_session, ConsentMode, StartOptions,
 };
 use crate::system_recorder::SystemRecorder;
 use crate::transcription::{
@@ -40,6 +48,7 @@ use crate::transcription::{
 
 const TICK_RATE: Duration = Duration::from_millis(100);
 const SOURCE_REFRESH_TICKS: u64 = 50;
+const MAX_NOTE_PASTE_CHARS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureState {
@@ -170,7 +179,9 @@ pub fn run_with_options(options: TuiOptions) -> io::Result<TuiExit> {
         None => None,
     };
     let mut terminal = ratatui::try_init()?;
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
     let result = App::new(options, resume)?.run(&mut terminal);
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     let restore_result = ratatui::try_restore();
 
     match (result, restore_result) {
@@ -226,7 +237,7 @@ struct App {
     parakeet_cache_dir: Option<PathBuf>,
     require_parakeet: bool,
     chunk_seconds: u64,
-    note_draft: Option<String>,
+    note_draft: Option<NoteDraft>,
     editor: Option<String>,
     resumed: bool,
     append_next: bool,
@@ -297,6 +308,33 @@ enum AnalysisUiEvent {
         generation: u32,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NoteDraft {
+    caption: String,
+    images: Vec<String>,
+}
+
+impl NoteDraft {
+    fn display(&self) -> String {
+        let mut out = self.caption.clone();
+        for (index, _) in self.images.iter().enumerate() {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+            if index == 0 {
+                out.push_str("[img]");
+            } else {
+                out.push_str(&format!("[img {}]", index + 1));
+            }
+        }
+        out
+    }
+
+    fn is_empty(&self) -> bool {
+        self.caption.trim().is_empty() && self.images.is_empty()
+    }
 }
 
 impl App {
@@ -415,13 +453,19 @@ impl App {
             terminal.draw(|frame| self.render(frame))?;
 
             if event::poll(TICK_RATE)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press && self.handle_key(key)? {
+                match event::read()? {
+                    Event::Key(key)
+                        if key.kind == KeyEventKind::Press && self.handle_key(key)? =>
+                    {
                         return Ok(TuiExit {
                             session_path: self.session_path.clone(),
                             detached_logs: self.detached_logs.clone(),
                         });
                     }
+                    Event::Paste(text) if self.note_draft.is_some() => {
+                        self.handle_note_paste(&text);
+                    }
+                    _ => {}
                 }
             }
 
@@ -520,28 +564,134 @@ impl App {
     fn handle_note_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => self.save_manual_note(),
-            KeyCode::Esc => {
-                self.note_draft = None;
-                self.toast = "Note cancelled.".to_string();
-            }
-            KeyCode::Backspace => {
-                if let Some(draft) = &mut self.note_draft {
-                    draft.pop();
-                }
-            }
+            KeyCode::Esc => self.cancel_manual_note(),
+            KeyCode::Backspace => self.backspace_note_draft(),
+            KeyCode::Tab => self.paste_clipboard_image(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.note_draft = None;
-                self.toast = "Note cancelled.".to_string();
+                self.cancel_manual_note();
+            }
+            KeyCode::Char('v')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
+                self.paste_clipboard_image();
+            }
+            KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.paste_clipboard_image();
             }
             KeyCode::Char(ch)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
                 if let Some(draft) = &mut self.note_draft {
-                    draft.push(ch);
+                    draft.caption.push(ch);
                 }
             }
             _ => {}
         }
+    }
+
+    fn handle_note_paste(&mut self, text: &str) {
+        if text.chars().count() > MAX_NOTE_PASTE_CHARS || paste_looks_binary(text) {
+            self.toast = "Ignored a large clipboard paste.".to_string();
+            return;
+        }
+        if let Some(path) = pasted_image_path(text) {
+            self.import_note_image_from_path(&path);
+            return;
+        }
+        if let Some(draft) = &mut self.note_draft {
+            let flattened = text.replace(['\n', '\r'], " ");
+            draft.caption.push_str(&flattened);
+        }
+    }
+
+    fn paste_clipboard_image(&mut self) {
+        let Some(session_path) = self.session_path.clone() else {
+            return;
+        };
+        if self.note_draft.is_none() {
+            return;
+        }
+
+        let elapsed = self.elapsed_label();
+        let relative = next_note_image_relative_path(&session_path, &elapsed, "png");
+        let dest = session_path.join(&relative);
+        match write_clipboard_image(&dest) {
+            Ok(ClipboardImageOutcome::Saved(path)) => {
+                let relative = path
+                    .strip_prefix(&session_path)
+                    .ok()
+                    .map(|value| value.to_string_lossy().replace('\\', "/"))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(relative);
+                self.attach_note_image(relative);
+            }
+            Ok(ClipboardImageOutcome::NoImage) => {
+                let _ = fs::remove_file(&dest);
+                let _ = remove_empty_images_dir(&session_path);
+                self.toast = "Clipboard has no image. Copy a screenshot first.".to_string();
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&dest);
+                let _ = remove_empty_images_dir(&session_path);
+                self.toast = format!("Could not paste image: {error}");
+            }
+        }
+    }
+
+    fn import_note_image_from_path(&mut self, source: &Path) {
+        let Some(session_path) = self.session_path.clone() else {
+            return;
+        };
+        if self.note_draft.is_none() {
+            return;
+        }
+        let elapsed = self.elapsed_label();
+        match copy_image_into_session(&session_path, &elapsed, source) {
+            Ok(relative) => self.attach_note_image(relative),
+            Err(error) => {
+                self.toast = format!("Could not attach image: {error}");
+            }
+        }
+    }
+
+    fn attach_note_image(&mut self, relative: String) {
+        if let Some(draft) = &mut self.note_draft {
+            draft.images.push(relative.clone());
+            self.toast = format!("Image {} saved as {relative}", draft.images.len());
+        }
+    }
+
+    fn backspace_note_draft(&mut self) {
+        let relative = {
+            let Some(draft) = self.note_draft.as_mut() else {
+                return;
+            };
+            if !draft.caption.is_empty() {
+                draft.caption.pop();
+                return;
+            }
+            let Some(relative) = draft.images.pop() else {
+                return;
+            };
+            relative
+        };
+        if let Some(session_path) = &self.session_path {
+            let _ = discard_unused_note_images(session_path, std::slice::from_ref(&relative));
+        }
+    }
+
+    fn cancel_manual_note(&mut self) {
+        let draft = self.note_draft.take();
+        if let (Some(session_path), Some(draft)) = (self.session_path.clone(), draft) {
+            if !draft.images.is_empty() {
+                if let Err(error) = discard_unused_note_images(&session_path, &draft.images) {
+                    self.toast = format!("Note cancelled, but unused images remain: {error}");
+                    return;
+                }
+            }
+        }
+        self.toast = "Note cancelled.".to_string();
     }
 
     fn tick(&mut self) {
@@ -876,28 +1026,49 @@ impl App {
             return;
         }
 
-        self.note_draft = Some(String::new());
-        self.toast = "Type a note, then press Enter to save or Esc to cancel.".to_string();
+        self.note_draft = Some(NoteDraft::default());
+        self.toast =
+            "Type a note, then press Enter to save or Esc to cancel. Cmd+V or Ctrl+I pastes a clipboard image."
+                .to_string();
     }
 
     fn save_manual_note(&mut self) {
-        let note_text = self.note_draft.take().unwrap_or_default();
-        let note_text = note_text.trim();
-        if note_text.is_empty() {
+        let Some(draft) = self.note_draft.take() else {
+            return;
+        };
+        if draft.is_empty() {
             self.toast = "Empty note discarded.".to_string();
             return;
         }
 
-        let note = format!("{} {note_text}", self.elapsed_label());
-        if let Some(session_path) = &self.session_path {
-            if let Err(error) = append_session_note(session_path, &self.elapsed_label(), note_text)
-            {
-                self.toast = format!("Note created in memory, but failed to save: {error}");
-                return;
-            }
+        let caption = draft.caption.trim();
+        let elapsed = self.elapsed_label();
+        let Some(session_path) = self.session_path.clone() else {
+            self.toast = "Start or resume a session before adding notes.".to_string();
+            return;
+        };
+        let save_result = if draft.images.is_empty() {
+            append_session_note(&session_path, &elapsed, caption)
+        } else {
+            append_session_note_with_images(&session_path, &elapsed, caption, &draft.images)
+        };
+        if let Err(error) = save_result {
+            self.note_draft = Some(draft);
+            self.toast = format!("Note created in memory, but failed to save: {error}");
+            return;
         }
-        self.live_notes.push(note.clone());
-        self.toast = format!("{note} saved with the session");
+
+        let live = format_session_note_bullet(&elapsed, caption, &draft.images)
+            .map(|note| {
+                if let Some(rest) = note.strip_prefix("- ") {
+                    rest.to_string()
+                } else {
+                    note
+                }
+            })
+            .unwrap_or_else(|| format!("`{elapsed}` {caption}"));
+        self.live_notes.push(live.clone());
+        self.toast = format!("{live} saved with the session");
     }
 
     fn refresh_sources(&mut self) {
@@ -2092,7 +2263,7 @@ impl App {
         if let Some(draft) = &self.note_draft {
             lines.push(Line::from(vec![
                 Span::styled("Note draft: ", Style::default().fg(Color::Blue)),
-                Span::raw(draft.clone()),
+                Span::raw(draft.display()),
                 Span::styled("_", Style::default().fg(Color::Blue)),
             ]));
             lines.push(Line::raw(""));
@@ -2268,7 +2439,7 @@ impl App {
                         " Note > ",
                         Style::default().fg(Color::Black).bg(Color::Blue),
                     ),
-                    Span::raw(draft.clone()),
+                    Span::raw(draft.display()),
                     Span::styled("_", Style::default().fg(Color::Blue)),
                 ]),
                 Line::from(vec![
@@ -2283,7 +2454,12 @@ impl App {
                         " Backspace ",
                         Style::default().fg(Color::Black).bg(Color::Yellow),
                     ),
-                    Span::raw(" edit"),
+                    Span::raw(" edit  "),
+                    Span::styled(
+                        " Cmd+V / Ctrl+I ",
+                        Style::default().fg(Color::Black).bg(Color::Magenta),
+                    ),
+                    Span::raw(" paste image"),
                 ]),
             ];
             frame.render_widget(
@@ -2525,6 +2701,15 @@ fn signal_gauge(label: &'static str, percent: u16, color: Color) -> Gauge<'stati
 fn db_to_percent(level_db: f32) -> u16 {
     let normalized = ((level_db + 60.0) / 60.0).clamp(0.0, 1.0);
     (normalized * 100.0) as u16
+}
+
+fn paste_looks_binary(text: &str) -> bool {
+    text.chars().any(|ch| ch == '\0')
+        || text
+            .chars()
+            .filter(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+            .count()
+            > 8
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3077,5 +3262,157 @@ mod tests {
                 analyze: true,
             }]
         );
+    }
+
+    fn unique_storage(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "recall-tui-note-image-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    fn type_note(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.handle_note_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+    }
+
+    fn note_session(label: &str) -> (PathBuf, PathBuf) {
+        let storage = unique_storage(label);
+        let session = start_session(&StartOptions {
+            title: "Note Images".to_string(),
+            consent: ConsentMode::Noted,
+            storage_dir: storage.clone(),
+        })
+        .unwrap();
+        (storage, session.path)
+    }
+
+    #[test]
+    fn text_only_note_writes_one_bullet_without_images_dir() {
+        let (storage, session_path) = note_session("text-only");
+        let mut app = test_app(session_path.clone());
+        app.accumulated = Duration::from_secs(12 * 60 + 4);
+        app.start_manual_note();
+        type_note(&mut app, "whiteboard");
+        app.handle_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let notes = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        assert!(notes.contains("- `12:04` whiteboard"));
+        assert!(!notes.contains("[image]"));
+        assert!(!session_path.join("images").exists());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn image_paste_with_caption_writes_file_and_markdown_link() {
+        let (storage, session_path) = note_session("captioned");
+        let source = storage.join("board.png");
+        fs::write(&source, tiny_png()).unwrap();
+        let mut app = test_app(session_path.clone());
+        app.accumulated = Duration::from_secs(12 * 60 + 4);
+        app.start_manual_note();
+        type_note(&mut app, "whiteboard");
+        app.handle_note_paste(&source.to_string_lossy());
+        app.handle_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let notes = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        let meeting = fs::read_to_string(session_path.join("meeting.md")).unwrap();
+        assert!(session_path.join("images/12-04-note.png").is_file());
+        assert!(notes.contains("- `12:04` whiteboard · [image](images/12-04-note.png)"));
+        assert!(meeting.contains("[image](images/12-04-note.png)"));
+        assert!(app.note_draft.is_none());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn esc_after_image_paste_removes_unused_files() {
+        let (storage, session_path) = note_session("esc-discard");
+        let source = storage.join("board.png");
+        fs::write(&source, tiny_png()).unwrap();
+        let mut app = test_app(session_path.clone());
+        app.accumulated = Duration::from_secs(12 * 60 + 4);
+        app.start_manual_note();
+        app.handle_note_paste(&source.to_string_lossy());
+        assert!(session_path.join("images/12-04-note.png").is_file());
+        app.handle_note_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.note_draft.is_none());
+        assert!(!session_path.join("images").exists());
+        let notes = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        assert!(!notes.contains("[image]"));
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn image_paste_without_caption_still_saves() {
+        let (storage, session_path) = note_session("no-caption");
+        let source = storage.join("board.png");
+        fs::write(&source, tiny_png()).unwrap();
+        let mut app = test_app(session_path.clone());
+        app.accumulated = Duration::from_secs(12 * 60 + 4);
+        app.start_manual_note();
+        app.handle_note_paste(&source.to_string_lossy());
+        app.handle_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let notes = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        assert!(session_path.join("images/12-04-note.png").is_file());
+        assert!(notes.contains("- `12:04` [image](images/12-04-note.png)"));
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn non_image_paste_does_not_create_images_dir() {
+        let (storage, session_path) = note_session("non-image");
+        let mut app = test_app(session_path.clone());
+        app.accumulated = Duration::from_secs(12 * 60 + 4);
+        app.start_manual_note();
+        app.handle_note_paste("just some copied text");
+        app.handle_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let notes = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        assert!(notes.contains("- `12:04` just some copied text"));
+        assert!(!session_path.join("images").exists());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn two_image_pastes_in_the_same_second_get_counter_suffix() {
+        let (storage, session_path) = note_session("two-pastes");
+        let source = storage.join("board.png");
+        fs::write(&source, tiny_png()).unwrap();
+        let mut app = test_app(session_path.clone());
+        app.accumulated = Duration::from_secs(12 * 60 + 4);
+        app.start_manual_note();
+        app.handle_note_paste(&source.to_string_lossy());
+        app.handle_note_paste(&source.to_string_lossy());
+        app.handle_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let notes = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        assert!(session_path.join("images/12-04-note.png").is_file());
+        assert!(session_path.join("images/12-04-note-2.png").is_file());
+        assert!(notes.contains("[image](images/12-04-note.png)"));
+        assert!(notes.contains("[image](images/12-04-note-2.png)"));
+
+        let _ = fs::remove_dir_all(storage);
     }
 }

@@ -13,6 +13,7 @@ The helper should stay small:
 - capture app/system audio with ScreenCaptureKit
 - write audio chunks or stream PCM events
 - emit simple JSON status events to the Rust app
+- read a macOS pasteboard image and write it as PNG (note paste)
 
 ## Planned APIs
 
@@ -24,6 +25,7 @@ swift run recall-capture record-mic --session-dir ../sessions/example --duration
 swift run recall-capture record-audio-tap --session-dir ../sessions/example --duration 5 --output-name call-001.m4a
 swift run recall-capture record-system --session-dir ../sessions/example --duration 5 --output-name call-001.m4a
 swift run recall-capture probe-audio-tap
+swift run recall-capture clipboard-image --out /tmp/recall-clipboard.png
 ```
 
 Planned command shape:
@@ -66,6 +68,18 @@ Current `probe-audio-tap` event output creates and destroys a private CoreAudio 
 {"message":"CoreAudio process tap destroyed","source":"call","type":"audio_tap_probe_stopped"}
 ```
 
+Current `clipboard-image` output is a single JSON line:
+
+```json
+{"path":"/tmp/recall-clipboard.png","type":"ok"}
+```
+
+If the pasteboard has no image, the helper exits 1 with:
+
+```json
+{"message":"Clipboard has no image","type":"error"}
+```
+
 Potential future event output:
 
 ```json
@@ -84,4 +98,4 @@ Potential future event output:
 
 ## Current Boundary
 
-The helper currently lists candidate sources, records default microphone audio, records system audio through CoreAudio process taps, keeps an initial ScreenCaptureKit fallback command, and can probe CoreAudio process taps. The Rust TUI invokes the mic and CoreAudio process-tap recorders.
+The helper currently lists candidate sources, records default microphone audio, records system audio through CoreAudio process taps, keeps an initial ScreenCaptureKit fallback command, can probe CoreAudio process taps, and can write the macOS pasteboard image as PNG. The Rust TUI invokes the mic and CoreAudio process-tap recorders, and uses `clipboard-image` while a note draft is open.

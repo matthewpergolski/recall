@@ -118,6 +118,74 @@ impl HelperSourceList {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardImageOutcome {
+    Saved(PathBuf),
+    NoImage,
+}
+
+#[derive(Deserialize)]
+struct ClipboardImageResponse {
+    #[serde(rename = "type")]
+    kind: String,
+    path: Option<String>,
+    message: Option<String>,
+}
+
+pub fn write_clipboard_image(out_path: &Path) -> io::Result<ClipboardImageOutcome> {
+    let out = out_path.to_string_lossy();
+    let output = run_helper_args(&["clipboard-image", "--out", out.as_ref()])?;
+    match parse_clipboard_image_output(&output.stdout) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            if output.status.success() {
+                Err(error)
+            } else {
+                let stderr = command_error(&output.stderr);
+                if stderr == "helper exited with no error output" {
+                    Err(error)
+                } else {
+                    Err(io::Error::other(format!("{error}; {stderr}")))
+                }
+            }
+        }
+    }
+}
+
+fn parse_clipboard_image_output(stdout: &[u8]) -> io::Result<ClipboardImageOutcome> {
+    let text = String::from_utf8_lossy(stdout);
+    let json_line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with('{'))
+        .ok_or_else(|| io::Error::other("clipboard helper returned no JSON"))?;
+    let parsed: ClipboardImageResponse = serde_json::from_str(json_line)
+        .map_err(|error| io::Error::other(format!("clipboard helper JSON: {error}")))?;
+    match parsed.kind.as_str() {
+        "ok" => {
+            let path = parsed
+                .path
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| io::Error::other("clipboard helper ok response missing path"))?;
+            Ok(ClipboardImageOutcome::Saved(PathBuf::from(path)))
+        }
+        "error" => {
+            let message = parsed
+                .message
+                .unwrap_or_else(|| "clipboard helper failed".to_string());
+            if message == "Clipboard has no image" {
+                Ok(ClipboardImageOutcome::NoImage)
+            } else {
+                Err(io::Error::other(message))
+            }
+        }
+        other => Err(io::Error::other(format!(
+            "unexpected clipboard helper type: {other}"
+        ))),
+    }
+}
+
 fn run_helper() -> io::Result<HelperSourceList> {
     let output = run_helper_command("list-sources")?;
 
@@ -129,15 +197,19 @@ fn run_helper() -> io::Result<HelperSourceList> {
 }
 
 fn run_helper_command(command_name: &str) -> io::Result<std::process::Output> {
+    run_helper_args(&[command_name])
+}
+
+fn run_helper_args(args: &[&str]) -> io::Result<std::process::Output> {
     let helper_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("capture-helper");
 
     if let Some(binary) = helper_binary(&helper_dir) {
-        Command::new(binary).arg(command_name).output()
+        Command::new(binary).args(args).output()
     } else {
         Command::new("swift")
             .arg("run")
             .arg("recall-capture")
-            .arg(command_name)
+            .args(args)
             .current_dir(&helper_dir)
             .output()
     }
@@ -164,7 +236,8 @@ fn command_error(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_source_list;
+    use super::{parse_clipboard_image_output, parse_source_list, ClipboardImageOutcome};
+    use std::path::PathBuf;
 
     #[test]
     fn parses_helper_source_list() {
@@ -201,5 +274,22 @@ mod tests {
         assert!(summary.apps[0].contains("Microsoft Teams"));
         assert_eq!(summary.microphones, ["MacBook Pro Microphone"]);
         assert!(summary.status.contains("authorized"));
+    }
+
+    #[test]
+    fn clipboard_helper_error_json_is_no_image() {
+        let json = br#"{"message":"Clipboard has no image","type":"error"}"#;
+        let outcome = parse_clipboard_image_output(json).unwrap();
+        assert_eq!(outcome, ClipboardImageOutcome::NoImage);
+    }
+
+    #[test]
+    fn clipboard_helper_ok_json_returns_path() {
+        let json = br#"{"path":"/tmp/images/12-04-note.png","type":"ok"}"#;
+        let outcome = parse_clipboard_image_output(json).unwrap();
+        assert_eq!(
+            outcome,
+            ClipboardImageOutcome::Saved(PathBuf::from("/tmp/images/12-04-note.png"))
+        );
     }
 }

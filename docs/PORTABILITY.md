@@ -141,6 +141,8 @@ sessions/
     audio/
       mic.m4a
       call.m4a
+    images/
+      12-04-note.png
     .recall/
       metadata.json
       notes.md

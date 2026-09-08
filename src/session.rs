@@ -128,8 +128,204 @@ pub fn append_session_marker(session_path: &Path, elapsed: &str) -> io::Result<(
 }
 
 pub fn append_session_note(session_path: &Path, elapsed: &str, note: &str) -> io::Result<()> {
-    append_session_entry(&notes_path(session_path), elapsed, note)?;
+    append_session_note_with_images(session_path, elapsed, note, &[])
+}
+
+pub fn append_session_note_with_images(
+    session_path: &Path,
+    elapsed: &str,
+    caption: &str,
+    image_relative_paths: &[String],
+) -> io::Result<()> {
+    let Some(line) = format_session_note_bullet(elapsed, caption, image_relative_paths) else {
+        return Ok(());
+    };
+    append_session_line(&notes_path(session_path), &line)?;
     refresh_meeting_capture_context(session_path)
+}
+
+pub fn format_session_note_bullet(
+    elapsed: &str,
+    caption: &str,
+    image_relative_paths: &[String],
+) -> Option<String> {
+    let caption = caption.trim();
+    if caption.is_empty() && image_relative_paths.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if !caption.is_empty() {
+        parts.push(caption.to_string());
+    }
+    for image in image_relative_paths {
+        parts.push(format!("[image]({image})"));
+    }
+    Some(format!("- `{elapsed}` {}", parts.join(" · ")))
+}
+
+pub fn images_dir(session_path: &Path) -> PathBuf {
+    session_path.join("images")
+}
+
+pub fn next_note_image_relative_path(
+    session_path: &Path,
+    elapsed: &str,
+    extension: &str,
+) -> String {
+    let stem = note_image_stem(elapsed);
+    let ext = extension.trim_start_matches('.').to_ascii_lowercase();
+    let dir = images_dir(session_path);
+    let first = format!("{stem}.{ext}");
+    if !dir.join(&first).exists() {
+        return format!("images/{first}");
+    }
+
+    let mut n = 2u32;
+    loop {
+        let name = format!("{stem}-{n}.{ext}");
+        if !dir.join(&name).exists() {
+            return format!("images/{name}");
+        }
+        n = n.saturating_add(1);
+        if n == u32::MAX {
+            return format!("images/{name}");
+        }
+    }
+}
+
+pub fn copy_image_into_session(
+    session_path: &Path,
+    elapsed: &str,
+    source: &Path,
+) -> io::Result<String> {
+    let ext = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("png");
+    let relative = next_note_image_relative_path(session_path, elapsed, ext);
+    let dest = session_path.join(&relative);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, &dest)?;
+    Ok(relative)
+}
+
+pub fn discard_unused_note_images(
+    session_path: &Path,
+    image_relative_paths: &[String],
+) -> io::Result<()> {
+    for relative in image_relative_paths {
+        let path = session_path.join(relative);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    }
+    remove_empty_images_dir(session_path)
+}
+
+pub fn remove_empty_images_dir(session_path: &Path) -> io::Result<()> {
+    let dir = images_dir(session_path);
+    if dir.is_dir() && fs::read_dir(&dir)?.next().is_none() {
+        fs::remove_dir(dir)?;
+    }
+    Ok(())
+}
+
+pub fn pasted_image_path(text: &str) -> Option<PathBuf> {
+    if text.chars().count() > 1024 {
+        return None;
+    }
+    if text
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    {
+        return None;
+    }
+
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() != 1 {
+        return None;
+    }
+
+    let candidate = strip_wrapping_quotes(lines[0]);
+    let path = PathBuf::from(expand_pasted_path(candidate));
+    if !is_image_extension(&path) {
+        return None;
+    }
+    path.is_file().then_some(path)
+}
+
+fn note_image_stem(elapsed: &str) -> String {
+    format!("{}-note", elapsed.replace(':', "-"))
+}
+
+fn strip_wrapping_quotes(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+        {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+fn expand_pasted_path(value: &str) -> String {
+    let decoded = percent_decode(value);
+    let without_scheme = decoded
+        .strip_prefix("file://localhost")
+        .or_else(|| decoded.strip_prefix("file://"))
+        .map(str::to_string)
+        .unwrap_or(decoded);
+    if let Some(rest) = without_scheme.strip_prefix("~/") {
+        if let Some(home) = env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join(rest)
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    without_scheme
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Some(hex) = std::str::from_utf8(&bytes[index + 1..index + 3])
+                .ok()
+                .and_then(|text| u8::from_str_radix(text, 16).ok())
+            {
+                out.push(hex);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn is_image_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "tif" | "tiff" | "webp" | "bmp" | "heic"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn write_session_files(session: &Session) -> io::Result<()> {
@@ -145,6 +341,10 @@ fn write_session_files(session: &Session) -> io::Result<()> {
 }
 
 fn append_session_entry(path: &Path, elapsed: &str, text: &str) -> io::Result<()> {
+    append_session_line(path, &format!("- `{elapsed}` {text}"))
+}
+
+fn append_session_line(path: &Path, line: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -152,7 +352,7 @@ fn append_session_entry(path: &Path, elapsed: &str, text: &str) -> io::Result<()
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(file, "- `{}` {}", elapsed, text)
+    writeln!(file, "{line}")
 }
 
 fn read_session_created_at_unix(session_path: &Path) -> Option<u64> {
@@ -669,10 +869,12 @@ fn escape_json(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_session_marker, append_session_note, eastern_offset_hours, editor_invocation,
-        escape_json, export_session, list_sessions, mark_transcript_ready, read_session_consent,
-        readable_eastern_timestamp_for, resolve_session_target, resume_hint, slugify,
-        start_session, ConsentMode, StartOptions,
+        append_session_marker, append_session_note, append_session_note_with_images,
+        copy_image_into_session, discard_unused_note_images, eastern_offset_hours,
+        editor_invocation, escape_json, export_session, format_session_note_bullet, list_sessions,
+        mark_transcript_ready, next_note_image_relative_path, pasted_image_path,
+        read_session_consent, readable_eastern_timestamp_for, resolve_session_target, resume_hint,
+        slugify, start_session, ConsentMode, StartOptions,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -980,5 +1182,139 @@ mod tests {
             "Resume this session with:\n  recall --resume 05-26-2026_7-21pm-et-grill-supper-and-weber-gift\nOr: recall --resume latest"
         );
         assert!(resume_hint(Path::new("/")).is_none());
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    #[test]
+    fn text_only_note_bullet_has_no_image_link() {
+        assert_eq!(
+            format_session_note_bullet("00:43", "Follow up on budget", &[]),
+            Some("- `00:43` Follow up on budget".to_string())
+        );
+        assert_eq!(format_session_note_bullet("00:43", "  ", &[]), None);
+    }
+
+    #[test]
+    fn image_note_bullet_uses_root_relative_markdown_link() {
+        assert_eq!(
+            format_session_note_bullet(
+                "12:04",
+                "whiteboard",
+                &["images/12-04-note.png".to_string()]
+            ),
+            Some("- `12:04` whiteboard · [image](images/12-04-note.png)".to_string())
+        );
+        assert_eq!(
+            format_session_note_bullet("12:04", "", &["images/12-04-note.png".to_string()]),
+            Some("- `12:04` [image](images/12-04-note.png)".to_string())
+        );
+    }
+
+    #[test]
+    fn second_image_in_the_same_second_gets_a_counter_suffix() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "recall-note-image-name-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        fs::create_dir_all(session_dir.join("images")).unwrap();
+        assert_eq!(
+            next_note_image_relative_path(&session_dir, "12:04", "png"),
+            "images/12-04-note.png"
+        );
+        fs::write(session_dir.join("images/12-04-note.png"), tiny_png()).unwrap();
+        assert_eq!(
+            next_note_image_relative_path(&session_dir, "12:04", "png"),
+            "images/12-04-note-2.png"
+        );
+        fs::write(session_dir.join("images/12-04-note-2.png"), tiny_png()).unwrap();
+        assert_eq!(
+            next_note_image_relative_path(&session_dir, "12:04", "png"),
+            "images/12-04-note-3.png"
+        );
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn image_note_writes_file_and_meeting_markdown_link() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "recall-note-image-save-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        let session = start_session(&StartOptions {
+            title: "Image Note".to_string(),
+            consent: ConsentMode::Noted,
+            storage_dir: storage_dir.clone(),
+        })
+        .unwrap();
+        let source = storage_dir.join("source.png");
+        fs::write(&source, tiny_png()).unwrap();
+
+        let relative = copy_image_into_session(&session.path, "12:04", &source).unwrap();
+        assert_eq!(relative, "images/12-04-note.png");
+        append_session_note_with_images(&session.path, "12:04", "whiteboard", &[relative.clone()])
+            .unwrap();
+
+        let notes = fs::read_to_string(session.path.join(".recall/notes.md")).unwrap();
+        let meeting = fs::read_to_string(session.path.join("meeting.md")).unwrap();
+        assert!(session.path.join("images/12-04-note.png").is_file());
+        assert!(notes.contains("- `12:04` whiteboard · [image](images/12-04-note.png)"));
+        assert!(meeting.contains("[image](images/12-04-note.png)"));
+
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn discarding_unused_note_images_removes_orphans() {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "recall-note-image-discard-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        let session = start_session(&StartOptions {
+            title: "Discard Images".to_string(),
+            consent: ConsentMode::Noted,
+            storage_dir: storage_dir.clone(),
+        })
+        .unwrap();
+        let source = storage_dir.join("source.png");
+        fs::write(&source, tiny_png()).unwrap();
+        let relative = copy_image_into_session(&session.path, "12:04", &source).unwrap();
+        assert!(session.path.join(&relative).is_file());
+
+        discard_unused_note_images(&session.path, &[relative.clone()]).unwrap();
+        assert!(!session.path.join("images").exists());
+
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn pasted_image_path_ignores_non_image_text() {
+        assert!(pasted_image_path("hello from the clipboard").is_none());
+        assert!(pasted_image_path("see images/12-04-note.png later").is_none());
+
+        let storage_dir = std::env::temp_dir().join(format!(
+            "recall-pasted-image-path-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        fs::create_dir_all(&storage_dir).unwrap();
+        let image = storage_dir.join("board.png");
+        fs::write(&image, tiny_png()).unwrap();
+        assert_eq!(
+            pasted_image_path(&format!("\"{}\"", image.display())),
+            Some(image)
+        );
+        let _ = fs::remove_dir_all(storage_dir);
     }
 }
