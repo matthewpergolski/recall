@@ -294,6 +294,7 @@ recall export latest --output ~/Desktop/project-sync.md
 - `r`: refresh detected sources
 - `m`: add a timestamped marker to the session
 - `n`: type a timestamped note, then `Enter` saves it with the session
+- While the note draft is open: `Cmd+V` or `Ctrl+V` pastes a clipboard image when the terminal lets that chord through; `Ctrl+I` always inserts a clipboard image (needed in Apple Terminal). Caption text is optional. Esc cancels and deletes unused pasted files. Optional Ghostty bind: `keybind = cmd+v=unbind` so Recall sees `Cmd+V`.
 - `o`: open the session folder in Finder or the configured editor
 - `O`: open the meeting document
 - `q` or `Ctrl+C`: quit
@@ -316,6 +317,8 @@ sessions/
       call-001.m4a
       mic-002.m4a   # present after a continued take
       call-002.m4a
+    images/
+      12-04-note.png
     .recall/
       metadata.json
       markers.md
@@ -330,7 +333,7 @@ sessions/
         agent-result.json
 ```
 
-`meeting.md` is the normal reading view. `transcript.md` is the clean source record. Audio and internal/debug artifacts remain available without crowding the session root. Recall continues to recognize sessions created with the older expanded layout.
+`meeting.md` is the normal reading view. `transcript.md` is the clean source record. Pasted note images are ordinary files under `images/`, linked from `.recall/notes.md` and `meeting.md`. Audio and internal/debug artifacts remain available without crowding the session root. Recall continues to recognize sessions created with the older expanded layout.
 
 `sessions/` is ignored by Git because it contains private meeting data.
 

@@ -85,6 +85,33 @@ struct RecordSystemOptions {
     let outputName: String
 }
 
+struct ClipboardImageOptions {
+    let outURL: URL
+}
+
+struct ClipboardImageResponse: Encodable {
+    let type: String
+    let path: String?
+    let message: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case path
+        case message
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(type, forKey: .type)
+        if let path {
+            try container.encode(path, forKey: .path)
+        }
+        if let message {
+            try container.encode(message, forKey: .message)
+        }
+    }
+}
+
 final class PermissionResult: @unchecked Sendable {
     var granted = false
 }
@@ -106,6 +133,9 @@ enum CaptureError: Error, CustomStringConvertible {
     case audioObjectPropertyFailed(String, OSStatus)
     case audioFormatUnavailable
     case unsupportedOS(String)
+    case missingOutPath
+    case clipboardHasNoImage
+    case clipboardImageConversionFailed
 
     var description: String {
         switch self {
@@ -141,6 +171,12 @@ enum CaptureError: Error, CustomStringConvertible {
             return "Failed to resolve CoreAudio tap audio format"
         case .unsupportedOS(let message):
             return message
+        case .missingOutPath:
+            return "clipboard-image requires --out <path>"
+        case .clipboardHasNoImage:
+            return "Clipboard has no image"
+        case .clipboardImageConversionFailed:
+            return "Failed to convert clipboard image to PNG"
         }
     }
 }
@@ -207,6 +243,20 @@ struct RecallCapture {
                     path: nil,
                     elapsedSeconds: nil,
                     levelDb: nil,
+                    message: "\(error)"
+                ))
+                Foundation.exit(1)
+            }
+        case "clipboard-image":
+            do {
+                let options = try parseClipboardImageOptions(Array(args.dropFirst()))
+                try await MainActor.run {
+                    try clipboardImage(options)
+                }
+            } catch {
+                try printJSONLine(ClipboardImageResponse(
+                    type: "error",
+                    path: nil,
                     message: "\(error)"
                 ))
                 Foundation.exit(1)
@@ -343,6 +393,97 @@ struct RecallCapture {
             stopFile: stopFile,
             outputName: outputName
         )
+    }
+
+    private static func parseClipboardImageOptions(_ args: [String]) throws -> ClipboardImageOptions {
+        var outURL: URL?
+        var index = 0
+
+        while index < args.count {
+            let arg = args[index]
+            switch arg {
+            case "--out":
+                guard index + 1 < args.count else {
+                    throw CaptureError.missingValue(arg)
+                }
+                outURL = URL(fileURLWithPath: args[index + 1])
+                index += 2
+            default:
+                fputs("Ignoring unknown clipboard-image option: \(arg)\n", stderr)
+                index += 1
+            }
+        }
+
+        guard let outURL else {
+            throw CaptureError.missingOutPath
+        }
+
+        return ClipboardImageOptions(outURL: outURL)
+    }
+
+    @MainActor
+    private static func clipboardImage(_ options: ClipboardImageOptions) throws {
+        _ = NSApplication.shared
+        guard let image = clipboardNSImage() else {
+            throw CaptureError.clipboardHasNoImage
+        }
+        guard let png = pngData(from: image) else {
+            throw CaptureError.clipboardImageConversionFailed
+        }
+
+        let outURL = options.outURL
+        let parent = outURL.deletingLastPathComponent()
+        if !parent.path.isEmpty && parent.path != "." && parent.path != outURL.path {
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        }
+        try png.write(to: outURL, options: .atomic)
+        try printJSONLine(ClipboardImageResponse(
+            type: "ok",
+            path: outURL.path,
+            message: nil
+        ))
+    }
+
+    @MainActor
+    private static func clipboardNSImage() -> NSImage? {
+        let pasteboard = NSPasteboard.general
+        if let image = NSImage(pasteboard: pasteboard) {
+            return image
+        }
+
+        let types: [NSPasteboard.PasteboardType] = [
+            .png,
+            .tiff,
+            NSPasteboard.PasteboardType("public.jpeg"),
+            NSPasteboard.PasteboardType("public.heic"),
+        ]
+        for type in types {
+            if let data = pasteboard.data(forType: type), let image = NSImage(data: data) {
+                return image
+            }
+        }
+
+        if let urls = pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] {
+            for url in urls {
+                if let image = NSImage(contentsOf: url) {
+                    return image
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private static func pngData(from image: NSImage) -> Data? {
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff)
+        else {
+            return nil
+        }
+        return bitmap.representation(using: .png, properties: [:])
     }
 
     private static func validatedOutputName(_ value: String) throws -> String {
@@ -755,6 +896,7 @@ struct RecallCapture {
                 recall-capture record-audio-tap --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
                 recall-capture record-system --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
                 recall-capture probe-audio-tap
+                recall-capture clipboard-image --out <path>
                 recall-capture version
 
             COMMANDS:
@@ -763,6 +905,7 @@ struct RecallCapture {
                 record-audio-tap Record system audio with CoreAudio process taps into <session-dir>/audio/<output-name>.
                 record-system   Record app/system audio into <session-dir>/audio/<output-name>.
                 probe-audio-tap Probe CoreAudio's process-tap API without writing audio.
+                clipboard-image Write the macOS pasteboard image as PNG to --out.
                 version         Print helper version.
 
             NOTE:
