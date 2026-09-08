@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::audio::{generation_is_current, lock_session_publish, session_folder_is_sticky};
 use crate::session::{
     analysis_dir, default_storage_dir, list_sessions, markers_path, metadata_path, notes_path,
-    read_session_title,
+    read_session_title, session_entries,
 };
 
 #[derive(Debug, Clone)]
@@ -697,8 +697,8 @@ fn meeting_markdown(
     title: &str,
     result: &AgentMeetingResult,
 ) -> io::Result<String> {
-    let notes = read_session_entries(&notes_path(session_path))?;
-    let markers = read_session_entries(&markers_path(session_path))?;
+    let notes = session_entries(&notes_path(session_path))?;
+    let markers = session_entries(&markers_path(session_path))?;
     let mut markdown = format!(
         "# {title}\n\n> Analysis generated from the [clean transcript](transcript.md).\n\n## Summary\n\n{}\n\n",
         result
@@ -717,18 +717,6 @@ fn meeting_markdown(
         "## Source Material\n\n- [Transcript](transcript.md)\n- [Microphone audio](audio/mic.m4a)\n- [System audio](audio/call.m4a)\n",
     );
     Ok(markdown)
-}
-
-fn read_session_entries(path: &Path) -> io::Result<Vec<String>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    Ok(fs::read_to_string(path)?
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("- `"))
-        .map(str::to_string)
-        .collect())
 }
 
 fn append_captured_entries(markdown: &mut String, heading: &str, entries: &[String]) {

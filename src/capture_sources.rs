@@ -124,11 +124,18 @@ pub enum ClipboardImageOutcome {
     NoImage,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardTextOutcome {
+    Text(String),
+    NoText,
+}
+
 #[derive(Deserialize)]
 struct ClipboardImageResponse {
     #[serde(rename = "type")]
     kind: String,
     path: Option<String>,
+    text: Option<String>,
     message: Option<String>,
 }
 
@@ -152,7 +159,53 @@ pub fn write_clipboard_image(out_path: &Path) -> io::Result<ClipboardImageOutcom
     }
 }
 
-fn parse_clipboard_image_output(stdout: &[u8]) -> io::Result<ClipboardImageOutcome> {
+pub fn read_clipboard_text() -> io::Result<ClipboardTextOutcome> {
+    let output = run_helper_args(&["clipboard-text"])?;
+    match parse_clipboard_text_output(&output.stdout) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            if output.status.success() {
+                Err(error)
+            } else {
+                let stderr = command_error(&output.stderr);
+                if stderr == "helper exited with no error output" {
+                    Err(error)
+                } else {
+                    Err(io::Error::other(format!("{error}; {stderr}")))
+                }
+            }
+        }
+    }
+}
+
+fn parse_clipboard_text_output(stdout: &[u8]) -> io::Result<ClipboardTextOutcome> {
+    let parsed = parse_clipboard_json(stdout)?;
+    match parsed.kind.as_str() {
+        "ok" => {
+            let text = parsed.text.unwrap_or_default();
+            if text.trim().is_empty() {
+                Ok(ClipboardTextOutcome::NoText)
+            } else {
+                Ok(ClipboardTextOutcome::Text(text))
+            }
+        }
+        "error" => {
+            let message = parsed
+                .message
+                .unwrap_or_else(|| "clipboard helper failed".to_string());
+            if message == "Clipboard has no text" {
+                Ok(ClipboardTextOutcome::NoText)
+            } else {
+                Err(io::Error::other(message))
+            }
+        }
+        other => Err(io::Error::other(format!(
+            "unexpected clipboard helper type: {other}"
+        ))),
+    }
+}
+
+fn parse_clipboard_json(stdout: &[u8]) -> io::Result<ClipboardImageResponse> {
     let text = String::from_utf8_lossy(stdout);
     let json_line = text
         .lines()
@@ -160,8 +213,12 @@ fn parse_clipboard_image_output(stdout: &[u8]) -> io::Result<ClipboardImageOutco
         .map(str::trim)
         .find(|line| line.starts_with('{'))
         .ok_or_else(|| io::Error::other("clipboard helper returned no JSON"))?;
-    let parsed: ClipboardImageResponse = serde_json::from_str(json_line)
-        .map_err(|error| io::Error::other(format!("clipboard helper JSON: {error}")))?;
+    serde_json::from_str(json_line)
+        .map_err(|error| io::Error::other(format!("clipboard helper JSON: {error}")))
+}
+
+fn parse_clipboard_image_output(stdout: &[u8]) -> io::Result<ClipboardImageOutcome> {
+    let parsed = parse_clipboard_json(stdout)?;
     match parsed.kind.as_str() {
         "ok" => {
             let path = parsed
@@ -236,7 +293,10 @@ fn command_error(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_clipboard_image_output, parse_source_list, ClipboardImageOutcome};
+    use super::{
+        parse_clipboard_image_output, parse_clipboard_text_output, parse_source_list,
+        ClipboardImageOutcome, ClipboardTextOutcome,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -290,6 +350,16 @@ mod tests {
         assert_eq!(
             outcome,
             ClipboardImageOutcome::Saved(PathBuf::from("/tmp/images/12-04-note.png"))
+        );
+    }
+
+    #[test]
+    fn clipboard_text_helper_json_returns_text() {
+        let json = br#"{"text":"first\nsecond","type":"ok"}"#;
+        let outcome = parse_clipboard_text_output(json).unwrap();
+        assert_eq!(
+            outcome,
+            ClipboardTextOutcome::Text("first\nsecond".to_string())
         );
     }
 }

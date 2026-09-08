@@ -29,7 +29,8 @@ use crate::audio::{
     CaptureProgress,
 };
 use crate::capture_sources::{
-    detect_sources, write_clipboard_image, ClipboardImageOutcome, SourceSummary,
+    detect_sources, read_clipboard_text, write_clipboard_image, ClipboardImageOutcome,
+    ClipboardTextOutcome, SourceSummary,
 };
 use crate::mic_recorder::MicRecorder;
 use crate::session::{
@@ -317,10 +318,10 @@ struct NoteDraft {
 }
 
 impl NoteDraft {
-    fn display(&self) -> String {
-        let mut out = self.caption.clone();
+    fn chip_suffix(&self) -> String {
+        let mut out = String::new();
         for (index, _) in self.images.iter().enumerate() {
-            if !out.is_empty() && !out.ends_with(' ') {
+            if !out.is_empty() {
                 out.push(' ');
             }
             if index == 0 {
@@ -330,6 +331,37 @@ impl NoteDraft {
             }
         }
         out
+    }
+
+    fn display_lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self.caption.split('\n').map(str::to_string).collect();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let chips = self.chip_suffix();
+        if !chips.is_empty() {
+            if let Some(last) = lines.last_mut() {
+                if !last.is_empty() && !last.ends_with(' ') {
+                    last.push(' ');
+                }
+                last.push_str(&chips);
+            }
+        }
+        lines
+    }
+
+    fn preview_lines(&self, max: usize) -> Vec<String> {
+        let lines = self.display_lines();
+        if lines.len() <= max {
+            return lines;
+        }
+        let mut view = lines[lines.len() - max..].to_vec();
+        if let Some(first) = view.first_mut() {
+            if !first.starts_with('…') {
+                first.insert(0, '…');
+            }
+        }
+        view
     }
 
     fn is_empty(&self) -> bool {
@@ -563,10 +595,18 @@ impl App {
 
     fn handle_note_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.insert_note_newline();
+            }
             KeyCode::Enter => self.save_manual_note(),
             KeyCode::Esc => self.cancel_manual_note(),
             KeyCode::Backspace => self.backspace_note_draft(),
-            KeyCode::Tab => self.paste_clipboard_image(),
+            KeyCode::Tab => self.paste_clipboard_image(false),
+            KeyCode::Char('\n') | KeyCode::Char('\r') => self.insert_note_newline(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cancel_manual_note();
             }
@@ -574,10 +614,10 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     || key.modifiers.contains(KeyModifiers::SUPER) =>
             {
-                self.paste_clipboard_image();
+                self.paste_clipboard_image(true);
             }
             KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.paste_clipboard_image();
+                self.paste_clipboard_image(false);
             }
             KeyCode::Char(ch)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
@@ -587,6 +627,12 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn insert_note_newline(&mut self) {
+        if let Some(draft) = &mut self.note_draft {
+            draft.caption.push('\n');
         }
     }
 
@@ -600,12 +646,12 @@ impl App {
             return;
         }
         if let Some(draft) = &mut self.note_draft {
-            let flattened = text.replace(['\n', '\r'], " ");
-            draft.caption.push_str(&flattened);
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            draft.caption.push_str(&normalized);
         }
     }
 
-    fn paste_clipboard_image(&mut self) {
+    fn paste_clipboard_image(&mut self, allow_text: bool) {
         let Some(session_path) = self.session_path.clone() else {
             return;
         };
@@ -629,6 +675,19 @@ impl App {
             Ok(ClipboardImageOutcome::NoImage) => {
                 let _ = fs::remove_file(&dest);
                 let _ = remove_empty_images_dir(&session_path);
+                if allow_text {
+                    match read_clipboard_text() {
+                        Ok(ClipboardTextOutcome::Text(text)) => {
+                            self.handle_note_paste(&text);
+                            return;
+                        }
+                        Ok(ClipboardTextOutcome::NoText) => {}
+                        Err(error) => {
+                            self.toast = format!("Could not paste clipboard text: {error}");
+                            return;
+                        }
+                    }
+                }
                 self.toast = "Clipboard has no image. Copy a screenshot first.".to_string();
             }
             Err(error) => {
@@ -1026,9 +1085,10 @@ impl App {
             return;
         }
 
+        // Opening `n` must not read the pasteboard. Paste is explicit (Cmd+V / Ctrl+I / Paste).
         self.note_draft = Some(NoteDraft::default());
         self.toast =
-            "Type a note, then press Enter to save or Esc to cancel. Cmd+V or Ctrl+I pastes a clipboard image."
+            "Type a note, then press Enter to save or Esc to cancel. Shift+Enter adds a newline. Cmd+V or Ctrl+I pastes."
                 .to_string();
     }
 
@@ -1060,10 +1120,10 @@ impl App {
 
         let live = format_session_note_bullet(&elapsed, caption, &draft.images)
             .map(|note| {
-                if let Some(rest) = note.strip_prefix("- ") {
-                    rest.to_string()
-                } else {
-                    note
+                let body = note.strip_prefix("- ").unwrap_or(&note);
+                match body.split_once('\n') {
+                    Some((first, _)) => format!("{first} …"),
+                    None => body.to_string(),
                 }
             })
             .unwrap_or_else(|| format!("`{elapsed}` {caption}"));
@@ -1886,6 +1946,7 @@ impl App {
 
     fn render(&self, frame: &mut Frame) {
         let area = frame.area();
+        let footer_height = if self.note_draft.is_some() { 6 } else { 3 };
         let main = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1893,7 +1954,7 @@ impl App {
                 Constraint::Length(7),
                 Constraint::Min(5),
                 Constraint::Length(6),
-                Constraint::Length(3),
+                Constraint::Length(footer_height),
             ])
             .split(area);
 
@@ -2261,11 +2322,23 @@ impl App {
         }
 
         if let Some(draft) = &self.note_draft {
-            lines.push(Line::from(vec![
-                Span::styled("Note draft: ", Style::default().fg(Color::Blue)),
-                Span::raw(draft.display()),
-                Span::styled("_", Style::default().fg(Color::Blue)),
-            ]));
+            let preview = draft.preview_lines(2);
+            let last = preview.len().saturating_sub(1);
+            for (index, line) in preview.into_iter().enumerate() {
+                let mut spans = if index == 0 {
+                    vec![Span::styled(
+                        "Note draft: ",
+                        Style::default().fg(Color::Blue),
+                    )]
+                } else {
+                    vec![Span::raw("            ")]
+                };
+                spans.push(Span::raw(line));
+                if index == last {
+                    spans.push(Span::styled("_", Style::default().fg(Color::Blue)));
+                }
+                lines.push(Line::from(spans));
+            }
             lines.push(Line::raw(""));
         }
 
@@ -2433,35 +2506,44 @@ impl App {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         if let Some(draft) = &self.note_draft {
-            let text = vec![
-                Line::from(vec![
-                    Span::styled(
+            let preview = draft.preview_lines(3);
+            let last = preview.len().saturating_sub(1);
+            let mut text = Vec::new();
+            for (index, line) in preview.into_iter().enumerate() {
+                let mut spans = Vec::new();
+                if index == 0 {
+                    spans.push(Span::styled(
                         " Note > ",
                         Style::default().fg(Color::Black).bg(Color::Blue),
-                    ),
-                    Span::raw(draft.display()),
-                    Span::styled("_", Style::default().fg(Color::Blue)),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        " Enter ",
-                        Style::default().fg(Color::Black).bg(Color::Green),
-                    ),
-                    Span::raw(" save  "),
-                    Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
-                    Span::raw(" cancel  "),
-                    Span::styled(
-                        " Backspace ",
-                        Style::default().fg(Color::Black).bg(Color::Yellow),
-                    ),
-                    Span::raw(" edit  "),
-                    Span::styled(
-                        " Cmd+V / Ctrl+I ",
-                        Style::default().fg(Color::Black).bg(Color::Magenta),
-                    ),
-                    Span::raw(" paste image"),
-                ]),
-            ];
+                    ));
+                } else {
+                    spans.push(Span::raw("         "));
+                }
+                spans.push(Span::raw(line));
+                if index == last {
+                    spans.push(Span::styled("_", Style::default().fg(Color::Blue)));
+                }
+                text.push(Line::from(spans));
+            }
+            text.push(Line::from(vec![
+                Span::styled(
+                    " Enter ",
+                    Style::default().fg(Color::Black).bg(Color::Green),
+                ),
+                Span::raw(" save  "),
+                Span::styled(
+                    " Shift+Enter ",
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                ),
+                Span::raw(" newline  "),
+                Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Gray)),
+                Span::raw(" cancel  "),
+                Span::styled(
+                    " Cmd+V / Ctrl+I ",
+                    Style::default().fg(Color::Black).bg(Color::Magenta),
+                ),
+                Span::raw(" paste"),
+            ]));
             frame.render_widget(
                 Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
                 area,
@@ -3303,6 +3385,18 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_note_does_not_paste_or_create_images() {
+        let (storage, session_path) = note_session("open-empty");
+        let mut app = test_app(session_path.clone());
+        app.start_manual_note();
+        assert_eq!(app.note_draft, Some(NoteDraft::default()));
+        assert!(app.note_draft.as_ref().unwrap().caption.is_empty());
+        assert!(app.note_draft.as_ref().unwrap().images.is_empty());
+        assert!(!session_path.join("images").exists());
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
     fn text_only_note_writes_one_bullet_without_images_dir() {
         let (storage, session_path) = note_session("text-only");
         let mut app = test_app(session_path.clone());
@@ -3390,6 +3484,75 @@ mod tests {
 
         let notes = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
         assert!(notes.contains("- `12:04` just some copied text"));
+        assert!(!session_path.join("images").exists());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn multiline_paste_does_not_save_until_enter() {
+        let (storage, session_path) = note_session("multiline-paste");
+        let mut app = test_app(session_path.clone());
+        app.accumulated = Duration::from_secs(12 * 60 + 4);
+        app.start_manual_note();
+        app.handle_note_paste("first line\nsecond line");
+        assert!(app.note_draft.is_some());
+        assert_eq!(
+            app.note_draft.as_ref().unwrap().caption,
+            "first line\nsecond line"
+        );
+        let notes_before = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        assert!(!notes_before.contains("first line"));
+
+        app.handle_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let notes = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        let meeting = fs::read_to_string(session_path.join("meeting.md")).unwrap();
+        assert!(notes.contains("- `12:04` first line\n  second line"));
+        assert!(meeting.contains("first line"));
+        assert!(meeting.contains("second line"));
+        assert!(app.note_draft.is_none());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline_without_saving() {
+        let (storage, session_path) = note_session("shift-enter");
+        let mut app = test_app(session_path.clone());
+        app.accumulated = Duration::from_secs(12 * 60 + 4);
+        app.start_manual_note();
+        type_note(&mut app, "first");
+        app.handle_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        type_note(&mut app, "second");
+        assert_eq!(app.note_draft.as_ref().unwrap().caption, "first\nsecond");
+        let notes_before = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        assert!(!notes_before.contains("first"));
+
+        for _ in 0.."\nsecond".len() {
+            app.handle_note_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        assert_eq!(app.note_draft.as_ref().unwrap().caption, "first");
+
+        app.handle_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(app.note_draft.as_ref().unwrap().caption, "first\n");
+        assert!(app.note_draft.is_some());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn url_in_caption_becomes_a_markdown_link_on_save() {
+        let (storage, session_path) = note_session("url-link");
+        let mut app = test_app(session_path.clone());
+        app.accumulated = Duration::from_secs(12 * 60 + 4);
+        app.start_manual_note();
+        type_note(&mut app, "see https://example.com/foo");
+        app.handle_note_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let notes = fs::read_to_string(session_path.join(".recall/notes.md")).unwrap();
+        let meeting = fs::read_to_string(session_path.join("meeting.md")).unwrap();
+        assert!(notes.contains("- `12:04` see [https://example.com/foo](https://example.com/foo)"));
+        assert!(meeting.contains("[https://example.com/foo](https://example.com/foo)"));
         assert!(!session_path.join("images").exists());
 
         let _ = fs::remove_dir_all(storage);

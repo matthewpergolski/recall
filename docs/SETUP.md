@@ -222,6 +222,7 @@ swift run recall-capture record-audio-tap --session-dir ../sessions/<session-id>
 swift run recall-capture record-system --session-dir ../sessions/<session-id> --duration 5
 swift run recall-capture probe-audio-tap
 swift run recall-capture clipboard-image --out /tmp/recall-clipboard.png
+swift run recall-capture clipboard-text
 ```
 
 `record-mic` writes microphone audio to `<session-dir>/audio/mic.m4a`.
@@ -229,6 +230,7 @@ swift run recall-capture clipboard-image --out /tmp/recall-clipboard.png
 `record-system` is the ScreenCaptureKit fallback and may require broader Screen Recording permission.
 `probe-audio-tap` checks whether CoreAudio process taps are available.
 `clipboard-image` writes the macOS pasteboard image as PNG; it exits 1 if the clipboard has no image.
+`clipboard-text` emits the pasteboard string as JSON for Cmd+V text fallback after an image miss.
 
 ## Current Rust Dependencies
 
