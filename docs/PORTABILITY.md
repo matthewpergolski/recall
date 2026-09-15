@@ -159,7 +159,7 @@ Example stable storage config:
 storage_dir = "~/Documents/Recall/sessions"
 ```
 
-Session IDs use a 12-digit inverted UTC key, then a US Eastern `YYYY-MM-DD_HHMM` stamp, then `et`, then a slug, for example `797394737678-2026-05-26_1921-et-quick-capture`. The key is `999999999999` minus the UTC `YYYYMMDDHHMM`, so VS Code Explorer, Finder, and `ls` A-Z list newest first. The `et` marker keeps the readable stamp stable even when the project is run from another local timezone. Older ISO `YYYY-MM-DD_HHMM-et-…` and `MM-DD-YYYY_H-MMapm` folders remain valid session IDs. If agent analysis returns a useful title, Recall can rename a generic folder such as `797394737678-2026-05-26_1921-et-quick-capture` to a topic-based name such as `797394737678-2026-05-26_1921-et-rain-birthdays-and-jersey-mikes-chat`.
+Session IDs use a 12-digit inverted UTC key, then a local `YYYY-MM-DD_HHMM` stamp, then a zone token, then a slug, for example `797390917984-2026-09-08_1515-ct-mute-check`. The key is `999999999999` minus the UTC `YYYYMMDDHHMM`, so VS Code Explorer, Finder, and `ls` A-Z list newest first. Set `timezone` in `~/.config/recall/config.toml` to an IANA name; otherwise Recall detects the Mac zone and falls back to US Eastern (`et`) only if detection fails. Older ISO `YYYY-MM-DD_HHMM-et-…` and `MM-DD-YYYY_H-MMapm` folders remain valid session IDs. If agent analysis returns a useful title, Recall can rename a generic folder such as `797394737678-2026-05-26_1921-et-quick-capture` to a topic-based name such as `797394737678-2026-05-26_1921-et-rain-birthdays-and-jersey-mikes-chat`, keeping the existing zone token.
 
 ## Current Caveat
 

@@ -247,6 +247,8 @@ consent_default = "provided"
 storage_dir = "~/Documents/Recall/sessions"
 source_dir = "~/Projects/recall"
 editor = "code"
+timezone = "America/Chicago"   # IANA; optional. Omit to use the Mac zone.
+keep_audio = true              # false deletes m4as after a successful transcript, once you leave the session.
 
 [analysis]
 default_agent = "grok"
@@ -334,7 +336,9 @@ sessions/
         agent-result.json
 ```
 
-New folders are `{inverted-utc-key}-{YYYY-MM-DD_HHMM}-et-{slug}`. The 12-digit key is `999999999999` minus the UTC `YYYYMMDDHHMM`, so VS Code Explorer, Finder, and `ls` A-Z list newest first. The readable stamp stays US Eastern 24-hour time. Older ISO `YYYY-MM-DD_HHMM-et-…` and am/pm `MM-DD-YYYY_H-MMapm-et-…` folders remain valid session IDs.
+New folders are `{inverted-utc-key}-{YYYY-MM-DD_HHMM}-{zone}-{slug}`. The 12-digit key is `999999999999` minus the UTC `YYYYMMDDHHMM`, so VS Code Explorer, Finder, and `ls` A-Z list newest first. The readable stamp is 24-hour local time in `timezone` from config, the Mac IANA zone if that is omitted, or US Eastern as a last resort. The zone token comes from that instant's abbreviation (`CST`/`CDT` → `ct`, `EST`/`EDT` → `et`, `UTC` → `utc`). Older ISO `YYYY-MM-DD_HHMM-et-…` and am/pm `MM-DD-YYYY_H-MMapm-et-…` folders remain valid session IDs.
+
+`keep_audio = false` still records into `audio/` during a take. After a successful transcript, Recall unlinks those m4as once you leave the session (new folder, quit, or detached CLI transcribe). It never deletes audio while you are still in that TUI session, while recording, or if transcription failed. Resume can append a new take; earlier discarded takes stay transcript-only.
 
 `meeting.md` is the normal reading view. `transcript.md` is the clean source record. Pasted note images are ordinary files under `images/`, linked from `.recall/notes.md` and `meeting.md`. Audio and internal/debug artifacts remain available without crowding the session root. Recall continues to recognize sessions created with the older expanded layout.
 

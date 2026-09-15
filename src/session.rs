@@ -5,16 +5,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use jiff::{tz::TimeZone, Timestamp, Zoned};
 use serde_json::Value;
-use time::{Duration, Month, OffsetDateTime, Weekday};
 
 pub const INTERNAL_DIR: &str = ".recall";
+pub const FALLBACK_TIMEZONE: &str = "America/New_York";
 
 #[derive(Debug, Clone)]
 pub struct StartOptions {
     pub title: String,
     pub consent: ConsentMode,
     pub storage_dir: PathBuf,
+    pub timezone: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +66,7 @@ impl StartOptions {
             title: "Untitled meeting".to_string(),
             consent: ConsentMode::NotYet,
             storage_dir: env::current_dir()?.join("sessions"),
+            timezone: resolve_timezone(None),
         })
     }
 }
@@ -71,7 +74,7 @@ impl StartOptions {
 pub fn start_session(options: &StartOptions) -> io::Result<Session> {
     let created_at_unix = unix_timestamp();
     let slug = slugify(&options.title);
-    let id = format!("{}-et-{slug}", readable_eastern_timestamp());
+    let id = format!("{}-{slug}", readable_session_stamp(&options.timezone));
     let path = unique_session_path(&options.storage_dir, &id);
     let id = path
         .file_name()
@@ -862,78 +865,117 @@ fn unix_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
-fn readable_eastern_timestamp() -> String {
-    let now_utc = OffsetDateTime::now_utc();
-    readable_eastern_timestamp_for(now_utc)
+pub fn resolve_timezone(configured: Option<&str>) -> String {
+    if let Some(name) = configured.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(resolved) = canonical_iana_name(name) {
+            return resolved;
+        }
+    }
+    detect_system_iana_timezone().unwrap_or_else(|| FALLBACK_TIMEZONE.to_string())
 }
 
-fn readable_eastern_timestamp_for(now_utc: OffsetDateTime) -> String {
+pub fn detect_system_iana_timezone() -> Option<String> {
+    if let Ok(tz) = TimeZone::try_system() {
+        if !tz.is_unknown() {
+            if let Some(name) = tz.iana_name() {
+                if !name.is_empty() && name != "Etc/Unknown" {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    iana_name_from_localtime_symlink()
+}
+
+fn iana_name_from_localtime_symlink() -> Option<String> {
+    let target = fs::read_link("/etc/localtime").ok()?;
+    let rendered = target.to_string_lossy();
+    for marker in ["/zoneinfo/", "/tzfiles/"] {
+        if let Some((_, rest)) = rendered.rsplit_once(marker) {
+            let name = rest.trim_matches('/');
+            if !name.is_empty() {
+                if let Some(canonical) = canonical_iana_name(name) {
+                    return Some(canonical);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn canonical_iana_name(name: &str) -> Option<String> {
+    let tz = TimeZone::get(name).ok()?;
+    tz.iana_name()
+        .map(str::to_string)
+        .filter(|value| !value.is_empty() && value != "Etc/Unknown")
+        .or_else(|| Some(name.to_string()))
+}
+
+fn load_timezone(name: &str) -> TimeZone {
+    TimeZone::get(name)
+        .unwrap_or_else(|_| TimeZone::get(FALLBACK_TIMEZONE).unwrap_or(TimeZone::UTC))
+}
+
+fn readable_session_stamp(timezone: &str) -> String {
+    readable_session_stamp_for(Timestamp::now(), timezone)
+}
+
+pub fn readable_session_stamp_for(utc: Timestamp, timezone: &str) -> String {
     // Inverted UTC YYYYMMDDHHMM so A-Z folder sort is newest first, including DST fallback.
-    let key = inverted_utc_minute_key(now_utc);
-    let now = now_utc + Duration::hours(i64::from(eastern_offset_hours(now_utc)));
-    let readable = format!(
-        "{:04}-{:02}-{:02}_{:02}{:02}",
-        now.year(),
-        u8::from(now.month()),
-        now.day(),
-        now.hour(),
-        now.minute()
-    );
-    format!("{key:012}-{readable}")
+    let key = inverted_utc_minute_key(utc);
+    let tz = load_timezone(timezone);
+    let local = utc.to_zoned(tz.clone());
+    let readable = format_local_stamp(&local);
+    let abbreviation = tz.to_offset_info(utc).abbreviation().to_string();
+    let token = zone_token(&abbreviation);
+    format!("{key:012}-{readable}-{token}")
 }
 
-fn inverted_utc_minute_key(utc: OffsetDateTime) -> u64 {
+fn format_local_stamp(local: &Zoned) -> String {
+    format!(
+        "{:04}-{:02}-{:02}_{:02}{:02}",
+        local.year(),
+        local.month(),
+        local.day(),
+        local.hour(),
+        local.minute()
+    )
+}
+
+pub fn zone_token(abbreviation: &str) -> String {
+    let trimmed = abbreviation.trim();
+    if trimmed.is_empty() {
+        return "et".to_string();
+    }
+    if trimmed.eq_ignore_ascii_case("utc") || trimmed.eq_ignore_ascii_case("gmt") {
+        return "utc".to_string();
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.len() == 3 && (upper.ends_with("ST") || upper.ends_with("DT")) {
+        let first = upper.chars().next().unwrap_or('E').to_ascii_lowercase();
+        return format!("{first}t");
+    }
+    let token: String = trimmed
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .take(4)
+        .collect();
+    if token.is_empty() || !token.chars().any(|ch| ch.is_ascii_alphabetic()) {
+        "tz".to_string()
+    } else {
+        token
+    }
+}
+
+fn inverted_utc_minute_key(utc: Timestamp) -> u64 {
+    let utc = utc.to_zoned(TimeZone::UTC);
     let compact = i64::from(utc.year()) * 100_000_000
-        + i64::from(u8::from(utc.month())) * 1_000_000
+        + i64::from(utc.month()) * 1_000_000
         + i64::from(utc.day()) * 10_000
         + i64::from(utc.hour()) * 100
         + i64::from(utc.minute());
     999_999_999_999u64.saturating_sub(u64::try_from(compact).unwrap_or(0))
-}
-
-fn eastern_offset_hours(utc: OffsetDateTime) -> i8 {
-    let year = utc.year();
-    let dst_start = us_eastern_dst_start_utc(year);
-    let dst_end = us_eastern_dst_end_utc(year);
-    if utc >= dst_start && utc < dst_end {
-        -4
-    } else {
-        -5
-    }
-}
-
-fn us_eastern_dst_start_utc(year: i32) -> OffsetDateTime {
-    let day = nth_weekday_of_month_day(year, Month::March, Weekday::Sunday, 2);
-    time::Date::from_calendar_date(year, Month::March, day)
-        .expect("valid DST start date")
-        .with_hms(7, 0, 0)
-        .expect("valid DST start time")
-        .assume_utc()
-}
-
-fn us_eastern_dst_end_utc(year: i32) -> OffsetDateTime {
-    let day = nth_weekday_of_month_day(year, Month::November, Weekday::Sunday, 1);
-    time::Date::from_calendar_date(year, Month::November, day)
-        .expect("valid DST end date")
-        .with_hms(6, 0, 0)
-        .expect("valid DST end time")
-        .assume_utc()
-}
-
-fn nth_weekday_of_month_day(year: i32, month: Month, weekday: Weekday, occurrence: u8) -> u8 {
-    let mut seen = 0;
-    for day in 1..=31 {
-        let Ok(date) = time::Date::from_calendar_date(year, month, day) else {
-            break;
-        };
-        if date.weekday() == weekday {
-            seen += 1;
-            if seen == occurrence {
-                return day;
-            }
-        }
-    }
-    unreachable!("requested weekday occurrence should exist")
 }
 
 fn slugify(title: &str) -> String {
@@ -992,16 +1034,16 @@ fn escape_json(value: &str) -> String {
 mod tests {
     use super::{
         append_session_marker, append_session_note, append_session_note_with_images,
-        copy_image_into_session, discard_unused_note_images, eastern_offset_hours,
+        copy_image_into_session, detect_system_iana_timezone, discard_unused_note_images,
         editor_invocation, escape_json, export_session, format_session_note_bullet,
         linkify_note_caption, list_sessions, mark_transcript_ready, next_note_image_relative_path,
-        pasted_image_path, read_session_consent, readable_eastern_timestamp_for,
-        resolve_session_target, resume_hint, session_entries, slugify, start_session, ConsentMode,
-        StartOptions,
+        pasted_image_path, read_session_consent, readable_session_stamp_for,
+        resolve_session_target, resolve_timezone, resume_hint, session_entries, slugify,
+        start_session, zone_token, ConsentMode, StartOptions, FALLBACK_TIMEZONE,
     };
+    use jiff::{civil::date, tz::TimeZone};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use time::{Date, Month};
 
     #[test]
     fn editor_invocation_defaults_to_macos_open() {
@@ -1055,73 +1097,75 @@ mod tests {
         assert_eq!(escape_json("line\nbreak"), "line\\nbreak");
     }
 
-    #[test]
-    fn eastern_offset_obeys_us_dst_boundaries() {
-        let winter = Date::from_calendar_date(2026, Month::January, 15)
+    fn utc_at(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> jiff::Timestamp {
+        date(year, month, day)
+            .at(hour, minute, 0, 0)
+            .to_zoned(TimeZone::UTC)
             .unwrap()
-            .with_hms(12, 0, 0)
-            .unwrap()
-            .assume_utc();
-        let summer = Date::from_calendar_date(2026, Month::May, 26)
-            .unwrap()
-            .with_hms(12, 0, 0)
-            .unwrap()
-            .assume_utc();
-
-        assert_eq!(eastern_offset_hours(winter), -5);
-        assert_eq!(eastern_offset_hours(summer), -4);
+            .timestamp()
     }
 
     #[test]
-    fn formats_eastern_timestamp_for_paths() {
-        let utc = Date::from_calendar_date(2026, Month::May, 26)
-            .unwrap()
-            .with_hms(23, 21, 45)
-            .unwrap()
-            .assume_utc();
-
-        assert_eq!(
-            readable_eastern_timestamp_for(utc),
-            "797394737678-2026-05-26_1921"
+    fn chicago_afternoon_stamp_uses_ct_and_utc_sort_key() {
+        let utc = utc_at(2026, 9, 8, 20, 15);
+        let stamp = readable_session_stamp_for(utc, "America/Chicago");
+        assert_eq!(stamp, "797390917984-2026-09-08_1515-ct");
+        assert!(
+            format!("{stamp}-mute-check").contains("-ct-"),
+            "{stamp}-mute-check"
         );
+        assert!(!format!("{stamp}-mute-check").contains("-et-"));
+
+        let later = readable_session_stamp_for(utc_at(2026, 9, 8, 21, 15), "America/Chicago");
+        assert!(
+            later < stamp,
+            "later UTC must sort first: {later} vs {stamp}"
+        );
+        assert!(later.ends_with("-ct"));
     }
 
     #[test]
-    fn eastern_timestamps_sort_lexically_newest_first() {
-        let two_am = readable_eastern_timestamp_for(
-            Date::from_calendar_date(2026, Month::September, 8)
-                .unwrap()
-                .with_hms(6, 5, 0)
-                .unwrap()
-                .assume_utc(),
-        );
-        let noon = readable_eastern_timestamp_for(
-            Date::from_calendar_date(2026, Month::September, 8)
-                .unwrap()
-                .with_hms(16, 4, 0)
-                .unwrap()
-                .assume_utc(),
-        );
-        let two_pm = readable_eastern_timestamp_for(
-            Date::from_calendar_date(2026, Month::September, 8)
-                .unwrap()
-                .with_hms(18, 5, 0)
-                .unwrap()
-                .assume_utc(),
-        );
-        let three_pm = readable_eastern_timestamp_for(
-            Date::from_calendar_date(2026, Month::September, 8)
-                .unwrap()
-                .with_hms(19, 0, 0)
-                .unwrap()
-                .assume_utc(),
-        );
+    fn eastern_stamp_keeps_et_token_and_newest_first_sort() {
+        let two_am = readable_session_stamp_for(utc_at(2026, 9, 8, 6, 5), FALLBACK_TIMEZONE);
+        let noon = readable_session_stamp_for(utc_at(2026, 9, 8, 16, 4), FALLBACK_TIMEZONE);
+        let two_pm = readable_session_stamp_for(utc_at(2026, 9, 8, 18, 5), FALLBACK_TIMEZONE);
+        let three_pm = readable_session_stamp_for(utc_at(2026, 9, 8, 19, 0), FALLBACK_TIMEZONE);
 
-        assert_eq!(two_am, "797390919394-2026-09-08_0205");
-        assert_eq!(noon, "797390918395-2026-09-08_1204");
-        assert_eq!(two_pm, "797390918194-2026-09-08_1405");
-        assert_eq!(three_pm, "797390918099-2026-09-08_1500");
+        assert_eq!(two_am, "797390919394-2026-09-08_0205-et");
+        assert_eq!(noon, "797390918395-2026-09-08_1204-et");
+        assert_eq!(two_pm, "797390918194-2026-09-08_1405-et");
+        assert_eq!(three_pm, "797390918099-2026-09-08_1500-et");
         assert!(three_pm < two_pm && two_pm < noon && noon < two_am);
+    }
+
+    #[test]
+    fn detection_without_config_returns_iana_or_eastern_fallback() {
+        let detected = detect_system_iana_timezone();
+        if let Some(name) = &detected {
+            assert!(!name.is_empty());
+            assert!(TimeZone::get(name).is_ok(), "detected {name}");
+        }
+        let resolved = resolve_timezone(None);
+        assert!(!resolved.is_empty());
+        assert!(TimeZone::get(&resolved).is_ok() || resolved == FALLBACK_TIMEZONE);
+    }
+
+    #[test]
+    fn invalid_timezone_does_not_crash() {
+        let resolved = resolve_timezone(Some("Not/A Zone"));
+        assert!(!resolved.is_empty());
+        assert_ne!(resolved, "Not/A Zone");
+        let stamp = readable_session_stamp_for(utc_at(2026, 9, 8, 20, 15), "bogus/zone");
+        assert!(
+            stamp.ends_with("-et") || stamp.ends_with("-utc"),
+            "fallback stamp: {stamp}"
+        );
+        assert_eq!(zone_token("CDT"), "ct");
+        assert_eq!(zone_token("CST"), "ct");
+        assert_eq!(zone_token("UTC"), "utc");
+        assert_eq!(zone_token("CEST"), "cest");
+        assert_eq!(zone_token("-05"), "tz");
+        assert_eq!(zone_token("GMT+5"), "gmt5");
     }
 
     #[test]
@@ -1178,9 +1222,16 @@ mod tests {
             title: "Layout Test".to_string(),
             consent: ConsentMode::Noted,
             storage_dir: storage_dir.clone(),
+            timezone: "America/Chicago".to_string(),
         })
         .unwrap();
 
+        assert!(
+            session.id.contains("-ct-"),
+            "Chicago session should use ct token: {}",
+            session.id
+        );
+        assert!(!session.id.contains("-et-"), "{}", session.id);
         assert!(session.path.join("meeting.md").exists());
         assert!(session.path.join("transcript.md").exists());
         assert!(session.path.join("audio").is_dir());
@@ -1483,6 +1534,7 @@ mod tests {
             title: "Image Note".to_string(),
             consent: ConsentMode::Noted,
             storage_dir: storage_dir.clone(),
+            timezone: FALLBACK_TIMEZONE.to_string(),
         })
         .unwrap();
         let source = storage_dir.join("source.png");
@@ -1513,6 +1565,7 @@ mod tests {
             title: "Discard Images".to_string(),
             consent: ConsentMode::Noted,
             storage_dir: storage_dir.clone(),
+            timezone: FALLBACK_TIMEZONE.to_string(),
         })
         .unwrap();
         let source = storage_dir.join("source.png");

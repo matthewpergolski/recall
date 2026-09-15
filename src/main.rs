@@ -17,7 +17,7 @@ use capture_sources::{detect_sources, probe_audio_tap};
 use config::{config_path, RecallConfig};
 use session::{
     default_storage_dir, export_session, latest_session, list_sessions, open_path,
-    primary_document_path, resume_hint, start_session, ConsentMode, StartOptions,
+    primary_document_path, resolve_timezone, resume_hint, start_session, ConsentMode, StartOptions,
 };
 use transcription::{
     find_parakeet_binary, format_bytes, format_model_download_label, parakeet_binary_doctor_level,
@@ -194,6 +194,10 @@ fn run_tui_with_options(options: TuiOptions) {
                     println!("  {}", session_path.display());
                     println!("    log: {}", log_path.display());
                 }
+            }
+            if let Some(notice) = exit.notice {
+                println!();
+                println!("{notice}");
             }
             if let Some(path) = exit.session_path {
                 if let Some(hint) = resume_hint(&path) {
@@ -868,6 +872,8 @@ fn tui_options_from_config(config: &RecallConfig) -> TuiOptions {
     if let Some(preset) = &config.analysis.preset {
         options.preset = preset.clone();
     }
+    options.timezone = resolve_timezone(config.timezone.as_deref());
+    options.keep_audio = config.keep_audio.unwrap_or(true);
     options
 }
 
@@ -878,6 +884,7 @@ fn parse_start_options(
     let mut options = StartOptions::default_for_cwd()
         .map_err(|error| format!("Failed to resolve current directory: {error}"))?;
     options.title = tui_defaults.title.clone();
+    options.timezone = tui_defaults.timezone.clone();
     if let Some(storage_dir) = &tui_defaults.storage_dir {
         options.storage_dir = storage_dir.clone();
     }
@@ -1042,6 +1049,7 @@ fn parse_transcribe_options(
         keep_wav,
         require_parakeet,
         generation,
+        keep_audio: tui_defaults.keep_audio,
     })
 }
 

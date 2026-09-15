@@ -11,6 +11,8 @@ pub struct RecallConfig {
     pub storage_dir: Option<PathBuf>,
     pub source_dir: Option<PathBuf>,
     pub editor: Option<String>,
+    pub timezone: Option<String>,
+    pub keep_audio: Option<bool>,
     pub analysis: AnalysisConfig,
     pub transcription: TranscriptionConfig,
 }
@@ -89,6 +91,12 @@ impl RecallConfig {
                 }
                 ("", "editor") => {
                     config.editor = parse_string(value);
+                }
+                ("", "timezone") => {
+                    config.timezone = parse_string(value).filter(|value| !value.trim().is_empty());
+                }
+                ("", "keep_audio") => {
+                    config.keep_audio = parse_bool(value);
                 }
                 ("analysis", "default_agent") => {
                     config.analysis.default_agent = parse_string(value);
@@ -209,6 +217,8 @@ mod tests {
             storage_dir = "~/Recall/Sessions"
             source_dir = "~/Projects/recall"
             editor = "code"
+            timezone = "America/Chicago"
+            keep_audio = false
 
             [analysis]
             default_agent = "grok"
@@ -231,6 +241,8 @@ mod tests {
         assert!(config.storage_dir.is_some());
         assert!(config.source_dir.is_some());
         assert_eq!(config.editor.as_deref(), Some("code"));
+        assert_eq!(config.timezone.as_deref(), Some("America/Chicago"));
+        assert_eq!(config.keep_audio, Some(false));
         assert_eq!(config.analysis.default_agent.as_deref(), Some("grok"));
         assert_eq!(config.analysis.auto_analyze, Some(true));
         assert_eq!(config.analysis.preset.as_deref(), Some("work"));

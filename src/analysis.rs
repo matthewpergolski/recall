@@ -514,7 +514,7 @@ fn rename_session_dir_for_title(session_path: &Path, title: &str) -> io::Result<
     };
 
     let slug = title_slug(title);
-    let base_name = format!("{prefix}-et-{slug}");
+    let base_name = format!("{prefix}-{slug}");
     let target = unique_session_path(parent, &base_name);
 
     if target == session_path {
@@ -526,18 +526,90 @@ fn rename_session_dir_for_title(session_path: &Path, title: &str) -> io::Result<
 }
 
 fn session_timestamp_prefix(name: &str) -> Option<String> {
-    if let Some((prefix, _rest)) = name.split_once("-et-") {
-        if prefix.is_empty() {
-            return None;
-        }
-        return compact_timestamp_to_iso(prefix).or_else(|| Some(prefix.to_string()));
-    }
-
-    compact_timestamp_to_iso(name)
+    parse_keyed_iso_zone_prefix(name)
+        .or_else(|| parse_iso_zone_prefix(name))
+        .or_else(|| parse_ampm_zone_prefix(name))
+        .or_else(|| compact_timestamp_to_iso(name))
 }
 
-fn compact_timestamp_to_iso(prefix: &str) -> Option<String> {
-    let name = prefix;
+fn parse_keyed_iso_zone_prefix(name: &str) -> Option<String> {
+    let bytes = name.as_bytes();
+    if bytes.len() < 13 || !bytes[..12].iter().all(u8::is_ascii_digit) || bytes[12] != b'-' {
+        return None;
+    }
+    let key = &name[..12];
+    let stamp_zone = parse_iso_zone_prefix(&name[13..])?;
+    Some(format!("{key}-{stamp_zone}"))
+}
+
+fn parse_iso_zone_prefix(name: &str) -> Option<String> {
+    if !is_iso_stamp(name.get(..15)?) {
+        return None;
+    }
+    let stamp = &name[..15];
+    let zone = zone_token_from_rest(&name[15..])?;
+    Some(format!("{stamp}-{zone}"))
+}
+
+fn is_iso_stamp(stamp: &str) -> bool {
+    let bytes = stamp.as_bytes();
+    bytes.len() == 15
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[10] == b'_'
+        && bytes[11..15].iter().all(u8::is_ascii_digit)
+}
+
+fn parse_ampm_zone_prefix(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let ampm_at = lower.find("am-").or_else(|| lower.find("pm-"))?;
+    let stamp_end = ampm_at + 2;
+    let stamp = name.get(..stamp_end)?;
+    if !looks_like_ampm_stamp(stamp) {
+        return None;
+    }
+    let zone = zone_token_from_rest(name.get(stamp_end..)?)?;
+    Some(format!("{stamp}-{zone}"))
+}
+
+fn looks_like_ampm_stamp(stamp: &str) -> bool {
+    let lower = stamp.to_ascii_lowercase();
+    let Some((date, time)) = lower.split_once('_') else {
+        return false;
+    };
+    let clock = if let Some(clock) = time.strip_suffix("am") {
+        clock
+    } else if let Some(clock) = time.strip_suffix("pm") {
+        clock
+    } else {
+        return false;
+    };
+    let date_parts = date.split('-').collect::<Vec<_>>();
+    date_parts.len() == 3
+        && date_parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+        && !clock.is_empty()
+        && clock
+            .split('-')
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn zone_token_from_rest(rest: &str) -> Option<&str> {
+    let rest = rest.strip_prefix('-')?;
+    let token = rest.split('-').next()?;
+    is_zone_token(token).then_some(token)
+}
+
+fn is_zone_token(token: &str) -> bool {
+    let len = token.len();
+    (1..=4).contains(&len) && token.chars().all(|ch| ch.is_ascii_alphabetic())
+}
+
+fn compact_timestamp_to_iso(name: &str) -> Option<String> {
     let bytes = name.as_bytes();
     if bytes.len() < 15 {
         return None;
@@ -558,7 +630,11 @@ fn compact_timestamp_to_iso(prefix: &str) -> Option<String> {
     let hm: u64 = name[9..13].parse().ok()?;
     let compact = date * 10_000 + hm;
     let key = 999_999_999_999u64.checked_sub(compact)?;
-    Some(format!("{key:012}-{year}-{month}-{day}_{hour}{minute}"))
+    let iso = format!("{key:012}-{year}-{month}-{day}_{hour}{minute}");
+    match zone_token_from_rest(name.get(15..).unwrap_or("")) {
+        Some(zone) => Some(format!("{iso}-{zone}")),
+        None => Some(iso),
+    }
 }
 
 fn unique_session_path(parent: &Path, base_name: &str) -> PathBuf {
@@ -878,23 +954,27 @@ mod tests {
         );
         assert_eq!(
             session_timestamp_prefix("20260526-185332-et-rain-chat"),
-            Some("797394738146-2026-05-26_1853".to_string())
+            Some("797394738146-2026-05-26_1853-et".to_string())
         );
         assert_eq!(
             session_timestamp_prefix("05-26-2026_7-21pm-et-rain-chat"),
-            Some("05-26-2026_7-21pm".to_string())
+            Some("05-26-2026_7-21pm-et".to_string())
         );
         assert_eq!(
             session_timestamp_prefix("2026-09-08_1405-et-release-version"),
-            Some("2026-09-08_1405".to_string())
+            Some("2026-09-08_1405-et".to_string())
         );
         assert_eq!(
             session_timestamp_prefix("797390918099-2026-09-08_1500-et-empty-quick-capture"),
-            Some("797390918099-2026-09-08_1500".to_string())
+            Some("797390918099-2026-09-08_1500-et".to_string())
         );
         assert_eq!(
             session_timestamp_prefix("797394737678-2026-05-26_1921-et-design-sync"),
-            Some("797394737678-2026-05-26_1921".to_string())
+            Some("797394737678-2026-05-26_1921-et".to_string())
+        );
+        assert_eq!(
+            session_timestamp_prefix("797390917984-2026-09-08_1515-ct-old-slug"),
+            Some("797390917984-2026-09-08_1515-ct".to_string())
         );
         assert_eq!(
             title_slug("Rain, Birthdays and Jersey Mike's Chat"),
@@ -1013,6 +1093,7 @@ mod tests {
                 take_count: 2,
                 completed_take: 1,
                 elapsed_ms: 0,
+                transcribed_take: 0,
             },
         )
         .unwrap();
@@ -1021,6 +1102,42 @@ mod tests {
         assert_eq!(renamed, session);
         assert!(session.exists());
         assert!(!storage.join("05-26-2026_7-21pm-et-better-title").exists());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn retitle_keeps_ct_zone_token_and_replaces_only_the_slug() {
+        let storage = std::env::temp_dir().join(format!("recall-ct-rename-{}", std::process::id()));
+        let session = storage.join("797390917984-2026-09-08_1515-ct-old-slug");
+        fs::create_dir_all(&session).unwrap();
+        assert_eq!(
+            session_timestamp_prefix("797390917984-2026-09-08_1515-ct-old-slug"),
+            Some("797390917984-2026-09-08_1515-ct".to_string())
+        );
+
+        let renamed = maybe_rename_session_dir_for_title(&session, "Mute Check").unwrap();
+        assert_eq!(
+            renamed.file_name().and_then(|name| name.to_str()),
+            Some("797390917984-2026-09-08_1515-ct-mute-check")
+        );
+        assert!(!session.exists());
+        assert!(renamed.exists());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn retitle_still_parses_old_et_prefixes() {
+        let storage = std::env::temp_dir().join(format!("recall-et-rename-{}", std::process::id()));
+        let session = storage.join("797394737678-2026-05-26_1921-et-design-sync");
+        fs::create_dir_all(&session).unwrap();
+
+        let renamed = maybe_rename_session_dir_for_title(&session, "Better Title").unwrap();
+        assert_eq!(
+            renamed.file_name().and_then(|name| name.to_str()),
+            Some("797394737678-2026-05-26_1921-et-better-title")
+        );
 
         let _ = fs::remove_dir_all(storage);
     }

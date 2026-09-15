@@ -126,6 +126,8 @@ Example:
 ```toml
 consent_default = "provided"
 storage_dir = "~/Documents/Recall/sessions"
+timezone = "America/Chicago"
+keep_audio = true
 
 [analysis]
 default_agent = "grok"

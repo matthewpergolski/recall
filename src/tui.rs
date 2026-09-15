@@ -26,8 +26,9 @@ use crate::analysis::{
     analyze, known_agents, maybe_rename_session_dir_for_title, AnalyzeOptions, AnalyzeTarget,
 };
 use crate::audio::{
-    acquire_capture_lock, copy_take1_aliases, next_take_index, prepare_continued_take,
-    read_capture_progress, resume_block_reason, write_capture_progress, AudioTrack, CaptureLock,
+    acquire_capture_lock, copy_take1_aliases, earlier_takes_are_transcript_only,
+    maybe_discard_session_audio, next_take_index, prepare_continued_take, read_capture_progress,
+    resume_block_reason, write_capture_progress, AudioRetention, AudioTrack, CaptureLock,
     CaptureProgress,
 };
 use crate::capture_sources::{
@@ -40,7 +41,8 @@ use crate::session::{
     copy_image_into_session, default_storage_dir, discard_unused_note_images,
     format_session_note_bullet, internal_dir, next_note_image_relative_path, open_path,
     pasted_image_path, primary_document_path, read_session_consent, read_session_title,
-    remove_empty_images_dir, resolve_session_target, start_session, ConsentMode, StartOptions,
+    remove_empty_images_dir, resolve_session_target, resolve_timezone, start_session, ConsentMode,
+    StartOptions,
 };
 use crate::system_recorder::SystemRecorder;
 use crate::transcription::{
@@ -101,6 +103,8 @@ pub struct TuiOptions {
     pub preset: String,
     pub editor: Option<String>,
     pub resume: Option<ResumeTarget>,
+    pub timezone: String,
+    pub keep_audio: bool,
 }
 
 impl Default for TuiOptions {
@@ -123,6 +127,8 @@ impl Default for TuiOptions {
             preset: "general".to_string(),
             editor: None,
             resume: None,
+            timezone: resolve_timezone(None),
+            keep_audio: true,
         }
     }
 }
@@ -168,6 +174,7 @@ pub(crate) fn prepare_resume(
 pub struct TuiExit {
     pub session_path: Option<PathBuf>,
     pub detached_logs: Vec<(PathBuf, PathBuf)>,
+    pub notice: Option<String>,
 }
 
 pub fn run_with_options(options: TuiOptions) -> io::Result<TuiExit> {
@@ -263,6 +270,9 @@ struct App {
     append_next: bool,
     capture_lock: Option<CaptureLock>,
     detached_logs: Vec<(PathBuf, PathBuf)>,
+    timezone: String,
+    keep_audio: bool,
+    quit_notice: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -979,6 +989,9 @@ impl App {
             append_next: true,
             capture_lock: None,
             detached_logs: Vec::new(),
+            timezone: options.timezone,
+            keep_audio: options.keep_audio,
+            quit_notice: None,
         };
         if let Some(resume) = resume {
             app.apply_resume(resume);
@@ -1003,6 +1016,9 @@ impl App {
         self.toast = format!(
             "Resumed {id}. Enter appends take {next_take}. Clock continues from {clock} (break not added)."
         );
+        if earlier_takes_are_transcript_only(&resume.path) {
+            self.toast.push_str(" Earlier takes are transcript-only.");
+        }
         self.live_notes = vec![
             format!("Resumed {}", resume.path.display()),
             format!(
@@ -1040,6 +1056,7 @@ impl App {
                         return Ok(TuiExit {
                             session_path: self.session_path.clone(),
                             detached_logs: self.detached_logs.clone(),
+                            notice: self.quit_notice.clone(),
                         });
                     }
                     Event::Paste(text) if self.note_draft.is_some() => {
@@ -1106,10 +1123,29 @@ impl App {
                     return Ok(false);
                 }
             }
+        } else if matches!(self.state, CaptureState::Ended) {
+            if let Some(session_path) = self.session_path.clone() {
+                if self.discard_left_session_audio(&session_path) {
+                    self.toast = "Audio discarded after transcript.".to_string();
+                    self.quit_notice = Some(self.toast.clone());
+                }
+            }
         }
         self.stop_recorders();
         self.capture_lock = None;
         Ok(true)
+    }
+
+    fn discard_left_session_audio(&self, session_path: &Path) -> bool {
+        maybe_discard_session_audio(
+            session_path,
+            AudioRetention {
+                keep_audio: self.keep_audio,
+                is_recording: false,
+                is_open_session: false,
+            },
+        )
+        .unwrap_or(false)
     }
 
     fn detach_background_jobs(&mut self) -> io::Result<Vec<(PathBuf, PathBuf)>> {
@@ -1522,6 +1558,13 @@ impl App {
         self.transcription_status = TranscriptionStatus::idle();
         self.analysis_status = AnalysisStatus::idle();
 
+        if let Some(previous) = self.session_path.clone() {
+            if self.discard_left_session_audio(&previous) {
+                self.live_notes
+                    .push("Audio discarded after transcript.".to_string());
+            }
+        }
+
         let options = StartOptions {
             title: capture_title,
             consent: if self.consent_noted {
@@ -1530,6 +1573,7 @@ impl App {
                 ConsentMode::NotYet
             },
             storage_dir: self.storage_dir.clone(),
+            timezone: self.timezone.clone(),
         };
         let session = start_session(&options)?;
 
@@ -1574,6 +1618,7 @@ impl App {
                     take_count: 1,
                     completed_take: 0,
                     elapsed_ms: 0,
+                    transcribed_take: 0,
                 },
             );
             self.state = CaptureState::Recording;
@@ -1638,23 +1683,29 @@ impl App {
             self.ended_at = Some(Instant::now());
             self.toast = format!("Could not continue this session: {}", failures.join("; "));
         } else {
+            let existing = read_capture_progress(&session_path);
             let _ = write_capture_progress(
                 &session_path,
                 CaptureProgress {
                     take_count: continued.take_index,
                     completed_take: self.completed_take,
                     elapsed_ms: self.elapsed().as_millis() as u64,
+                    transcribed_take: existing.transcribed_take,
                 },
             );
             self.started_at = Some(Instant::now());
             self.state = CaptureState::Recording;
             self.reset_analysis_gauge_for_new_take();
-            self.toast = if self.has_background_jobs() {
+            let mut toast = if self.has_background_jobs() {
                 "Continuing this session. Previous transcript still running in the background."
                     .to_string()
             } else {
                 "Continuing this session. New audio will append.".to_string()
             };
+            if earlier_takes_are_transcript_only(&session_path) {
+                toast.push_str(" Earlier takes are transcript-only.");
+            }
+            self.toast = toast;
             self.live_notes.push(if included_break {
                 "Continuing this session (audio appends; clock includes the break).".to_string()
             } else {
@@ -1769,12 +1820,14 @@ impl App {
                     .retain(|note| !note.contains("Press Enter to end"));
                 self.replace_next_action_notes();
                 if let Some(session_path) = &self.session_path {
+                    let existing = read_capture_progress(session_path);
                     if let Err(error) = write_capture_progress(
                         session_path,
                         CaptureProgress {
                             take_count: self.take_index.max(1),
                             completed_take: self.completed_take,
                             elapsed_ms: self.elapsed().as_millis() as u64,
+                            transcribed_take: existing.transcribed_take,
                         },
                     ) {
                         self.toast = format!(
@@ -2218,6 +2271,7 @@ impl App {
                 keep_wav: false,
                 require_parakeet,
                 generation: Some(generation),
+                keep_audio: true,
             };
 
             let progress_sender = sender.clone();
@@ -2297,6 +2351,10 @@ impl App {
                             "Transcript ready for {}.",
                             Self::session_label(&session_path)
                         ));
+                        if published && self.discard_left_session_audio(&session_path) {
+                            self.live_notes
+                                .push("Audio discarded after transcript.".to_string());
+                        }
                     }
                     if apply && self.auto_analyze {
                         self.start_analysis_job(session_path, generation);
@@ -3695,6 +3753,9 @@ mod tests {
             append_next: true,
             capture_lock: None,
             detached_logs: Vec::new(),
+            timezone: crate::session::FALLBACK_TIMEZONE.to_string(),
+            keep_audio: true,
+            quit_notice: None,
         }
     }
 
@@ -3982,6 +4043,7 @@ mod tests {
             title: "Design Sync".to_string(),
             consent: ConsentMode::Noted,
             storage_dir: storage.clone(),
+            timezone: crate::session::FALLBACK_TIMEZONE.to_string(),
         })
         .unwrap();
         let audio = session.path.join("audio");
@@ -3994,6 +4056,7 @@ mod tests {
                 take_count: 1,
                 completed_take: 1,
                 elapsed_ms: 724_000,
+                transcribed_take: 0,
             },
         )
         .unwrap();
@@ -4017,6 +4080,7 @@ mod tests {
         assert!(app.toast.contains("take 2"));
         assert!(app.toast.contains("12:04"));
         assert!(app.toast.contains("break not added"));
+        assert!(!app.toast.contains("transcript-only"));
 
         let continued = prepare_continued_take(&session.path).unwrap();
         assert_eq!(continued.take_index, 2);
@@ -4028,6 +4092,93 @@ mod tests {
                 .count(),
             1
         );
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn resume_with_discarded_audio_allows_a_new_take_and_toasts_transcript_only() {
+        let storage = std::env::temp_dir().join(format!(
+            "recall-tui-resume-discarded-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let session = start_session(&StartOptions {
+            title: "Mute Check".to_string(),
+            consent: ConsentMode::Noted,
+            storage_dir: storage.clone(),
+            timezone: crate::session::FALLBACK_TIMEZONE.to_string(),
+        })
+        .unwrap();
+        fs::write(
+            session.path.join("transcript.md"),
+            "# Transcript\n\nGenerated by local Whisper transcription.\n",
+        )
+        .unwrap();
+        write_capture_progress(
+            &session.path,
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 1,
+                elapsed_ms: 12_000,
+                transcribed_take: 0,
+            },
+        )
+        .unwrap();
+        let _ = fs::remove_file(session.path.join("audio/mic-001.m4a"));
+        let _ = fs::remove_file(session.path.join("audio/call-001.m4a"));
+
+        let prepared = prepare_resume(&storage, &ResumeTarget::Latest, false).unwrap();
+        let mut app = test_app(session.path.clone());
+        app.apply_resume(prepared);
+        assert!(app.toast.contains("transcript-only"));
+        assert_eq!(
+            next_recording_action(app.state, app.session_path.is_some(), app.append_next),
+            RecordingAction::Continue
+        );
+        let continued = prepare_continued_take(&session.path).unwrap();
+        assert_eq!(continued.take_index, 2);
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn quit_from_ended_session_discards_audio_when_keep_audio_is_false() {
+        let storage = std::env::temp_dir().join(format!(
+            "recall-tui-quit-discard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let session = start_session(&StartOptions {
+            title: "Quit Discard".to_string(),
+            consent: ConsentMode::Noted,
+            storage_dir: storage.clone(),
+            timezone: crate::session::FALLBACK_TIMEZONE.to_string(),
+        })
+        .unwrap();
+        fs::write(session.path.join("audio/mic-001.m4a"), b"mic").unwrap();
+        fs::write(
+            session.path.join("transcript.md"),
+            "# Transcript\n\nGenerated by local Whisper transcription.\n",
+        )
+        .unwrap();
+        let mut app = test_app(session.path.clone());
+        app.keep_audio = false;
+        app.state = CaptureState::Ended;
+        assert!(app.request_quit().unwrap());
+        assert_eq!(
+            app.quit_notice.as_deref(),
+            Some("Audio discarded after transcript.")
+        );
+        assert!(!session.path.join("audio/mic-001.m4a").exists());
+        assert!(session.path.join("audio").is_dir());
+        assert!(session.path.join("transcript.md").exists());
 
         let _ = fs::remove_dir_all(storage);
     }
@@ -4046,6 +4197,7 @@ mod tests {
             title: "Busy".to_string(),
             consent: ConsentMode::Noted,
             storage_dir: storage.clone(),
+            timezone: crate::session::FALLBACK_TIMEZONE.to_string(),
         })
         .unwrap();
         write_capture_progress(
@@ -4054,6 +4206,7 @@ mod tests {
                 take_count: 1,
                 completed_take: 0,
                 elapsed_ms: 1_000,
+                transcribed_take: 0,
             },
         )
         .unwrap();
@@ -4076,6 +4229,7 @@ mod tests {
                 take_count: 1,
                 completed_take: 1,
                 elapsed_ms: 60_000,
+                transcribed_take: 0,
             },
         });
         assert_eq!(app.elapsed_label(), "01:00");
@@ -4202,6 +4356,7 @@ mod tests {
             title: "Note Images".to_string(),
             consent: ConsentMode::Noted,
             storage_dir: storage.clone(),
+            timezone: crate::session::FALLBACK_TIMEZONE.to_string(),
         })
         .unwrap();
         (storage, session.path)

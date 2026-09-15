@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::audio::{
     concat_audio_segments, discover_track_segments, generation_is_current, lock_session_publish,
-    refresh_track_alias, AudioTrack,
+    maybe_discard_session_audio, refresh_track_alias, AudioRetention, AudioTrack,
 };
 use crate::session::{
     default_storage_dir, list_sessions, mark_transcript_ready, read_session_title,
@@ -117,6 +117,7 @@ pub struct TranscribeOptions {
     pub keep_wav: bool,
     pub require_parakeet: bool,
     pub generation: Option<u32>,
+    pub keep_audio: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -620,12 +621,24 @@ where
         started.elapsed(),
     )?;
     mark_transcript_ready(&session_path)?;
+    let _ = crate::audio::mark_audio_transcribed(&session_path);
     refresh_published_aliases(&session_path, &track_results)?;
 
     progress(TranscriptionProgress::Finished {
         transcript_path: transcript_path.clone(),
         elapsed_secs: elapsed_secs(),
     });
+
+    if !options.keep_audio {
+        let _ = maybe_discard_session_audio(
+            &session_path,
+            AudioRetention {
+                keep_audio: false,
+                is_recording: false,
+                is_open_session: false,
+            },
+        );
+    }
 
     Ok(TranscribeResult {
         session_path,
