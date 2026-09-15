@@ -28,6 +28,8 @@ pub struct CaptureProgress {
     pub completed_take: u32,
     #[serde(default)]
     pub elapsed_ms: u64,
+    #[serde(default)]
+    pub transcribed_take: u32,
 }
 
 impl CaptureProgress {
@@ -353,6 +355,8 @@ pub fn next_take_index(session_path: &Path) -> u32 {
         .filter_map(|path| segment_take_index(&path))
         .max()
         .unwrap_or(0);
+    let from_progress = read_capture_progress(session_path).take_count;
+    let max_numbered = max_numbered.max(from_progress);
     if max_numbered > 0 {
         return max_numbered + 1;
     }
@@ -382,6 +386,98 @@ pub fn discover_track_segments(
     } else {
         Vec::new()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioRetention {
+    pub keep_audio: bool,
+    pub is_recording: bool,
+    pub is_open_session: bool,
+}
+
+pub fn session_has_successful_transcript(session_path: &Path) -> bool {
+    let path = session_path.join("transcript.md");
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let trimmed = contents.trim();
+    !trimmed.is_empty() && !contents.contains("Transcript will appear here after audio capture")
+}
+
+pub fn mark_audio_transcribed(session_path: &Path) -> io::Result<CaptureProgress> {
+    let mut progress = read_capture_progress(session_path);
+    progress.transcribed_take = progress.completed_take.max(progress.take_count);
+    // Caller (transcribe) already holds SessionPublishLock; do not reacquire.
+    write_capture_progress_unlocked(session_path, progress)
+}
+
+fn transcript_covers_latest_take(session_path: &Path) -> bool {
+    if !session_has_successful_transcript(session_path) {
+        return false;
+    }
+    let progress = read_capture_progress(session_path);
+    if progress.take_in_progress() {
+        return false;
+    }
+    let latest = progress.completed_take.max(progress.take_count);
+    if progress.transcribed_take > 0 {
+        return progress.transcribed_take >= latest;
+    }
+    latest <= 1
+}
+
+pub fn maybe_discard_session_audio(
+    session_path: &Path,
+    retention: AudioRetention,
+) -> io::Result<bool> {
+    if retention.keep_audio || retention.is_recording || retention.is_open_session {
+        return Ok(false);
+    }
+    if !transcript_covers_latest_take(session_path) {
+        return Ok(false);
+    }
+    discard_audio_files(session_path)
+}
+
+fn discard_audio_files(session_path: &Path) -> io::Result<bool> {
+    let dir = audio_dir(session_path);
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    let mut removed = false;
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "m4a") {
+            fs::remove_file(&path)?;
+            removed = true;
+        }
+    }
+    Ok(removed)
+}
+
+pub fn earlier_takes_are_transcript_only(session_path: &Path) -> bool {
+    let progress = read_capture_progress(session_path);
+    let completed = progress.completed_take.max(progress.take_count);
+    if completed == 0 {
+        return false;
+    }
+    let dir = audio_dir(session_path);
+    for take in 1..=completed {
+        let mic = dir.join(AudioTrack::Mic.segment_name(take));
+        let call = dir.join(AudioTrack::Call.segment_name(take));
+        if mic.exists() || call.exists() {
+            continue;
+        }
+        if take == 1 {
+            let mic_alias = dir.join(AudioTrack::Mic.alias_name());
+            let call_alias = dir.join(AudioTrack::Call.alias_name());
+            if mic_alias.exists() || call_alias.exists() {
+                continue;
+            }
+        }
+        return true;
+    }
+    false
 }
 
 pub fn concat_audio_segments(ffmpeg: &Path, segments: &[PathBuf], output: &Path) -> io::Result<()> {
@@ -538,13 +634,14 @@ fn segment_take_index(path: &Path) -> Option<u32> {
 mod tests {
     use super::{
         acquire_capture_lock, capture_lock_path, discover_track_segments, ffmpeg_concat_list,
-        next_take_index, prepare_continued_take, promote_legacy_aliases_to_take1,
-        read_capture_progress, remove_lock_if_identity_matches, resume_block_reason,
-        session_folder_is_sticky, write_capture_progress, AudioTrack, CaptureProgress,
+        lock_session_publish, mark_audio_transcribed, maybe_discard_session_audio, next_take_index,
+        prepare_continued_take, promote_legacy_aliases_to_take1, read_capture_progress,
+        remove_lock_if_identity_matches, resume_block_reason, session_folder_is_sticky,
+        write_capture_progress, AudioRetention, AudioTrack, CaptureProgress,
     };
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn unique_session_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -618,6 +715,7 @@ mod tests {
                 take_count: 1,
                 completed_take: 1,
                 elapsed_ms: 0,
+                transcribed_take: 0,
             },
         )
         .unwrap();
@@ -679,6 +777,7 @@ mod tests {
                 take_count: 2,
                 completed_take: 1,
                 elapsed_ms: 0,
+                transcribed_take: 0,
             },
         )
         .unwrap();
@@ -689,6 +788,7 @@ mod tests {
                 take_count: 2,
                 completed_take: 1,
                 elapsed_ms: 0,
+                transcribed_take: 0,
             }
         );
         let _ = fs::remove_dir_all(session);
@@ -773,6 +873,7 @@ mod tests {
                 take_count: 1,
                 completed_take: 1,
                 elapsed_ms: 724_000,
+                transcribed_take: 0,
             },
         )
         .unwrap();
@@ -782,6 +883,7 @@ mod tests {
                 take_count: 1,
                 completed_take: 1,
                 elapsed_ms: 724_000,
+                transcribed_take: 0,
             }
         );
         let _ = fs::remove_dir_all(session);
@@ -803,6 +905,7 @@ mod tests {
                 take_count: 1,
                 completed_take: 1,
                 elapsed_ms: 0,
+                transcribed_take: 0,
             }
         );
         let _ = fs::remove_dir_all(session);
@@ -818,6 +921,7 @@ mod tests {
                 take_count: 1,
                 completed_take: 0,
                 elapsed_ms: 0,
+                transcribed_take: 0,
             },
         )
         .unwrap();
@@ -844,6 +948,7 @@ mod tests {
                 take_count: 1,
                 completed_take: 0,
                 elapsed_ms: 12_000,
+                transcribed_take: 0,
             },
         )
         .unwrap();
@@ -869,6 +974,7 @@ mod tests {
                 take_count: 1,
                 completed_take: 1,
                 elapsed_ms: 5_000,
+                transcribed_take: 0,
             },
         )
         .unwrap();
@@ -914,6 +1020,239 @@ mod tests {
             format!("{}\n", std::process::id())
         );
 
+        let _ = fs::remove_dir_all(session);
+    }
+
+    fn session_with_audio_and_transcript(label: &str, successful: bool) -> PathBuf {
+        let session = unique_session_dir(label);
+        let audio = session.join("audio");
+        fs::create_dir_all(&audio).unwrap();
+        fs::write(audio.join("mic-001.m4a"), b"mic").unwrap();
+        fs::write(audio.join("call-001.m4a"), b"call").unwrap();
+        fs::write(session.join("notes.md"), "- `00:01` keep me\n").unwrap();
+        if successful {
+            fs::write(
+                session.join("transcript.md"),
+                "# Transcript\n\nGenerated by local Whisper transcription.\n",
+            )
+            .unwrap();
+            write_capture_progress(
+                &session,
+                CaptureProgress {
+                    take_count: 1,
+                    completed_take: 1,
+                    elapsed_ms: 0,
+                    transcribed_take: 1,
+                },
+            )
+            .unwrap();
+        } else {
+            fs::write(
+                session.join("transcript.md"),
+                "# Transcript: Pending\n\nTranscript will appear here after audio capture and transcription are wired in.\n",
+            )
+            .unwrap();
+        }
+        session
+    }
+
+    #[test]
+    fn keep_audio_false_discards_m4as_after_leaving_session() {
+        let session = session_with_audio_and_transcript("discard-leave", true);
+        let discarded = maybe_discard_session_audio(
+            &session,
+            AudioRetention {
+                keep_audio: false,
+                is_recording: false,
+                is_open_session: false,
+            },
+        )
+        .unwrap();
+        assert!(discarded);
+        assert!(!session.join("audio/mic-001.m4a").exists());
+        assert!(!session.join("audio/call-001.m4a").exists());
+        assert!(session.join("audio").is_dir());
+        assert!(session.join("transcript.md").exists());
+        assert!(session.join("notes.md").exists());
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn keep_audio_false_keeps_audio_while_session_is_still_open() {
+        let session = session_with_audio_and_transcript("discard-open", true);
+        let discarded = maybe_discard_session_audio(
+            &session,
+            AudioRetention {
+                keep_audio: false,
+                is_recording: false,
+                is_open_session: true,
+            },
+        )
+        .unwrap();
+        assert!(!discarded);
+        assert!(session.join("audio/mic-001.m4a").exists());
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn keep_audio_true_never_discards() {
+        let session = session_with_audio_and_transcript("keep-true", true);
+        let discarded = maybe_discard_session_audio(
+            &session,
+            AudioRetention {
+                keep_audio: true,
+                is_recording: false,
+                is_open_session: false,
+            },
+        )
+        .unwrap();
+        assert!(!discarded);
+        assert!(session.join("audio/mic-001.m4a").exists());
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn missing_or_failed_transcript_never_discards_audio() {
+        let missing = unique_session_dir("discard-missing");
+        let audio = missing.join("audio");
+        fs::create_dir_all(&audio).unwrap();
+        fs::write(audio.join("mic-001.m4a"), b"mic").unwrap();
+        assert!(!maybe_discard_session_audio(
+            &missing,
+            AudioRetention {
+                keep_audio: false,
+                is_recording: false,
+                is_open_session: false,
+            },
+        )
+        .unwrap());
+        assert!(audio.join("mic-001.m4a").exists());
+
+        let placeholder = session_with_audio_and_transcript("discard-placeholder", false);
+        assert!(!maybe_discard_session_audio(
+            &placeholder,
+            AudioRetention {
+                keep_audio: false,
+                is_recording: false,
+                is_open_session: false,
+            },
+        )
+        .unwrap());
+        assert!(placeholder.join("audio/mic-001.m4a").exists());
+
+        let _ = fs::remove_dir_all(missing);
+        let _ = fs::remove_dir_all(placeholder);
+    }
+
+    #[test]
+    fn stale_take_one_transcript_does_not_discard_newer_untranscribed_audio() {
+        let session = session_with_audio_and_transcript("discard-stale-take", true);
+        let audio = session.join("audio");
+        fs::write(audio.join("mic-002.m4a"), b"mic2").unwrap();
+        fs::write(audio.join("call-002.m4a"), b"call2").unwrap();
+        write_capture_progress(
+            &session,
+            CaptureProgress {
+                take_count: 2,
+                completed_take: 2,
+                elapsed_ms: 0,
+                transcribed_take: 1,
+            },
+        )
+        .unwrap();
+        assert!(!maybe_discard_session_audio(
+            &session,
+            AudioRetention {
+                keep_audio: false,
+                is_recording: false,
+                is_open_session: false,
+            },
+        )
+        .unwrap());
+        assert!(audio.join("mic-002.m4a").exists());
+
+        write_capture_progress(
+            &session,
+            CaptureProgress {
+                take_count: 2,
+                completed_take: 2,
+                elapsed_ms: 0,
+                transcribed_take: 2,
+            },
+        )
+        .unwrap();
+        assert!(maybe_discard_session_audio(
+            &session,
+            AudioRetention {
+                keep_audio: false,
+                is_recording: false,
+                is_open_session: false,
+            },
+        )
+        .unwrap());
+        assert!(!audio.join("mic-002.m4a").exists());
+
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn mark_audio_transcribed_does_not_reacquire_the_publish_lock() {
+        let session = unique_session_dir("transcribed-lock");
+        fs::create_dir_all(&session).unwrap();
+        write_capture_progress(
+            &session,
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 1,
+                elapsed_ms: 0,
+                transcribed_take: 0,
+            },
+        )
+        .unwrap();
+        let _lock = lock_session_publish(&session).unwrap();
+        let started = Instant::now();
+        let progress = mark_audio_transcribed(&session).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(progress.transcribed_take, 1);
+        assert_eq!(read_capture_progress(&session).transcribed_take, 1);
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn discard_audio_only_removes_m4a_files() {
+        let session = session_with_audio_and_transcript("discard-m4a-only", true);
+        let audio = session.join("audio");
+        fs::write(audio.join("sidecar.txt"), b"keep").unwrap();
+        assert!(maybe_discard_session_audio(
+            &session,
+            AudioRetention {
+                keep_audio: false,
+                is_recording: false,
+                is_open_session: false,
+            },
+        )
+        .unwrap());
+        assert!(!audio.join("mic-001.m4a").exists());
+        assert!(audio.join("sidecar.txt").exists());
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn discarded_audio_still_counts_the_next_take_from_capture_progress() {
+        let session = unique_session_dir("discard-next-take");
+        let audio = session.join("audio");
+        fs::create_dir_all(&audio).unwrap();
+        write_capture_progress(
+            &session,
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 1,
+                elapsed_ms: 1_000,
+                transcribed_take: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(next_take_index(&session), 2);
         let _ = fs::remove_dir_all(session);
     }
 }

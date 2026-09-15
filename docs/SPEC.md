@@ -116,7 +116,9 @@ sessions/
 }
 ```
 
-New folder names use a 12-digit inverted UTC key plus a US Eastern `YYYY-MM-DD_HHMM` stamp plus `et` plus slug, for example `797394737678-2026-05-26_1921-et-design-sync`. The key is `999999999999` minus the UTC `YYYYMMDDHHMM`, so VS Code Explorer, Finder, and `ls` A-Z list newest first. Older ISO `YYYY-MM-DD_HHMM-et-…` and `MM-DD-YYYY_H-MMapm` folders remain valid session IDs. `recall show latest`, `recall transcribe latest`, `recall analyze latest`, and `recall --resume latest` still sort by `created_at_unix` so mixed old and new names stay in true time order.
+New folder names use a 12-digit inverted UTC key plus a local `YYYY-MM-DD_HHMM` stamp plus a zone token plus slug, for example `797390917984-2026-09-08_1515-ct-mute-check` in Chicago or `797394737678-2026-05-26_1921-et-design-sync` in Eastern. The key is `999999999999` minus the UTC `YYYYMMDDHHMM`, so VS Code Explorer, Finder, and `ls` A-Z list newest first. The zone comes from `timezone` in `~/.config/recall/config.toml` when that IANA name is valid, otherwise the Mac IANA zone, otherwise US Eastern (`et`). Older ISO `YYYY-MM-DD_HHMM-et-…` and `MM-DD-YYYY_H-MMapm` folders remain valid session IDs. `recall show latest`, `recall transcribe latest`, `recall analyze latest`, and `recall --resume latest` still sort by `created_at_unix` so mixed old and new names stay in true time order.
+
+`keep_audio` defaults to true. Set `keep_audio = false` to unlink `audio/*.m4a` after a successful transcript once the session is no longer the open TUI folder (quit from ENDED, start a new folder, or detached/CLI transcribe). Recording, missing/failed transcripts, and in-TUI transcribe completion keep the files. The `audio/` directory remains.
 
 After a TUI session that created or resumed a folder, quitting restores the terminal and prints:
 

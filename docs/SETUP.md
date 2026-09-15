@@ -175,6 +175,8 @@ Example persistent config:
 consent_default = "provided"
 storage_dir = "~/Documents/Recall/sessions"
 source_dir = "~/Projects/recall"
+timezone = "America/Chicago"
+keep_audio = true
 
 [analysis]
 default_agent = "grok"
