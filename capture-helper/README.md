@@ -14,6 +14,7 @@ The helper should stay small:
 - write audio chunks or stream PCM events
 - emit simple JSON status events to the Rust app
 - read a macOS pasteboard image and write it as PNG (note paste)
+- batch-transcribe a wav/m4a file with on-device SpeechAnalyzer
 
 ## Planned APIs
 
@@ -21,12 +22,14 @@ Current command shape:
 
 ```sh
 swift run recall-capture list-sources
-swift run recall-capture record-mic --session-dir ../sessions/example --duration 5 --output-name mic-001.m4a --stop-file /tmp/stop-mic --mute-file /tmp/mute-mic
-swift run recall-capture record-audio-tap --session-dir ../sessions/example --duration 5 --output-name call-001.m4a
+swift run recall-capture record-mic --session-dir ../sessions/example --duration 5 --output-name mic-001.m4a --stop-file /tmp/stop-mic --mute-file /tmp/mute-mic --live-transcript
+swift run recall-capture record-audio-tap --session-dir ../sessions/example --duration 5 --output-name call-001.m4a --live-transcript
 swift run recall-capture record-system --session-dir ../sessions/example --duration 5 --output-name call-001.m4a
 swift run recall-capture probe-audio-tap
 swift run recall-capture clipboard-image --out /tmp/recall-clipboard.png
 swift run recall-capture clipboard-text
+swift run recall-capture transcribe-status
+swift run recall-capture transcribe-file --audio /tmp/track.wav --out /tmp/track
 ```
 
 Planned command shape:
@@ -97,12 +100,25 @@ Potential future event output:
 {"type":"recording_stopped"}
 ```
 
+Current `transcribe-status` output:
+
+```json
+{"available":true,"installedLocales":["en-US"],"locale":"en-US","message":null}
+```
+
+Current `transcribe-file` writes `<base>.json`, `<base>.vtt`, and `<base>.txt`. JSON shape:
+
+```json
+{"engine":"apple","locale":"en-US","segments":[{"end":2.4,"start":0.12,"text":"..."}],"type":"transcript"}
+```
+
 ## macOS Frameworks
 
 - ScreenCaptureKit
 - AVFoundation
+- Speech (SpeechAnalyzer / SpeechTranscriber on macOS 26+)
 - CoreAudio, if needed
 
 ## Current Boundary
 
-The helper currently lists candidate sources, records default microphone audio, records system audio through CoreAudio process taps, keeps an initial ScreenCaptureKit fallback command, can probe CoreAudio process taps, and can write the macOS pasteboard image as PNG. The Rust TUI invokes the mic and CoreAudio process-tap recorders, and uses `clipboard-image` while a note draft is open.
+The helper currently lists candidate sources, records default microphone audio, records system audio through CoreAudio process taps, keeps an initial ScreenCaptureKit fallback command, can probe CoreAudio process taps, can write the macOS pasteboard image as PNG, and can batch-transcribe a wav/m4a file with Apple SpeechAnalyzer. The Rust TUI invokes the mic and CoreAudio process-tap recorders, and uses `clipboard-image` while a note draft is open. Transcription uses `transcribe-file` after a take ends.

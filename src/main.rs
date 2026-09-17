@@ -21,10 +21,10 @@ use session::{
 };
 use transcription::{
     find_parakeet_binary, format_bytes, format_model_download_label, parakeet_binary_doctor_level,
-    parakeet_model_is_cached, resolve_parakeet_cache_dir_for_options, resolve_parakeet_model_id,
-    transcribe_with_progress, DoctorCheckLevel, TrackSelection, TranscribeOptions,
-    TranscribeTarget, TranscriptionEngine, TranscriptionProgress, DEFAULT_PARAKEET_BIN,
-    PARAKEET_INSTALL_HINT,
+    parakeet_model_is_cached, probe_apple_speech_status, resolve_parakeet_cache_dir_for_options,
+    resolve_parakeet_model_id, transcribe_with_progress, AppleSpeechDoctorStatus, DoctorCheckLevel,
+    TrackSelection, TranscribeOptions, TranscribeTarget, TranscriptionEngine,
+    TranscriptionProgress, APPLE_SPEECH_HINT, DEFAULT_PARAKEET_BIN, PARAKEET_INSTALL_HINT,
 };
 use tui::{ResumeTarget, TuiOptions};
 use update::{update, UpdateOptions};
@@ -108,7 +108,7 @@ START OPTIONS:
 TRANSCRIBE OPTIONS:
     recall transcribe latest [options]
     recall transcribe <session-path> [options]
-    --engine <whisper|parakeet>           ASR engine, default: parakeet on Apple Silicon
+    --engine <apple|parakeet|whisper>     ASR engine, default: apple on Apple Silicon
     --track <both|call|mic>               Audio track selection, default: both
     --ffmpeg <path>                       ffmpeg binary path
     --model <path>                        Whisper ggml model path
@@ -133,7 +133,7 @@ ANALYZE OPTIONS:
 TUI OPTIONS:
     --resume [latest|<session-id>|<path>] Reopen a previous session to append another take
     --storage <path>                      Session storage directory
-    --engine <whisper|parakeet>           Auto-transcription engine, default: parakeet on Apple Silicon
+    --engine <apple|parakeet|whisper>     Auto-transcription engine, default: apple on Apple Silicon
     --ffmpeg <path>                       ffmpeg binary path for auto-transcription
     --model <path>                        Whisper model path for auto-transcription
     --whisper <path>                      whisper-cli path for auto-transcription
@@ -146,6 +146,8 @@ TUI OPTIONS:
     --no-auto-analyze                     Disable analysis after transcription
     --preset <name>                       Analysis prompt preset
     --editor <command>                    Editor/app used by TUI o to open the session folder
+    --live-transcript                     Show Apple live transcript while recording
+    --no-live-transcript                  Disable the live transcript pane
 
 OPEN OPTIONS:
     recall open latest [options]
@@ -749,9 +751,11 @@ fn parse_leading_tui_defaults(args: Vec<String>) -> Result<(TuiOptions, Vec<Stri
                 let value = iter
                     .next()
                     .ok_or_else(|| "--engine requires a value".to_string())?;
-                options.engine = TranscriptionEngine::parse(&value)
-                    .ok_or_else(|| format!("Unknown engine '{value}'. Use whisper or parakeet."))?;
+                options.engine = TranscriptionEngine::parse(&value).ok_or_else(|| {
+                    format!("Unknown engine '{value}'. Use apple, parakeet, or whisper.")
+                })?;
                 options.require_parakeet = options.engine == TranscriptionEngine::Parakeet;
+                options.require_apple = options.engine == TranscriptionEngine::Apple;
             }
             "--ffmpeg" => {
                 options.ffmpeg_bin = Some(PathBuf::from(
@@ -812,6 +816,12 @@ fn parse_leading_tui_defaults(args: Vec<String>) -> Result<(TuiOptions, Vec<Stri
             "--no-auto-analyze" => {
                 options.auto_analyze = false;
             }
+            "--live-transcript" => {
+                options.live_transcript = true;
+            }
+            "--no-live-transcript" => {
+                options.live_transcript = false;
+            }
             "--preset" => {
                 options.preset = iter
                     .next()
@@ -860,6 +870,8 @@ fn tui_options_from_config(config: &RecallConfig) -> TuiOptions {
     options.parakeet_bin = config.transcription.parakeet_bin.clone();
     options.parakeet_model = config.transcription.parakeet_model.clone();
     options.parakeet_cache_dir = config.transcription.parakeet_cache_dir.clone();
+    options.require_apple = config.transcription.engine_specified
+        && config.transcription.engine == TranscriptionEngine::Apple;
     if let Some(chunk_seconds) = config.transcription.chunk_seconds {
         options.chunk_seconds = chunk_seconds;
     }
@@ -874,6 +886,7 @@ fn tui_options_from_config(config: &RecallConfig) -> TuiOptions {
     }
     options.timezone = resolve_timezone(config.timezone.as_deref());
     options.keep_audio = config.keep_audio.unwrap_or(true);
+    options.live_transcript = config.live_transcription.enabled.unwrap_or(true);
     options
 }
 
@@ -933,6 +946,7 @@ fn parse_transcribe_options(
     let mut parakeet_model = tui_defaults.parakeet_model.clone();
     let mut parakeet_cache_dir = tui_defaults.parakeet_cache_dir.clone();
     let mut require_parakeet = false;
+    let mut require_apple = tui_defaults.require_apple && engine == TranscriptionEngine::Apple;
     let mut chunk_seconds = tui_defaults.chunk_seconds;
     let mut keep_wav = false;
     let mut generation = None;
@@ -945,9 +959,11 @@ fn parse_transcribe_options(
                 let value = iter
                     .next()
                     .ok_or_else(|| "--engine requires a value".to_string())?;
-                engine = TranscriptionEngine::parse(&value)
-                    .ok_or_else(|| format!("Unknown engine '{value}'. Use whisper or parakeet."))?;
+                engine = TranscriptionEngine::parse(&value).ok_or_else(|| {
+                    format!("Unknown engine '{value}'. Use apple, parakeet, or whisper.")
+                })?;
                 require_parakeet = engine == TranscriptionEngine::Parakeet;
+                require_apple = engine == TranscriptionEngine::Apple;
             }
             "--track" => {
                 let value = iter
@@ -1048,6 +1064,7 @@ fn parse_transcribe_options(
         chunk_seconds,
         keep_wav,
         require_parakeet,
+        require_apple,
         generation,
         keep_audio: tui_defaults.keep_audio,
     })
@@ -1148,7 +1165,7 @@ fn parse_storage_arg(
 fn print_spec_hint() {
     println!("Read docs/SPEC.md for the v0 product scope and docs/SETUP.md for setup.");
     println!(
-        "Default transcription engine on Apple Silicon is Parakeet (`parakeet-mlx`, NVIDIA Parakeet TDT 0.6B v3, CC-BY-4.0). Whisper (`whisper-cli`) remains available with --engine whisper. Missing Parakeet falls back to Whisper unless you pass --engine parakeet."
+        "Default transcription engine on Apple Silicon macOS 26+ is Apple SpeechAnalyzer (on-device). Parakeet (`parakeet-mlx`) remains available with --engine parakeet. Whisper (`whisper-cli`) remains available with --engine whisper. Missing Apple SpeechAnalyzer falls back to Parakeet unless you pass --engine apple."
     );
 }
 
@@ -1206,6 +1223,7 @@ fn print_doctor() {
         print_binary_check("whisper-cli", "whisper.cpp CLI");
     }
     print_path_check(&model_path, "Whisper model");
+    print_apple_doctor(config.transcription.engine);
     print_parakeet_doctor(
         parakeet_bin.as_deref(),
         &parakeet_model,
@@ -1256,6 +1274,48 @@ fn print_path_check(path: &Path, label: &str) {
     }
 }
 
+fn print_apple_doctor(engine: TranscriptionEngine) {
+    let AppleSpeechDoctorStatus {
+        available,
+        locale,
+        installed_locales,
+        message,
+        helper_path,
+    } = probe_apple_speech_status();
+    let role = if engine == TranscriptionEngine::Apple {
+        "selected engine"
+    } else {
+        "available fallback"
+    };
+    if available {
+        let locale = locale.unwrap_or_else(|| "unknown".to_string());
+        match helper_path {
+            Some(path) => println!(
+                "  ok   Apple SpeechAnalyzer ({role}): locale {locale} via {}",
+                path.display()
+            ),
+            None => println!("  ok   Apple SpeechAnalyzer ({role}): locale {locale}"),
+        }
+        if !installed_locales.is_empty() {
+            println!(
+                "        installed locales: {}",
+                installed_locales.join(", ")
+            );
+        }
+        return;
+    }
+
+    let detail = message
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| APPLE_SPEECH_HINT.to_string());
+    if engine == TranscriptionEngine::Apple {
+        println!("  warn Apple SpeechAnalyzer ({role}): unavailable; default path falls back to Parakeet");
+    } else {
+        println!("  warn Apple SpeechAnalyzer ({role}): unavailable");
+    }
+    println!("        {detail}");
+}
+
 fn print_parakeet_doctor(
     explicit_bin: Option<&Path>,
     model: &str,
@@ -1266,7 +1326,7 @@ fn print_parakeet_doctor(
     let resolved = find_parakeet_binary(explicit_bin);
     let role = match engine {
         TranscriptionEngine::Parakeet => "selected engine",
-        TranscriptionEngine::Whisper => "available fallback",
+        TranscriptionEngine::Apple | TranscriptionEngine::Whisper => "available fallback",
     };
     match parakeet_binary_doctor_level(explicit_bin, engine) {
         DoctorCheckLevel::Ok => match resolved {
@@ -1291,8 +1351,11 @@ fn print_parakeet_doctor(
         );
     }
     println!(
-        "  note Default engine on Apple Silicon is Parakeet (NVIDIA CC-BY-4.0). Whisper remains available with --engine whisper."
+        "  note Default engine on Apple Silicon macOS 26+ is Apple SpeechAnalyzer (on-device). Parakeet remains available with --engine parakeet. Whisper remains available with --engine whisper."
     );
+    if matches!(engine, TranscriptionEngine::Parakeet) {
+        println!("  note Config currently selects engine = \"parakeet\" (NVIDIA CC-BY-4.0 when that model runs).");
+    }
     if matches!(engine, TranscriptionEngine::Whisper) {
         println!("  note Config currently selects engine = \"whisper\".");
     }
@@ -1309,13 +1372,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transcribe_defaults_to_parakeet_engine() {
+    fn transcribe_defaults_to_platform_engine() {
         let options =
             parse_transcribe_options(vec!["latest".into()], &TuiOptions::default()).unwrap();
-        assert_eq!(options.engine, TranscriptionEngine::Parakeet);
+        assert_eq!(options.engine, TranscriptionEngine::default());
         assert!(!options.require_parakeet);
+        assert!(!options.require_apple);
         assert!(options.parakeet_bin.is_none());
         assert!(options.whisper_bin.is_none());
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(options.engine, TranscriptionEngine::Apple);
+        }
+    }
+
+    #[test]
+    fn transcribe_parses_apple_engine_and_requires_it() {
+        let options = parse_transcribe_options(
+            vec!["latest".into(), "--engine".into(), "apple".into()],
+            &TuiOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(options.engine, TranscriptionEngine::Apple);
+        assert!(options.require_apple);
+        assert!(!options.require_parakeet);
     }
 
     #[test]
@@ -1360,6 +1440,7 @@ mod tests {
 
         assert_eq!(options.engine, TranscriptionEngine::Whisper);
         assert!(!options.require_parakeet);
+        assert!(!options.require_apple);
         assert_eq!(
             options.parakeet_bin.as_deref(),
             Some(Path::new("/tmp/parakeet-mlx"))
@@ -1375,6 +1456,7 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("whisper"));
         assert!(error.contains("parakeet"));
+        assert!(error.contains("apple"));
     }
 
     #[test]
@@ -1406,12 +1488,24 @@ mod tests {
     }
 
     #[test]
-    fn tui_options_from_config_default_engine_is_parakeet() {
+    fn tui_options_from_config_default_engine_is_platform_default() {
         let options = tui_options_from_config(&RecallConfig::default());
-        assert_eq!(options.engine, TranscriptionEngine::Parakeet);
+        assert_eq!(options.engine, TranscriptionEngine::default());
         assert!(!options.require_parakeet);
+        assert!(!options.require_apple);
         assert!(options.parakeet_bin.is_none());
         assert!(options.whisper_bin.is_none());
+    }
+
+    #[test]
+    fn tui_options_from_config_explicit_apple_requires_apple() {
+        let mut config = RecallConfig::default();
+        config.transcription.engine = TranscriptionEngine::Apple;
+        config.transcription.engine_specified = true;
+        let options = tui_options_from_config(&config);
+        assert_eq!(options.engine, TranscriptionEngine::Apple);
+        assert!(options.require_apple);
+        assert!(!options.require_parakeet);
     }
 
     #[test]
@@ -1421,7 +1515,41 @@ mod tests {
                 .unwrap();
         assert_eq!(options.engine, TranscriptionEngine::Parakeet);
         assert!(options.require_parakeet);
+        assert!(!options.require_apple);
         assert_eq!(remainder, vec!["list".to_string()]);
+    }
+
+    #[test]
+    fn leading_engine_apple_requires_apple_speech() {
+        let (options, remainder) =
+            parse_leading_tui_defaults(vec!["--engine".into(), "apple".into(), "list".into()])
+                .unwrap();
+        assert_eq!(options.engine, TranscriptionEngine::Apple);
+        assert!(options.require_apple);
+        assert!(!options.require_parakeet);
+        assert_eq!(remainder, vec!["list".to_string()]);
+    }
+
+    #[test]
+    fn live_transcript_defaults_on_and_can_be_disabled() {
+        let options = TuiOptions::default();
+        assert!(options.live_transcript);
+
+        let (options, remainder) =
+            parse_leading_tui_defaults(vec!["--no-live-transcript".into(), "list".into()]).unwrap();
+        assert!(!options.live_transcript);
+        assert_eq!(remainder, vec!["list".to_string()]);
+
+        let (options, _) = parse_leading_tui_defaults(vec!["--live-transcript".into()]).unwrap();
+        assert!(options.live_transcript);
+    }
+
+    #[test]
+    fn tui_options_from_config_can_disable_live_transcript() {
+        let mut config = RecallConfig::default();
+        config.live_transcription.enabled = Some(false);
+        let options = tui_options_from_config(&config);
+        assert!(!options.live_transcript);
     }
 
     #[test]

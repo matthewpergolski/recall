@@ -30,20 +30,28 @@ Audio capture currently uses Apple frameworks through the Swift helper:
 | AVFoundation | Microphone capture and audio files | macOS SDK |
 | CoreAudio process taps | System/call audio capture | macOS SDK |
 | ScreenCaptureKit | Fallback system audio path | macOS SDK |
+| Speech / SpeechAnalyzer | Default on-device batch transcription on macOS 26+ | macOS SDK |
 
 These are provided by macOS/Xcode. They are not downloaded from Homebrew or Hugging Face.
 
 ## Transcription
 
-The default transcription engine is Parakeet on Apple Silicon. Whisper remains a first-class fallback.
+The default transcription engine is Apple SpeechAnalyzer on Apple Silicon macOS 26+. Parakeet and Whisper remain first-class fallbacks.
 
-Default engine (Parakeet):
+Default engine (Apple SpeechAnalyzer):
 
 | Dependency | Purpose | Source |
 | --- | --- | --- |
-| `parakeet-mlx` | Default local speech-to-text CLI | `uv tool install parakeet-mlx` (preferred) or pip; Apache-2.0. Not Homebrew. |
-| `mlx-community/parakeet-tdt-0.6b-v3` | Default Parakeet MLX weights | Hugging Face on first run; NVIDIA **CC-BY-4.0** (credit NVIDIA / the model) |
+| Apple SpeechAnalyzer | Default on-device speech-to-text on Apple Silicon macOS 26+ | macOS Speech framework; no NVIDIA download |
+| On-device speech model | Locale assets used by SpeechAnalyzer | System-managed; error if missing (Recall does not auto-download) |
 | `ffmpeg` | Chunks Recall `.m4a` audio and converts chunks to 16 kHz mono WAV | Homebrew for now, or an approved corporate binary |
+
+Parakeet fallback (`--engine parakeet`). Still supported:
+
+| Dependency | Purpose | Source |
+| --- | --- | --- |
+| `parakeet-mlx` | Local speech-to-text CLI | `uv tool install parakeet-mlx` (preferred) or pip; Apache-2.0. Not Homebrew. |
+| `mlx-community/parakeet-tdt-0.6b-v3` | Parakeet MLX weights | Hugging Face on first Parakeet run; NVIDIA **CC-BY-4.0** (credit NVIDIA / the model when this engine ran) |
 
 Fallback engine (Whisper). Still supported, never removed:
 
@@ -54,14 +62,13 @@ Fallback engine (Whisper). Still supported, never removed:
 
 `ffmpeg` is a temporary dependency. `recall update` does **not** install `parakeet-mlx`, `whisper-cli`, `ffmpeg`, or model weights. It only refreshes the Recall source checkout and the `recall` Cargo binary. Install ASR tools yourself, then keep them.
 
-Missing `parakeet-mlx` does not break `--engine whisper`. `recall doctor` reports a missing Parakeet CLI as a warning. First Parakeet run may download weights; later runs can be offline once the cache is warm. Do not commit model files.
+Missing Apple SpeechAnalyzer falls back to Parakeet unless you passed `--engine apple` or set config `engine = "apple"`. Missing `parakeet-mlx` does not break `--engine whisper`. `recall doctor` reports Apple SpeechAnalyzer status and a missing Parakeet CLI as a warning. First Parakeet run may download weights; later runs can be offline once the cache is warm. Do not commit model files.
 
 ## Personal Mac Setup With Homebrew
 
 Use this on a personal machine where Homebrew is allowed:
 
 ```sh
-uv tool install parakeet-mlx
 brew install whisper-cpp   # fallback engine only
 mkdir -p models
 curl -L -o models/ggml-base.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
@@ -69,7 +76,7 @@ cargo install --path . --locked
 recall transcribe latest
 ```
 
-`uv tool install parakeet-mlx` puts `parakeet-mlx` on PATH. Homebrew is fine for `uv` or `ffmpeg`, but do not expect a `brew install parakeet-mlx` formula. The first `recall transcribe` downloads the MLX model from Hugging Face.
+Apple SpeechAnalyzer needs no extra CLI. `uv tool install parakeet-mlx` puts `parakeet-mlx` on PATH for `--engine parakeet`. Homebrew is fine for `uv` or `ffmpeg`, but do not expect a `brew install parakeet-mlx` formula. The first Parakeet run downloads the MLX model from Hugging Face.
 
 ## No-Brew Corporate Setup
 
@@ -135,12 +142,12 @@ Recall should not assume Homebrew in corporate environments. It should accept ex
 
 ## Parakeet (`parakeet-mlx`)
 
-Parakeet is the default engine. Install the CLI yourself; Recall will not install it during `recall update`.
+Parakeet is a first-class fallback, not the Apple Silicon default. Install the CLI yourself; Recall will not install it during `recall update`.
 
 ```sh
 uv tool install parakeet-mlx
 # or: pip install parakeet-mlx
-recall transcribe latest
+recall transcribe latest --engine parakeet
 recall transcribe latest --engine whisper   # fallback
 ```
 
@@ -198,7 +205,7 @@ auto_analyze = true
 preset = "general"
 
 [transcription]
-engine = "parakeet"
+engine = "apple"      # default on Apple Silicon macOS 26+; "parakeet" or "whisper" to pin
 ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
 whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
 model_path = "~/Documents/Recall/models/ggml-base.en.bin"

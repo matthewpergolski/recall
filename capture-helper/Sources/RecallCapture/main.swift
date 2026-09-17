@@ -77,6 +77,7 @@ struct RecordMicOptions {
     let stopFile: URL?
     let muteFile: URL?
     let outputName: String
+    let liveTranscript: Bool
 }
 
 struct RecordSystemOptions {
@@ -84,6 +85,7 @@ struct RecordSystemOptions {
     let durationSeconds: TimeInterval
     let stopFile: URL?
     let outputName: String
+    let liveTranscript: Bool
 }
 
 struct ClipboardImageOptions {
@@ -143,6 +145,11 @@ enum CaptureError: Error, CustomStringConvertible {
     case clipboardHasNoImage
     case clipboardHasNoText
     case clipboardImageConversionFailed
+    case missingAudioPath
+    case missingTranscribeOutPath
+    case appleSpeechUnavailable(String)
+    case appleSpeechModelNotInstalled(String)
+    case transcribeFailed(String)
 
     var description: String {
         switch self {
@@ -186,6 +193,16 @@ enum CaptureError: Error, CustomStringConvertible {
             return "Clipboard has no text"
         case .clipboardImageConversionFailed:
             return "Failed to convert clipboard image to PNG"
+        case .missingAudioPath:
+            return "transcribe-file requires --audio <wav-or-m4a>"
+        case .missingTranscribeOutPath:
+            return "transcribe-file requires --out <base>"
+        case .appleSpeechUnavailable(let message):
+            return message
+        case .appleSpeechModelNotInstalled(let locale):
+            return "Apple speech model not installed for locale \(locale). Install the on-device speech model in System Settings; Recall will not download cloud recognition assets."
+        case .transcribeFailed(let message):
+            return message
         }
     }
 }
@@ -285,6 +302,19 @@ struct RecallCapture {
                 ))
                 Foundation.exit(1)
             }
+        case "transcribe-status":
+            try await transcribeStatus()
+        case "transcribe-file":
+            do {
+                try await transcribeFile(parseTranscribeFileOptions(Array(args.dropFirst())))
+            } catch {
+                try printJSONLine(TranscribeErrorResponse(
+                    type: "error",
+                    message: "\(error)",
+                    available: false
+                ))
+                Foundation.exit(1)
+            }
         case "version", "--version", "-V":
             print("recall-capture 0.1.0")
         case let command?:
@@ -313,6 +343,7 @@ struct RecallCapture {
         var stopFile: URL?
         var muteFile: URL?
         var outputName = "mic.m4a"
+        var liveTranscript = false
         var index = 0
 
         while index < args.count {
@@ -352,6 +383,9 @@ struct RecallCapture {
                 }
                 outputName = try validatedOutputName(args[index + 1])
                 index += 2
+            case "--live-transcript":
+                liveTranscript = true
+                index += 1
             default:
                 fputs("Ignoring unknown record-mic option: \(arg)\n", stderr)
                 index += 1
@@ -367,7 +401,8 @@ struct RecallCapture {
             durationSeconds: durationSeconds,
             stopFile: stopFile,
             muteFile: muteFile,
-            outputName: outputName
+            outputName: outputName,
+            liveTranscript: liveTranscript
         )
     }
 
@@ -376,6 +411,7 @@ struct RecallCapture {
         var durationSeconds: TimeInterval = 8 * 60 * 60
         var stopFile: URL?
         var outputName = "call.m4a"
+        var liveTranscript = false
         var index = 0
 
         while index < args.count {
@@ -409,6 +445,9 @@ struct RecallCapture {
                 }
                 outputName = try validatedOutputName(args[index + 1])
                 index += 2
+            case "--live-transcript":
+                liveTranscript = true
+                index += 1
             default:
                 fputs("Ignoring unknown record-system option: \(arg)\n", stderr)
                 index += 1
@@ -423,7 +462,8 @@ struct RecallCapture {
             sessionDir: sessionDir,
             durationSeconds: durationSeconds,
             stopFile: stopFile,
-            outputName: outputName
+            outputName: outputName,
+            liveTranscript: liveTranscript
         )
     }
 
@@ -560,7 +600,11 @@ struct RecallCapture {
             try FileManager.default.removeItem(at: outputURL)
         }
 
-        let recorder = MicTapRecorder(outputURL: outputURL, muteFile: options.muteFile)
+        let recorder = MicTapRecorder(
+            outputURL: outputURL,
+            muteFile: options.muteFile,
+            liveTranscript: options.liveTranscript
+        )
         try recorder.record(durationSeconds: options.durationSeconds, stopFile: options.stopFile)
     }
 
@@ -652,7 +696,10 @@ struct RecallCapture {
             try FileManager.default.removeItem(at: outputURL)
         }
 
-        let recorder = try CoreAudioTapRecorder(outputURL: outputURL)
+        let recorder = try CoreAudioTapRecorder(
+            outputURL: outputURL,
+            liveTranscript: options.liveTranscript
+        )
         try recorder.record(durationSeconds: options.durationSeconds, stopFile: options.stopFile)
     }
 
@@ -856,7 +903,7 @@ struct RecallCapture {
         }
     }
 
-    private static func printJSON<T: Encodable>(_ value: T) throws {
+    static func printJSON<T: Encodable>(_ value: T) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(value)
@@ -864,7 +911,7 @@ struct RecallCapture {
         FileHandle.standardOutput.write(Data("\n".utf8))
     }
 
-    fileprivate static func printJSONLine<T: Encodable>(_ value: T) throws {
+    static func printJSONLine<T: Encodable>(_ value: T) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(value)
@@ -879,23 +926,29 @@ struct RecallCapture {
 
             USAGE:
                 recall-capture list-sources
-                recall-capture record-mic --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--mute-file <path>] [--output-name <file.m4a>]
-                recall-capture record-audio-tap --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
+                recall-capture record-mic --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--mute-file <path>] [--output-name <file.m4a>] [--live-transcript]
+                recall-capture record-audio-tap --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>] [--live-transcript]
                 recall-capture record-system --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
                 recall-capture probe-audio-tap
                 recall-capture clipboard-image --out <path>
                 recall-capture clipboard-text
+                recall-capture transcribe-status
+                recall-capture transcribe-file --audio <wav-or-m4a> --out <base>
                 recall-capture version
 
             COMMANDS:
                 list-sources    Emit candidate meeting apps and microphones as JSON.
                 record-mic      Record default microphone audio into <session-dir>/audio/<output-name>.
                                 --mute-file writes digital silence into the same m4a while present.
+                                --live-transcript emits on-device SpeechAnalyzer JSON while recording.
                 record-audio-tap Record system audio with CoreAudio process taps into <session-dir>/audio/<output-name>.
+                                --live-transcript emits on-device SpeechAnalyzer JSON while recording.
                 record-system   Record app/system audio into <session-dir>/audio/<output-name>.
                 probe-audio-tap Probe CoreAudio's process-tap API without writing audio.
                 clipboard-image Write the macOS pasteboard image as PNG to --out.
                 clipboard-text  Emit the macOS pasteboard string as JSON.
+                transcribe-status Probe Apple SpeechAnalyzer availability as JSON.
+                transcribe-file Transcribe a wav/m4a file with on-device SpeechAnalyzer into <base>.json/.vtt/.txt.
                 version         Print helper version.
 
             NOTE:
@@ -924,13 +977,18 @@ final class MicTapRecorder: @unchecked Sendable {
     private var writeError: Error?
     private var muted = false
     private var currentInputDevice: DefaultInputDevice?
+    private let liveFeed: LiveTranscriptFeed?
 
-    init(outputURL: URL, muteFile: URL?) {
+    init(outputURL: URL, muteFile: URL?, liveTranscript: Bool) {
         self.outputURL = outputURL
         self.muteFile = muteFile
+        self.liveFeed = liveTranscript
+            ? LiveTranscriptFeed(source: "mic", startedAt: startedAt)
+            : nil
     }
 
     func record(durationSeconds: TimeInterval, stopFile: URL?) throws {
+        liveFeed?.start()
         try start()
         updateInputDevice(RecallCapture.defaultInputDevice())
         let startedDevice = snapshotInputDevice()
@@ -967,12 +1025,14 @@ final class MicTapRecorder: @unchecked Sendable {
             }
             if let writeError {
                 stop()
+                liveFeed?.finish()
                 throw writeError
             }
             RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         }
 
         stop()
+        liveFeed?.finish()
         let stoppedDevice = snapshotInputDevice()
 
         try RecallCapture.printJSONLine(CaptureEvent(
@@ -1068,6 +1128,7 @@ final class MicTapRecorder: @unchecked Sendable {
                     self.maybeEmitLevel(Self.mutedLevelDb, device: device)
                 } else {
                     try self.audioFile?.write(from: toWrite)
+                    self.liveFeed?.enqueue(toWrite)
                     self.maybeEmitLevel(audioLevelDb(toWrite) ?? Self.mutedLevelDb, device: device)
                 }
             } catch {
@@ -1164,12 +1225,17 @@ final class CoreAudioTapRecorder: @unchecked Sendable {
     private var audioFile: AVAudioFile?
     private var lastLevelEventAt = Date.distantPast
     private var writeError: Error?
+    private let liveFeed: LiveTranscriptFeed?
 
-    init(outputURL: URL) throws {
+    init(outputURL: URL, liveTranscript: Bool) throws {
         self.outputURL = outputURL
+        self.liveFeed = liveTranscript
+            ? LiveTranscriptFeed(source: "call", startedAt: startedAt)
+            : nil
     }
 
     func record(durationSeconds: TimeInterval, stopFile: URL?) throws {
+        liveFeed?.start()
         try start()
         try RecallCapture.printJSONLine(CaptureEvent(
             type: "recording_started",
@@ -1185,11 +1251,14 @@ final class CoreAudioTapRecorder: @unchecked Sendable {
         {
             Thread.sleep(forTimeInterval: 0.25)
             if let writeError {
+                stop()
+                liveFeed?.finish()
                 throw writeError
             }
         }
 
         stop()
+        liveFeed?.finish()
 
         try RecallCapture.printJSONLine(CaptureEvent(
             type: "recording_stopped",
@@ -1317,6 +1386,7 @@ final class CoreAudioTapRecorder: @unchecked Sendable {
         writerQueue.async {
             do {
                 try self.audioFile?.write(from: buffer)
+                self.liveFeed?.enqueue(buffer)
                 self.maybeEmitLevel(buffer)
             } catch {
                 self.writeError = error

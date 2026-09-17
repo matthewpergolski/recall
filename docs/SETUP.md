@@ -127,13 +127,12 @@ recall update
 Install the local binary:
 
 ```sh
-uv tool install parakeet-mlx
 cargo install --path . --locked
 ```
 
-`uv tool install parakeet-mlx` is required for the default Apple Silicon transcription engine. `recall update` does not install it. Whisper remains available with `--engine whisper` if you already have `whisper-cli`.
+The default Apple Silicon engine is Apple SpeechAnalyzer on macOS 26+. It uses the on-device speech model and does not require `parakeet-mlx`. If SpeechAnalyzer is unavailable, Recall falls back to Parakeet unless you pass `--engine apple`. `uv tool install parakeet-mlx` is only needed for `--engine parakeet` or that fallback. `recall update` does not install it. Whisper remains available with `--engine whisper` if you already have `whisper-cli`.
 
-The first Parakeet run may download `mlx-community/parakeet-tdt-0.6b-v3` from Hugging Face (NVIDIA CC-BY-4.0).
+The first Parakeet run may download `mlx-community/parakeet-tdt-0.6b-v3` from Hugging Face (NVIDIA CC-BY-4.0). Credit NVIDIA only when that engine ran.
 
 ## Updating An Installed Checkout
 
@@ -184,13 +183,16 @@ auto_analyze = true
 preset = "general"
 
 [transcription]
-engine = "parakeet"
+engine = "apple"      # default on Apple Silicon macOS 26+; use "parakeet" or "whisper" to pin
 ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
 whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
 model_path = "~/Documents/Recall/models/ggml-base.en.bin"
 parakeet_bin = "parakeet-mlx"
 parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
 chunk_seconds = 600
+
+[live_transcription]
+enabled = true
 ```
 
 ## macOS Permissions

@@ -135,7 +135,7 @@ auto_analyze = true
 preset = "general"
 
 [transcription]
-engine = "parakeet"
+engine = "apple"      # default on Apple Silicon macOS 26+
 ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
 whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
 model_path = "~/Documents/Recall/models/ggml-base.en.bin"
