@@ -97,6 +97,7 @@ pub struct TuiOptions {
     pub parakeet_model: Option<String>,
     pub parakeet_cache_dir: Option<PathBuf>,
     pub require_parakeet: bool,
+    pub require_apple: bool,
     pub chunk_seconds: u64,
     pub agent: Option<String>,
     pub auto_analyze: bool,
@@ -105,6 +106,7 @@ pub struct TuiOptions {
     pub resume: Option<ResumeTarget>,
     pub timezone: String,
     pub keep_audio: bool,
+    pub live_transcript: bool,
 }
 
 impl Default for TuiOptions {
@@ -121,6 +123,7 @@ impl Default for TuiOptions {
             parakeet_model: None,
             parakeet_cache_dir: None,
             require_parakeet: false,
+            require_apple: false,
             chunk_seconds: TRANSCRIPTION_CHUNK_SECONDS,
             agent: None,
             auto_analyze: true,
@@ -129,6 +132,7 @@ impl Default for TuiOptions {
             resume: None,
             timezone: resolve_timezone(None),
             keep_audio: true,
+            live_transcript: true,
         }
     }
 }
@@ -262,6 +266,7 @@ struct App {
     parakeet_model: Option<String>,
     parakeet_cache_dir: Option<PathBuf>,
     require_parakeet: bool,
+    require_apple: bool,
     chunk_seconds: u64,
     note_draft: Option<NoteDraft>,
     note_footer: Rect,
@@ -273,6 +278,321 @@ struct App {
     timezone: String,
     keep_audio: bool,
     quit_notice: Option<String>,
+    live_transcript_enabled: bool,
+    live_transcript_visible: bool,
+    live_transcript: LiveTranscriptState,
+    live_scroll: u16,
+    live_pane_width: u16,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LiveTranscriptState {
+    mic: LiveSourceTranscript,
+    call: LiveSourceTranscript,
+    next_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveLineSource {
+    Mic,
+    Call,
+}
+
+#[derive(Debug, Clone)]
+struct LiveDisplayLine {
+    source: LiveLineSource,
+    text: String,
+    volatile: bool,
+    seq: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LiveSourceTranscript {
+    stable: Vec<String>,
+    seqs: Vec<u64>,
+    volatile: String,
+    volatile_seq: u64,
+}
+
+impl LiveTranscriptState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn apply_mic(&mut self, text: String, volatile: bool) {
+        self.next_seq += 1;
+        self.mic.apply(text, volatile, self.next_seq);
+    }
+
+    fn apply_call(&mut self, text: String, volatile: bool) {
+        self.next_seq += 1;
+        self.call.apply(text, volatile, self.next_seq);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.mic.is_empty() && self.call.is_empty()
+    }
+
+    fn interleaved_lines(&self) -> Vec<LiveDisplayLine> {
+        let mut rows = Vec::new();
+        rows.extend(self.mic.display_rows(LiveLineSource::Mic));
+        rows.extend(self.call.display_rows(LiveLineSource::Call));
+        rows.sort_by_key(|row| row.seq);
+        suppress_speaker_bleed(rows)
+    }
+}
+
+impl LiveSourceTranscript {
+    const MAX_STABLE: usize = 400;
+
+    fn is_empty(&self) -> bool {
+        self.stable.is_empty() && self.volatile.is_empty()
+    }
+
+    fn apply(&mut self, text: String, volatile: bool, seq: u64) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if volatile {
+            if self.volatile.is_empty() || same_live_utterance(&self.volatile, text) {
+                self.volatile = text.to_string();
+                self.volatile_seq = seq;
+            } else {
+                self.commit_volatile();
+                self.volatile = text.to_string();
+                self.volatile_seq = seq;
+            }
+            return;
+        }
+        if !self.volatile.is_empty() && same_live_utterance(&self.volatile, text) {
+            self.volatile.clear();
+            self.volatile_seq = 0;
+        } else {
+            self.commit_volatile();
+        }
+        self.push_stable(text.to_string(), seq);
+    }
+
+    fn commit_volatile(&mut self) {
+        if !self.volatile.is_empty() {
+            let text = std::mem::take(&mut self.volatile);
+            let seq = self.volatile_seq;
+            self.volatile_seq = 0;
+            self.push_stable(text, seq);
+        }
+    }
+
+    fn push_stable(&mut self, text: String, seq: u64) {
+        if let Some(last) = self.stable.last_mut() {
+            if last == &text || live_lines_equivalent(last, &text) {
+                *last = text;
+                if let Some(last_seq) = self.seqs.last_mut() {
+                    *last_seq = seq;
+                }
+                return;
+            }
+        }
+        self.stable.push(text);
+        self.seqs.push(seq);
+        let extra = self.stable.len().saturating_sub(Self::MAX_STABLE);
+        if extra > 0 {
+            self.stable.drain(..extra);
+            self.seqs.drain(..extra);
+        }
+    }
+
+    fn display_rows(&self, source: LiveLineSource) -> Vec<LiveDisplayLine> {
+        let mut rows: Vec<LiveDisplayLine> = self
+            .stable
+            .iter()
+            .zip(self.seqs.iter())
+            .map(|(text, seq)| LiveDisplayLine {
+                source,
+                text: text.clone(),
+                volatile: false,
+                seq: *seq,
+            })
+            .collect();
+        if !self.volatile.is_empty() {
+            rows.push(LiveDisplayLine {
+                source,
+                text: self.volatile.clone(),
+                volatile: true,
+                seq: self.volatile_seq,
+            });
+        }
+        rows
+    }
+}
+
+fn same_live_utterance(previous: &str, next: &str) -> bool {
+    let previous = previous.trim();
+    let next = next.trim();
+    next.starts_with(previous)
+        || previous.starts_with(next)
+        || live_lines_equivalent(previous, next)
+}
+
+fn normalize_live_text(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn compact_live_text(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
+}
+
+fn live_token_jaccard(a: &str, b: &str) -> f32 {
+    let a: std::collections::HashSet<String> = normalize_live_text(a)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let b: std::collections::HashSet<String> = normalize_live_text(b)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if a.len() < 4 || b.len() < 4 {
+        return 0.0;
+    }
+    let inter = a.intersection(&b).count() as f32;
+    let union = a.union(&b).count() as f32;
+    if union == 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+fn live_lines_equivalent(a: &str, b: &str) -> bool {
+    let compact_a = compact_live_text(a);
+    let compact_b = compact_live_text(b);
+    if compact_a.len() >= 16 && compact_a == compact_b {
+        return true;
+    }
+    live_token_jaccard(a, b) >= 0.72
+}
+
+fn unique_mic_against_call(mic: &str, call: &str) -> Option<String> {
+    let mic_norm = normalize_live_text(mic);
+    let call_norm = normalize_live_text(call);
+    if mic_norm.is_empty() {
+        return None;
+    }
+    if call_norm.is_empty() {
+        return Some(mic.trim().to_string());
+    }
+    if call_norm.contains(&mic_norm) || (mic_norm.len() >= 16 && call_norm.starts_with(&mic_norm)) {
+        return None;
+    }
+    if mic_norm.contains(&call_norm) {
+        let call_tokens: std::collections::HashSet<&str> = call_norm.split_whitespace().collect();
+        let kept: Vec<&str> = mic
+            .split_whitespace()
+            .filter(|word| {
+                let token = normalize_live_text(word);
+                !token.is_empty() && !call_tokens.contains(token.as_str())
+            })
+            .collect();
+        if kept.is_empty() {
+            return None;
+        }
+        return Some(kept.join(" "));
+    }
+    if live_lines_equivalent(mic, call)
+        || live_token_jaccard(mic, call) >= 0.55
+        || mic_is_short_bleed_fragment(mic, call)
+    {
+        return None;
+    }
+    Some(mic.trim().to_string())
+}
+
+fn mic_is_short_bleed_fragment(mic: &str, call: &str) -> bool {
+    let mic_tokens: Vec<String> = normalize_live_text(mic)
+        .split_whitespace()
+        .filter(|token| token.len() >= 3)
+        .map(str::to_string)
+        .collect();
+    if mic_tokens.is_empty() || mic_tokens.len() > 4 {
+        return false;
+    }
+    let call_norm = normalize_live_text(call);
+    let hits = mic_tokens
+        .iter()
+        .filter(|token| {
+            call_norm
+                .split_whitespace()
+                .any(|word| word == token.as_str())
+        })
+        .count();
+    hits * 2 >= mic_tokens.len()
+}
+
+fn suppress_speaker_bleed(rows: Vec<LiveDisplayLine>) -> Vec<LiveDisplayLine> {
+    let call_lines: Vec<(u64, String)> = rows
+        .iter()
+        .filter(|row| row.source == LiveLineSource::Call)
+        .map(|row| (row.seq, row.text.clone()))
+        .collect();
+    let mut out = Vec::new();
+    for row in rows {
+        if row.source != LiveLineSource::Mic {
+            out.push(row);
+            continue;
+        }
+        let mut skip = false;
+        let mut replacement = None;
+        for (seq, call_text) in &call_lines {
+            if seq.abs_diff(row.seq) > 40 {
+                continue;
+            }
+            match unique_mic_against_call(&row.text, call_text) {
+                None => {
+                    skip = true;
+                    replacement = None;
+                    break;
+                }
+                Some(rest) if rest != row.text.trim() => {
+                    replacement = Some(rest);
+                }
+                Some(_) => {}
+            }
+        }
+        if skip {
+            continue;
+        }
+        if let Some(rest) = replacement {
+            out.push(LiveDisplayLine { text: rest, ..row });
+        } else {
+            out.push(row);
+        }
+    }
+    out
+}
+
+fn wrapped_live_height(text: &str, width: u16) -> usize {
+    let inner = usize::from(width.max(8));
+    let mut height = 1;
+    let mut col = 0;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(1);
+        if col + w > inner && col > 0 {
+            height += 1;
+            col = w;
+        } else {
+            col += w;
+        }
+    }
+    height
 }
 
 #[derive(Debug, Clone)]
@@ -981,6 +1301,7 @@ impl App {
             parakeet_model: options.parakeet_model,
             parakeet_cache_dir: options.parakeet_cache_dir,
             require_parakeet: options.require_parakeet,
+            require_apple: options.require_apple,
             chunk_seconds: options.chunk_seconds,
             note_draft: None,
             note_footer: Rect::default(),
@@ -992,6 +1313,11 @@ impl App {
             timezone: options.timezone,
             keep_audio: options.keep_audio,
             quit_notice: None,
+            live_transcript_enabled: options.live_transcript,
+            live_transcript_visible: options.live_transcript,
+            live_transcript: LiveTranscriptState::default(),
+            live_scroll: 0,
+            live_pane_width: 80,
         };
         if let Some(resume) = resume {
             app.apply_resume(resume);
@@ -1079,6 +1405,36 @@ impl App {
             return Ok(false);
         }
 
+        if self.live_transcript_visible && self.live_transcript_enabled {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.scroll_live(8);
+                    return Ok(false);
+                }
+                KeyCode::Up => {
+                    self.scroll_live(1);
+                    return Ok(false);
+                }
+                KeyCode::PageDown => {
+                    self.scroll_live(-8);
+                    return Ok(false);
+                }
+                KeyCode::Down => {
+                    self.scroll_live(-1);
+                    return Ok(false);
+                }
+                KeyCode::End => {
+                    self.live_scroll = 0;
+                    return Ok(false);
+                }
+                KeyCode::Home => {
+                    self.live_scroll = u16::MAX;
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
         if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.request_quit();
         }
@@ -1097,6 +1453,7 @@ impl App {
             }
             KeyCode::Char('e') => self.end_capture(),
             KeyCode::Char('m') => self.add_marker(),
+            KeyCode::Char('t') => self.toggle_live_transcript(),
             KeyCode::Char('n') => self.start_manual_note(),
             KeyCode::Char('r') => self.refresh_sources(),
             KeyCode::Char('a') => self.toggle_auto_analyze(),
@@ -1179,6 +1536,26 @@ impl App {
                 Ok(())
             }
         }
+    }
+
+    fn toggle_live_transcript(&mut self) {
+        if !self.live_transcript_enabled {
+            self.toast =
+                "Live transcript is disabled. Launch with --live-transcript to enable.".to_string();
+            return;
+        }
+        self.live_transcript_visible = !self.live_transcript_visible;
+        self.toast = if self.live_transcript_visible {
+            "Live transcript shown. PgUp/PgDn scrolls.".to_string()
+        } else {
+            "Live transcript hidden. Status dashboard shown.".to_string()
+        };
+        self.live_scroll = 0;
+    }
+
+    fn scroll_live(&mut self, delta: i32) {
+        let next = i32::from(self.live_scroll) + delta;
+        self.live_scroll = next.max(0) as u16;
     }
 
     fn toggle_mic_mute(&mut self) -> io::Result<()> {
@@ -1636,6 +2013,10 @@ impl App {
                 .to_string(),
             "Press Enter to end and start transcription.".to_string(),
         ];
+        if self.live_transcript_enabled {
+            self.live_notes
+                .push("Live transcript on. Press t to hide.".to_string());
+        }
         for failure in failures {
             self.live_notes.push(failure);
         }
@@ -1746,7 +2127,9 @@ impl App {
         let mut started = Vec::new();
         let mut failures = Vec::new();
 
-        match MicRecorder::start(session_path, mic_name) {
+        self.live_transcript.reset();
+        self.live_scroll = 0;
+        match MicRecorder::start(session_path, mic_name, self.live_transcript_enabled) {
             Ok(recorder) => {
                 self.mic_recorder = Some(recorder);
                 started.push("mic");
@@ -1754,7 +2137,7 @@ impl App {
             Err(error) => failures.push(format!("mic failed: {error}")),
         }
 
-        match SystemRecorder::start(session_path, call_name) {
+        match SystemRecorder::start(session_path, call_name, self.live_transcript_enabled) {
             Ok(recorder) => {
                 self.system_recorder = Some(recorder);
                 started.push("system audio");
@@ -2103,6 +2486,19 @@ impl App {
                     self.mic_level_db = None;
                     break;
                 }
+                "live_transcript" => {
+                    if let Some(text) = event.text {
+                        self.live_transcript
+                            .apply_mic(text, event.volatile.unwrap_or(false));
+                    }
+                }
+                "live_transcript_unavailable" => {
+                    let message = event
+                        .message
+                        .unwrap_or_else(|| "Live transcript unavailable for mic.".to_string());
+                    self.toast = format!("Live text unavailable: {message}");
+                    self.live_notes.push(self.toast.clone());
+                }
                 _ => {}
             }
         }
@@ -2169,6 +2565,19 @@ impl App {
                     self.call_level_db = None;
                     break;
                 }
+                "live_transcript" => {
+                    if let Some(text) = event.text {
+                        self.live_transcript
+                            .apply_call(text, event.volatile.unwrap_or(false));
+                    }
+                }
+                "live_transcript_unavailable" => {
+                    let message = event
+                        .message
+                        .unwrap_or_else(|| "Live transcript unavailable for call.".to_string());
+                    self.toast = format!("Live text unavailable: {message}");
+                    self.live_notes.push(self.toast.clone());
+                }
                 "error" => {
                     self.toast = event
                         .message
@@ -2234,9 +2643,9 @@ impl App {
             self.transcription_status = TranscriptionStatus::queued();
         }
         self.toast = if generation > 1 {
-            format!("Take {generation} ended. Re-transcribing all takes.")
+            format!("Take {generation} ended. Finalizing transcript…")
         } else {
-            "Session ended. Audio finalized; transcription queued.".to_string()
+            "Session ended. Finalizing transcript…".to_string()
         };
         self.live_notes.push(if generation > 1 {
             format!("Take {generation} queued a full re-transcribe of all audio.")
@@ -2252,6 +2661,7 @@ impl App {
         let parakeet_model = self.parakeet_model.clone();
         let parakeet_cache_dir = self.parakeet_cache_dir.clone();
         let require_parakeet = self.require_parakeet;
+        let require_apple = self.require_apple;
         let chunk_seconds = self.chunk_seconds;
 
         thread::spawn(move || {
@@ -2270,6 +2680,7 @@ impl App {
                 chunk_seconds,
                 keep_wav: false,
                 require_parakeet,
+                require_apple,
                 generation: Some(generation),
                 keep_audio: true,
             };
@@ -2822,6 +3233,17 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        if self.live_transcript_enabled && matches!(self.state, CaptureState::Recording) {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                if self.live_transcript_visible {
+                    "live"
+                } else {
+                    "live hidden"
+                },
+                Style::default().fg(Color::Gray),
+            ));
+        }
         spans.extend([
             Span::raw("  "),
             Span::styled(consent, Style::default().fg(Color::Gray)),
@@ -3054,7 +3476,8 @@ impl App {
         ])
     }
 
-    fn render_live_recall(&self, frame: &mut Frame, area: Rect) {
+    fn render_live_recall(&mut self, frame: &mut Frame, area: Rect) {
+        self.live_pane_width = area.width;
         let session = self
             .session_path
             .as_ref()
@@ -3064,10 +3487,35 @@ impl App {
             Span::styled("Session: ", Style::default().fg(Color::Gray)),
             Span::raw(session),
         ])];
-        if self.session_path.is_some() {
+        let listening = self.live_transcript_enabled
+            && self.live_transcript_visible
+            && matches!(self.state, CaptureState::Recording);
+        if self.session_path.is_some() && !listening {
             lines.push(self.open_shortcuts_line());
         }
         lines.push(self.capture_health_line());
+        if listening {
+            if let Some(draft) = &self.note_draft {
+                lines.push(Line::from(vec![
+                    Span::styled("Note: ", Style::default().fg(Color::Blue)),
+                    Span::raw(draft.caption()),
+                ]));
+            }
+            lines.push(Line::raw(""));
+            let body = area.height.saturating_sub(5);
+            lines.extend(self.live_transcript_lines(body));
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(
+                        Block::default()
+                            .title(" Live Recall ")
+                            .borders(Borders::ALL),
+                    )
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
+            return;
+        }
         if self.has_background_jobs() {
             lines.push(self.background_jobs_line());
         }
@@ -3178,6 +3626,10 @@ impl App {
             lines.push(Line::raw(""));
         }
 
+        if self.live_transcript_enabled && self.live_transcript_visible {
+            lines.extend(self.live_transcript_lines(12));
+        }
+
         for note in self.live_notes.iter().rev().take(6).rev() {
             lines.push(Line::from(vec![
                 Span::styled("• ", Style::default().fg(Color::Cyan)),
@@ -3206,6 +3658,88 @@ impl App {
                 .wrap(Wrap { trim: true }),
             area,
         );
+    }
+
+    fn live_transcript_lines(&self, visible_rows: u16) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                "Live transcript",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  PgUp/PgDn scroll  End follow",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])];
+        if self.live_transcript.is_empty() {
+            let idle = if matches!(self.state, CaptureState::Recording) {
+                "Waiting for speech…"
+            } else {
+                "No live text this take."
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(idle, Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::raw(""));
+            return lines;
+        }
+        let rows = self.live_transcript.interleaved_lines();
+        let max_body = visible_rows.saturating_sub(2).max(4) as usize;
+        let text_width = self.live_pane_width.saturating_sub(12).max(8);
+        let heights: Vec<usize> = rows
+            .iter()
+            .map(|row| wrapped_live_height(&row.text, text_width))
+            .collect();
+        let total_height: usize = heights.iter().copied().sum();
+        let max_scroll = total_height.saturating_sub(max_body);
+        let scroll = (self.live_scroll as usize).min(max_scroll);
+        if scroll > 0 {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  ↑ {} older line(s)", scroll),
+                Style::default().fg(Color::DarkGray),
+            )]));
+        }
+        let mut skip = scroll;
+        let mut taken = 0;
+        let mut visible = Vec::new();
+        for (row, height) in rows.iter().zip(heights.iter()).rev() {
+            if skip >= *height {
+                skip -= *height;
+                continue;
+            }
+            visible.push(row);
+            taken += *height;
+            if taken >= max_body {
+                break;
+            }
+        }
+        visible.reverse();
+        for row in visible {
+            let (label, color) = match row.source {
+                LiveLineSource::Mic => ("Mic ", Color::Cyan),
+                LiveLineSource::Call => ("Call", Color::Magenta),
+            };
+            let mut spans = vec![Span::styled(
+                format!("  {label}  "),
+                Style::default().fg(color),
+            )];
+            if row.volatile {
+                spans.push(Span::styled(
+                    row.text.clone(),
+                    Style::default()
+                        .fg(Color::Gray)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+            } else {
+                spans.push(Span::raw(row.text.clone()));
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::raw(""));
+        lines
     }
 
     fn capture_health_line(&self) -> Line<'static> {
@@ -3442,6 +3976,8 @@ impl App {
             Span::raw(" append/new  "),
             Span::styled(" m ", Style::default().fg(Color::Black).bg(Color::Magenta)),
             Span::raw(" marker  "),
+            Span::styled(" t ", Style::default().fg(Color::Black).bg(Color::Magenta)),
+            Span::raw(" live  "),
             Span::styled(" n ", Style::default().fg(Color::Black).bg(Color::Blue)),
             Span::raw(" note  "),
             Span::styled(" r ", Style::default().fg(Color::Black).bg(Color::Cyan)),
@@ -3624,7 +4160,7 @@ impl TranscriptionStatus {
 
     fn queued() -> Self {
         Self {
-            label: "Transcription queued".to_string(),
+            label: "Finalizing transcript…".to_string(),
             percent: 1,
             transcript_path: None,
             failed: false,
@@ -3745,6 +4281,7 @@ mod tests {
             parakeet_model: None,
             parakeet_cache_dir: None,
             require_parakeet: false,
+            require_apple: false,
             chunk_seconds: TRANSCRIPTION_CHUNK_SECONDS,
             note_draft: None,
             note_footer: Rect::default(),
@@ -3756,6 +4293,11 @@ mod tests {
             timezone: crate::session::FALLBACK_TIMEZONE.to_string(),
             keep_audio: true,
             quit_notice: None,
+            live_transcript_enabled: true,
+            live_transcript_visible: true,
+            live_transcript: LiveTranscriptState::default(),
+            live_scroll: 0,
+            live_pane_width: 80,
         }
     }
 
@@ -3775,6 +4317,164 @@ mod tests {
         let (engine, model) = app.engine_status_parts();
         assert_eq!(engine, "whisper");
         assert_eq!(model, "ggml-large-v3-turbo.bin");
+
+        app.engine = TranscriptionEngine::Apple;
+        let (engine, model) = app.engine_status_parts();
+        assert_eq!(engine, "apple");
+        assert_eq!(model, "SpeechAnalyzer");
+    }
+
+    #[test]
+    fn live_transcript_grows_in_place_then_appends_a_new_utterance() {
+        let mut source = LiveSourceTranscript::default();
+        source.apply("Please schedule".into(), true, 1);
+        source.apply("Please schedule the review".into(), true, 2);
+        assert!(source.stable.is_empty());
+        assert_eq!(source.volatile, "Please schedule the review");
+
+        source.apply("Please schedule the review for Thursday.".into(), false, 3);
+        assert_eq!(
+            source.stable,
+            vec!["Please schedule the review for Thursday.".to_string()]
+        );
+        assert!(source.volatile.is_empty());
+
+        source.apply("Do not delete".into(), true, 4);
+        assert_eq!(source.stable.len(), 1);
+        assert_eq!(source.volatile, "Do not delete");
+        source.apply("Do not delete the backup.".into(), false, 5);
+        assert_eq!(source.stable.len(), 2);
+        assert_eq!(source.stable[1], "Do not delete the backup.");
+    }
+
+    #[test]
+    fn t_toggles_live_transcript_visibility() {
+        let mut app = test_app(PathBuf::from("/tmp/recall-live-toggle"));
+        app.state = CaptureState::Recording;
+        assert!(app.live_transcript_visible);
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.live_transcript_visible);
+        assert!(app.toast.contains("hidden"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.live_transcript_visible);
+        assert_eq!(app.state, CaptureState::Recording);
+    }
+
+    #[test]
+    fn note_draft_t_types_the_letter_instead_of_toggling_live() {
+        let mut app = test_app(PathBuf::from("/tmp/recall-live-note-t"));
+        app.state = CaptureState::Recording;
+        app.start_manual_note();
+        type_note(&mut app, "t");
+        assert_eq!(app.note_draft.as_ref().unwrap().caption(), "t");
+        assert!(app.live_transcript_visible);
+        assert_eq!(app.state, CaptureState::Recording);
+    }
+
+    #[test]
+    fn live_transcript_interleaves_and_hides_speaker_bleed() {
+        let mut live = LiveTranscriptState::default();
+        live.apply_call("It says ready to launch.".into(), false);
+        live.apply_mic("It says ready to launch.".into(), false);
+        live.apply_mic("Okay. It says ready to launch.".into(), false);
+        live.apply_mic("Let's go.".into(), false);
+        live.apply_call("Nick T in the house!".into(), false);
+        live.apply_mic("Nick, numerous.".into(), false);
+        let rows = live.interleaved_lines();
+        let texts: Vec<_> = rows
+            .iter()
+            .map(|row| (row.source, row.text.as_str()))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                (LiveLineSource::Call, "It says ready to launch."),
+                (LiveLineSource::Mic, "Okay."),
+                (LiveLineSource::Mic, "Let's go."),
+                (LiveLineSource::Call, "Nick T in the house!"),
+            ]
+        );
+    }
+
+    #[test]
+    fn page_up_scrolls_live_transcript_history() {
+        let mut app = test_app(PathBuf::from("/tmp/recall-live-scroll"));
+        app.state = CaptureState::Recording;
+        for i in 0..20 {
+            app.live_transcript.apply_call(
+                format!("Projection for year {i} shows growth of {i} percent."),
+                false,
+            );
+        }
+        assert_eq!(app.live_scroll, 0);
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.live_scroll > 0);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.live_scroll, 0);
+    }
+
+    #[test]
+    fn live_transcript_hides_spaced_and_revised_bleed() {
+        let mut live = LiveTranscriptState::default();
+        live.apply_mic(
+            "To learn more, visit LincolnElectric.com slash EV dash charging.".into(),
+            false,
+        );
+        live.apply_call(
+            "To learn more, visit Lincoln Electric.com slash EV dash charging.".into(),
+            false,
+        );
+        live.apply_call(
+            "Thank you to our sponsor, Iana, with over 100 EV charging locations now open to customers."
+                .into(),
+            false,
+        );
+        live.apply_call(
+            "Thank you to our sponsor, Ayana, with over 100 EV charging locations now open to customers."
+                .into(),
+            false,
+        );
+        live.apply_mic(
+            "Thank you to our sponsor, Ayana, with over 100 EV charging locations now open to customers."
+                .into(),
+            false,
+        );
+        let rows = live.interleaved_lines();
+        let texts: Vec<_> = rows
+            .iter()
+            .map(|row| (row.source, row.text.as_str()))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                (
+                    LiveLineSource::Call,
+                    "To learn more, visit Lincoln Electric.com slash EV dash charging."
+                ),
+                (
+                    LiveLineSource::Call,
+                    "Thank you to our sponsor, Ayana, with over 100 EV charging locations now open to customers."
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn mute_does_not_clear_call_live_text() {
+        let mut app = test_app(PathBuf::from("/tmp/recall-live-mute"));
+        app.state = CaptureState::Recording;
+        app.live_transcript
+            .apply_call("Yes, I agree.".to_string(), false);
+        app.mic_muted = true;
+        assert_eq!(
+            app.live_transcript.call.stable,
+            vec!["Yes, I agree.".to_string()]
+        );
+        assert!(app.live_transcript.mic.is_empty());
     }
 
     #[test]
@@ -3960,7 +4660,7 @@ mod tests {
 
         app.process_transcription_events();
 
-        assert_eq!(app.transcription_status.label, "Transcription queued");
+        assert_eq!(app.transcription_status.label, "Finalizing transcript…");
         assert!(app.transcription_status.transcript_path.is_none());
         assert!(app.analysis_jobs.is_empty());
         assert!(app

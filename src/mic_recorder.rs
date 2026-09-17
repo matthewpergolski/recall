@@ -24,6 +24,13 @@ pub struct MicEvent {
     pub device_name: Option<String>,
     #[serde(rename = "deviceID")]
     pub device_id: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub volatile: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub revision: Option<u64>,
 }
 
 pub struct MicRecorder {
@@ -72,10 +79,16 @@ fn prepare_control_files(session_dir: &Path) -> io::Result<(PathBuf, PathBuf)> {
 }
 
 impl MicRecorder {
-    pub fn start(session_dir: &Path, output_name: &str) -> io::Result<Self> {
+    pub fn start(session_dir: &Path, output_name: &str, live_transcript: bool) -> io::Result<Self> {
         let (stop_file, mute_file) = prepare_control_files(session_dir)?;
 
-        let mut child = spawn_helper(session_dir, &stop_file, &mute_file, output_name)?;
+        let mut child = spawn_helper(
+            session_dir,
+            &stop_file,
+            &mute_file,
+            output_name,
+            live_transcript,
+        )?;
         let stdout = child
             .stdout
             .take()
@@ -164,6 +177,7 @@ fn spawn_helper(
     stop_file: &Path,
     mute_file: &Path,
     output_name: &str,
+    live_transcript: bool,
 ) -> io::Result<Child> {
     let helper_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("capture-helper");
 
@@ -192,6 +206,9 @@ fn spawn_helper(
         .arg(output_name)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if live_transcript {
+        command.arg("--live-transcript");
+    }
 
     command.spawn()
 }
@@ -257,5 +274,18 @@ mod tests {
         assert!(!mute_path.exists());
 
         let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn parses_live_transcript_event() {
+        let event: MicEvent = serde_json::from_str(
+            r#"{"elapsedSeconds":2.1,"revision":3,"source":"mic","text":"Please schedule the review","type":"live_transcript","volatile":true}"#,
+        )
+        .unwrap();
+        assert_eq!(event.event_type, "live_transcript");
+        assert_eq!(event.text.as_deref(), Some("Please schedule the review"));
+        assert_eq!(event.volatile, Some(true));
+        assert_eq!(event.revision, Some(3));
+        assert_eq!(event.elapsed_seconds, Some(2.1));
     }
 }

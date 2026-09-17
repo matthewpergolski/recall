@@ -123,7 +123,7 @@ Current gap: automatic transcription and agent analysis are initial; clean trans
 
 Near-term gate: validate and tune transcript merge quality before prioritizing automatic summaries or action extraction. Speaker-mode recordings should not produce a confusing duplicate transcript when the mic also hears remote audio.
 
-Later, after live transcription exists: an optional TUI side panel for the live conversation that can expand to the full terminal. NVIDIA Parakeet TDT 0.6B v3 (`parakeet-mlx`) is the default batch engine; Whisper remains a fallback. Live streaming is still later work.
+Later, after live transcription exists: an optional TUI side panel for the live conversation that can expand to the full terminal. Apple SpeechAnalyzer is the default batch engine on Apple Silicon macOS 26+; Parakeet (`parakeet-mlx`) and Whisper remain fallbacks. Live streaming is still later work.
 
 ## v3: Recall Library
 

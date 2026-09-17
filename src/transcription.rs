@@ -8,6 +8,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::Deserialize;
+
 use crate::audio::{
     concat_audio_segments, discover_track_segments, generation_is_current, lock_session_publish,
     maybe_discard_session_audio, refresh_track_alias, AudioRetention, AudioTrack,
@@ -25,9 +27,13 @@ pub const PARAKEET_CHUNK_SECONDS: u64 = 120;
 pub const PARAKEET_OVERLAP_SECONDS: u64 = 15;
 pub const PARAKEET_INSTALL_HINT: &str =
     "Install with `uv tool install parakeet-mlx`. Whisper fallback: --engine whisper";
+pub const APPLE_SPEECH_HINT: &str =
+    "Apple SpeechAnalyzer needs macOS 26+ and an on-device speech model. Fallback: --engine parakeet";
+pub const APPLE_SPEECH_MODEL_LABEL: &str = "SpeechAnalyzer";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptionEngine {
+    Apple,
     Whisper,
     Parakeet,
 }
@@ -40,7 +46,7 @@ impl Default for TranscriptionEngine {
 
 pub fn default_transcription_engine() -> TranscriptionEngine {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        TranscriptionEngine::Parakeet
+        TranscriptionEngine::Apple
     } else {
         TranscriptionEngine::Whisper
     }
@@ -49,6 +55,7 @@ pub fn default_transcription_engine() -> TranscriptionEngine {
 impl TranscriptionEngine {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "apple" => Some(Self::Apple),
             "whisper" => Some(Self::Whisper),
             "parakeet" => Some(Self::Parakeet),
             _ => None,
@@ -57,6 +64,7 @@ impl TranscriptionEngine {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Apple => "apple",
             Self::Whisper => "whisper",
             Self::Parakeet => "parakeet",
         }
@@ -64,6 +72,7 @@ impl TranscriptionEngine {
 
     fn display_name(self) -> &'static str {
         match self {
+            Self::Apple => "Apple Speech",
             Self::Whisper => "Whisper",
             Self::Parakeet => "Parakeet",
         }
@@ -76,6 +85,7 @@ pub fn engine_status_parts(
     whisper_model: Option<&Path>,
 ) -> (String, String) {
     let model = match engine {
+        TranscriptionEngine::Apple => APPLE_SPEECH_MODEL_LABEL.to_string(),
         TranscriptionEngine::Parakeet => {
             let env_model = env_parakeet_model();
             short_model_label(&resolve_parakeet_model_id(
@@ -116,6 +126,7 @@ pub struct TranscribeOptions {
     pub chunk_seconds: u64,
     pub keep_wav: bool,
     pub require_parakeet: bool,
+    pub require_apple: bool,
     pub generation: Option<u32>,
     pub keep_audio: bool,
 }
@@ -272,21 +283,27 @@ pub enum DoctorCheckLevel {
 
 #[derive(Debug, Clone)]
 enum AsrEngine {
+    Apple {
+        helper: PathBuf,
+    },
     Whisper {
         bin: PathBuf,
         model: PathBuf,
         fallback_from_parakeet: bool,
+        fallback_from_apple: bool,
     },
     Parakeet {
         bin: PathBuf,
         model: String,
         cache_dir: Option<PathBuf>,
+        fallback_from_apple: bool,
     },
 }
 
 impl AsrEngine {
     fn kind(&self) -> TranscriptionEngine {
         match self {
+            Self::Apple { .. } => TranscriptionEngine::Apple,
             Self::Whisper { .. } => TranscriptionEngine::Whisper,
             Self::Parakeet { .. } => TranscriptionEngine::Parakeet,
         }
@@ -294,6 +311,7 @@ impl AsrEngine {
 
     fn model_label(&self) -> String {
         match self {
+            Self::Apple { .. } => APPLE_SPEECH_MODEL_LABEL.to_string(),
             Self::Whisper { model, .. } => model.display().to_string(),
             Self::Parakeet { model, .. } => model.clone(),
         }
@@ -301,6 +319,19 @@ impl AsrEngine {
 
     fn fallback_note(&self) -> Option<String> {
         match self {
+            Self::Parakeet {
+                fallback_from_apple: true,
+                ..
+            } => Some(format!(
+                "Apple SpeechAnalyzer unavailable; falling back to Parakeet. {APPLE_SPEECH_HINT}"
+            )),
+            Self::Whisper {
+                fallback_from_apple: true,
+                fallback_from_parakeet: true,
+                ..
+            } => Some(format!(
+                "Apple SpeechAnalyzer unavailable and Parakeet CLI missing; falling back to Whisper. {APPLE_SPEECH_HINT} {PARAKEET_INSTALL_HINT}"
+            )),
             Self::Whisper {
                 fallback_from_parakeet: true,
                 ..
@@ -313,11 +344,13 @@ impl AsrEngine {
 
     fn transcribe_chunk(&self, wav: &Path, output_base: &Path) -> io::Result<()> {
         match self {
+            Self::Apple { helper } => run_apple_transcribe(helper, wav, output_base),
             Self::Whisper { bin, model, .. } => run_whisper(bin, model, wav, output_base),
             Self::Parakeet {
                 bin,
                 model,
                 cache_dir,
+                ..
             } => {
                 let output_dir = output_base.parent().unwrap_or(Path::new("."));
                 run_parakeet(
@@ -337,11 +370,12 @@ impl AsrEngine {
         F: FnMut(TranscriptionProgress),
     {
         match self {
-            Self::Whisper { .. } => Ok(()),
+            Self::Apple { .. } | Self::Whisper { .. } => Ok(()),
             Self::Parakeet {
                 bin,
                 model,
                 cache_dir,
+                ..
             } => {
                 let Some(first) = chunks.first() else {
                     return Ok(());
@@ -365,6 +399,10 @@ impl AsrEngine {
 
     fn read_text(&self, output_base: &Path, wav: &Path) -> io::Result<String> {
         match self {
+            Self::Apple { .. } => Ok(clean_whisper_text_block(&read_apple_text(
+                output_base,
+                wav,
+            )?)),
             Self::Whisper { .. } => {
                 let text = read_whisper_output(output_base, wav)?;
                 Ok(clean_whisper_text_block(&text))
@@ -416,7 +454,7 @@ where
 
     let parakeet_cache_dir = match &engine {
         AsrEngine::Parakeet { cache_dir, .. } => cache_dir.clone(),
-        AsrEngine::Whisper { .. } => None,
+        AsrEngine::Apple { .. } | AsrEngine::Whisper { .. } => None,
     };
     let parakeet_needs_download = matches!(engine.kind(), TranscriptionEngine::Parakeet)
         && !parakeet_model_is_cached(&engine.model_label(), parakeet_cache_dir.as_deref());
@@ -517,7 +555,8 @@ where
                     &mut stage_started,
                 );
             }
-            TranscriptionEngine::Whisper => {
+            TranscriptionEngine::Whisper | TranscriptionEngine::Apple => {
+                let engine_name = engine.kind().as_str();
                 for (index, chunk) in chunks.iter().enumerate() {
                     progress(TranscriptionProgress::ChunkStarted {
                         track: track.label(),
@@ -528,7 +567,7 @@ where
                     engine.transcribe_chunk(&chunk.wav_path, &chunk.output_base)?;
                     mark_stage(
                         &format!(
-                            "{} whisper chunk {}/{}",
+                            "{} {engine_name} chunk {}/{}",
                             track.label(),
                             index + 1,
                             chunks.len()
@@ -816,49 +855,331 @@ fn resolve_model_path(options: &TranscribeOptions) -> io::Result<PathBuf> {
 
 fn resolve_asr_engine(options: &TranscribeOptions) -> io::Result<AsrEngine> {
     match options.engine {
-        TranscriptionEngine::Whisper => Ok(AsrEngine::Whisper {
-            bin: resolve_whisper_binary(options)?,
-            model: resolve_model_path(options)?,
-            fallback_from_parakeet: false,
-        }),
-        TranscriptionEngine::Parakeet => {
-            if let Some(bin) = find_parakeet_binary(options.parakeet_bin.as_deref())
-                .filter(|path| parakeet_binary_is_present(path))
-            {
-                return Ok(AsrEngine::Parakeet {
-                    bin,
-                    model: resolve_parakeet_model(options),
-                    cache_dir: resolve_parakeet_cache_dir(options),
-                });
-            }
+        TranscriptionEngine::Whisper => resolve_whisper_engine(options, false, false),
+        TranscriptionEngine::Parakeet => resolve_parakeet_engine(options, false),
+        TranscriptionEngine::Apple => match resolve_apple_engine() {
+            Ok(engine) => Ok(engine),
+            Err(error) if options.require_apple => Err(error),
+            Err(_) => resolve_parakeet_engine(options, true),
+        },
+    }
+}
 
-            if options.require_parakeet {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "Missing Parakeet CLI (`{DEFAULT_PARAKEET_BIN}`). {PARAKEET_INSTALL_HINT}"
-                    ),
-                ));
-            }
+fn resolve_whisper_engine(
+    options: &TranscribeOptions,
+    fallback_from_parakeet: bool,
+    fallback_from_apple: bool,
+) -> io::Result<AsrEngine> {
+    Ok(AsrEngine::Whisper {
+        bin: resolve_whisper_binary(options)?,
+        model: resolve_model_path(options)?,
+        fallback_from_parakeet,
+        fallback_from_apple,
+    })
+}
 
-            match (
-                resolve_whisper_binary(options),
-                resolve_model_path(options),
-            ) {
-                (Ok(bin), Ok(model)) => Ok(AsrEngine::Whisper {
-                    bin,
-                    model,
-                    fallback_from_parakeet: true,
-                }),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "Missing Parakeet CLI (`{DEFAULT_PARAKEET_BIN}`) and Whisper is not available either. {PARAKEET_INSTALL_HINT}"
-                    ),
-                )),
-            }
+fn resolve_parakeet_engine(
+    options: &TranscribeOptions,
+    fallback_from_apple: bool,
+) -> io::Result<AsrEngine> {
+    if let Some(bin) = find_parakeet_binary(options.parakeet_bin.as_deref())
+        .filter(|path| parakeet_binary_is_present(path))
+    {
+        return Ok(AsrEngine::Parakeet {
+            bin,
+            model: resolve_parakeet_model(options),
+            cache_dir: resolve_parakeet_cache_dir(options),
+            fallback_from_apple,
+        });
+    }
+
+    if options.require_parakeet {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Missing Parakeet CLI (`{DEFAULT_PARAKEET_BIN}`). {PARAKEET_INSTALL_HINT}"),
+        ));
+    }
+
+    match resolve_whisper_engine(options, true, fallback_from_apple) {
+        Ok(engine) => Ok(engine),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            if fallback_from_apple {
+                format!(
+                    "Apple SpeechAnalyzer unavailable, Parakeet CLI (`{DEFAULT_PARAKEET_BIN}`) missing, and Whisper is not available either. {APPLE_SPEECH_HINT} {PARAKEET_INSTALL_HINT}"
+                )
+            } else {
+                format!(
+                    "Missing Parakeet CLI (`{DEFAULT_PARAKEET_BIN}`) and Whisper is not available either. {PARAKEET_INSTALL_HINT}"
+                )
+            },
+        )),
+    }
+}
+
+fn resolve_apple_engine() -> io::Result<AsrEngine> {
+    let helper = resolve_capture_helper().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Missing recall-capture helper for Apple SpeechAnalyzer. {APPLE_SPEECH_HINT}"),
+        )
+    })?;
+    let status = apple_speech_status_from_helper(&helper)?;
+    if status.available {
+        Ok(AsrEngine::Apple { helper })
+    } else {
+        let detail = status
+            .message
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| APPLE_SPEECH_HINT.to_string());
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Apple SpeechAnalyzer is unavailable. {detail}"),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppleTranscribeStatus {
+    available: bool,
+    locale: Option<String>,
+    #[serde(rename = "installedLocales", default)]
+    installed_locales: Vec<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HelperErrorMessage {
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppleSpeechDoctorStatus {
+    pub available: bool,
+    pub locale: Option<String>,
+    pub installed_locales: Vec<String>,
+    pub message: Option<String>,
+    pub helper_path: Option<PathBuf>,
+}
+
+pub fn probe_apple_speech_status() -> AppleSpeechDoctorStatus {
+    match resolve_capture_helper() {
+        Some(helper) => match apple_speech_status_from_helper(&helper) {
+            Ok(status) => AppleSpeechDoctorStatus {
+                available: status.available,
+                locale: status.locale,
+                installed_locales: status.installed_locales,
+                message: status.message,
+                helper_path: Some(helper),
+            },
+            Err(error) => AppleSpeechDoctorStatus {
+                available: false,
+                locale: None,
+                installed_locales: Vec::new(),
+                message: Some(error.to_string()),
+                helper_path: Some(helper),
+            },
+        },
+        None => AppleSpeechDoctorStatus {
+            available: false,
+            locale: None,
+            installed_locales: Vec::new(),
+            message: Some(format!(
+                "Missing recall-capture helper for Apple SpeechAnalyzer. {APPLE_SPEECH_HINT}"
+            )),
+            helper_path: None,
+        },
+    }
+}
+
+fn resolve_capture_helper() -> Option<PathBuf> {
+    let helper_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("capture-helper");
+    capture_helper_binary(&helper_dir).or_else(|| {
+        find_binary("swift")?;
+        Some(helper_dir)
+    })
+}
+
+fn capture_helper_binary(helper_dir: &Path) -> Option<PathBuf> {
+    [
+        helper_dir.join(".build/debug/recall-capture"),
+        helper_dir.join(".build/arm64-apple-macosx/debug/recall-capture"),
+        helper_dir.join(".build/x86_64-apple-macosx/debug/recall-capture"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+}
+
+fn capture_helper_command(helper: &Path) -> Command {
+    if helper
+        .file_name()
+        .is_some_and(|name| name == "recall-capture")
+        && helper.exists()
+    {
+        Command::new(helper)
+    } else {
+        let mut command = Command::new("swift");
+        command.arg("run").arg("recall-capture").current_dir(helper);
+        command
+    }
+}
+
+fn apple_speech_status_from_helper(helper: &Path) -> io::Result<AppleTranscribeStatus> {
+    let output = capture_helper_command(helper)
+        .arg("transcribe-status")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    match parse_json_from_helper_output(&output.stdout) {
+        Ok(status) => Ok(status),
+        Err(_) if output.status.success() => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recall-capture transcribe-status returned no JSON status",
+        )),
+        Err(_) => Err(helper_command_error(
+            "transcribe-status",
+            &output.stdout,
+            &output.stderr,
+        )),
+    }
+}
+
+fn absolute_helper_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn run_apple_transcribe(helper: &Path, wav: &Path, output_base: &Path) -> io::Result<()> {
+    let wav = absolute_helper_path(wav);
+    let output_base = absolute_helper_path(output_base);
+    if let Some(parent) = output_base.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let output = capture_helper_command(helper)
+        .arg("transcribe-file")
+        .arg("--audio")
+        .arg(&wav)
+        .arg("--out")
+        .arg(&output_base)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(helper_command_error(
+            "transcribe-file",
+            &output.stdout,
+            &output.stderr,
+        ))
+    }
+}
+
+fn helper_command_error(command: &str, stdout: &[u8], stderr: &[u8]) -> io::Error {
+    if let Ok(parsed) = parse_json_from_helper_output::<HelperErrorMessage>(stdout) {
+        if let Some(message) = parsed.message.filter(|value| !value.trim().is_empty()) {
+            return io::Error::other(message);
         }
     }
+    let stderr_text = String::from_utf8_lossy(stderr).trim().to_string();
+    let stdout_text = String::from_utf8_lossy(stdout).trim().to_string();
+    let detail = if !stderr_text.is_empty() {
+        stderr_text
+    } else if !stdout_text.is_empty() {
+        stdout_text
+    } else {
+        format!("recall-capture {command} failed")
+    };
+    io::Error::other(detail)
+}
+
+fn parse_json_from_helper_output<T>(stdout: &[u8]) -> io::Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let text = String::from_utf8_lossy(stdout);
+    if let Ok(value) = serde_json::from_str(text.trim()) {
+        return Ok(value);
+    }
+    let start = text.find('{').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recall-capture produced no JSON object",
+        )
+    })?;
+    let end = text.rfind('}').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recall-capture produced incomplete JSON",
+        )
+    })?;
+    serde_json::from_str(&text[start..=end]).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to parse recall-capture JSON: {error}"),
+        )
+    })
+}
+
+fn read_apple_text(output_base: &Path, wav: &Path) -> io::Result<String> {
+    let txt_candidates = [
+        path_with_added_extension(output_base, "txt"),
+        path_with_added_extension(wav, "txt"),
+        wav.with_extension("txt"),
+    ];
+    for candidate in txt_candidates {
+        if candidate.exists() {
+            return fs::read_to_string(candidate);
+        }
+    }
+
+    if let Some(vtt_path) = find_vtt_output(output_base, wav) {
+        let segments = parse_vtt_segments_with_offset("apple", &fs::read_to_string(vtt_path)?, 0)?;
+        return Ok(segments
+            .into_iter()
+            .map(|segment| segment.text)
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+
+    let json_path = path_with_added_extension(output_base, "json");
+    if json_path.exists() {
+        let parsed: AppleTranscriptFile = serde_json::from_str(&fs::read_to_string(json_path)?)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to parse Apple transcript JSON: {error}"),
+                )
+            })?;
+        return Ok(parsed
+            .segments
+            .into_iter()
+            .map(|segment| segment.text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "Apple SpeechAnalyzer finished but no .txt, .vtt, or .json output file was found.",
+    ))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppleTranscriptFile {
+    segments: Vec<AppleTranscriptSegment>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AppleTranscriptSegment {
+    text: String,
 }
 
 pub fn find_parakeet_binary(explicit: Option<&Path>) -> Option<PathBuf> {
@@ -2296,7 +2617,8 @@ mod tests {
         format_model_download_label, format_timestamp, huggingface_repo_dir_name,
         parakeet_binary_doctor_level, parse_hf_progress_line, parse_vtt_segments_with_offset,
         path_with_added_extension, resolve_parakeet_model_id, track_chunks_dir, DoctorCheckLevel,
-        Track, TrackSelection, TranscriptSegment, TranscriptionEngine, DEFAULT_PARAKEET_MODEL,
+        Track, TrackSelection, TranscriptSegment, TranscriptionEngine, APPLE_SPEECH_MODEL_LABEL,
+        DEFAULT_PARAKEET_MODEL,
     };
     use std::path::Path;
     use std::time::Duration;
@@ -2372,13 +2694,22 @@ mod tests {
         );
         assert_eq!(engine, "whisper");
         assert_eq!(model, "ggml-large-v3-turbo.bin");
+
+        let (engine, model) = super::engine_status_parts(TranscriptionEngine::Apple, None, None);
+        assert_eq!(engine, "apple");
+        assert_eq!(model, APPLE_SPEECH_MODEL_LABEL);
     }
 
     #[test]
-    fn parakeet_is_the_default_transcription_engine() {
+    fn apple_is_the_default_transcription_engine_on_apple_silicon() {
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(TranscriptionEngine::default(), TranscriptionEngine::Apple);
+        } else {
+            assert_eq!(TranscriptionEngine::default(), TranscriptionEngine::Whisper);
+        }
         assert_eq!(
-            TranscriptionEngine::default(),
-            TranscriptionEngine::Parakeet
+            TranscriptionEngine::parse("apple"),
+            Some(TranscriptionEngine::Apple)
         );
         assert_eq!(
             TranscriptionEngine::parse("whisper"),
@@ -2389,7 +2720,10 @@ mod tests {
             Some(TranscriptionEngine::Parakeet)
         );
         assert!(TranscriptionEngine::parse("nemo").is_none());
+        assert_eq!(TranscriptionEngine::Apple.as_str(), "apple");
+        assert_eq!(TranscriptionEngine::Apple.display_name(), "Apple Speech");
         assert_eq!(TranscriptionEngine::Whisper.as_str(), "whisper");
+        assert_eq!(TranscriptionEngine::Parakeet.as_str(), "parakeet");
     }
 
     #[test]
@@ -2413,6 +2747,10 @@ mod tests {
         );
         assert_eq!(
             parakeet_binary_doctor_level(Some(missing), TranscriptionEngine::Whisper),
+            DoctorCheckLevel::Warn
+        );
+        assert_eq!(
+            parakeet_binary_doctor_level(Some(missing), TranscriptionEngine::Apple),
             DoctorCheckLevel::Warn
         );
     }
@@ -2747,5 +3085,28 @@ Hello <b>there.</b>\n";
 
         assert!(!markdown.contains("CC-BY-4.0"));
         assert!(!markdown.contains("NVIDIA Parakeet"));
+    }
+
+    #[test]
+    fn apple_transcript_header_has_no_nvidia_attribution() {
+        let segments = vec![TranscriptSegment {
+            start_ms: 1_000,
+            end_ms: 2_000,
+            track: "call",
+            text: "Clean line.".to_string(),
+        }];
+
+        let markdown = super::transcript_markdown(
+            "Test",
+            TranscriptionEngine::Apple,
+            APPLE_SPEECH_MODEL_LABEL,
+            &segments,
+        );
+
+        assert!(markdown.contains("Engine: `apple`"));
+        assert!(markdown.contains("Model: `SpeechAnalyzer`"));
+        assert!(markdown.contains("Apple Speech"));
+        assert!(!markdown.contains("CC-BY-4.0"));
+        assert!(!markdown.contains("NVIDIA"));
     }
 }

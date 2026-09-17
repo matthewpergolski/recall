@@ -10,6 +10,7 @@ recall transcribe latest --track call
 recall transcribe latest --track mic
 recall transcribe /path/to/session --track both
 recall transcribe latest --chunk-seconds 600
+recall transcribe latest --engine apple
 recall transcribe latest --engine whisper
 recall transcribe latest --engine parakeet
 ```
@@ -42,7 +43,7 @@ The clean conversation timeline is not full speaker diarization. It starts from 
 
 ## Multi-Hour Calls
 
-Recall chunks each audio track with `ffmpeg` before sending it to the selected ASR engine. The default engine is Parakeet (`parakeet-mlx`). `--engine whisper` uses `whisper-cli`. The default chunk size is 600 seconds, or 10 minutes.
+Recall chunks each audio track with `ffmpeg` before sending it to the selected ASR engine. The default engine on Apple Silicon macOS 26+ is Apple SpeechAnalyzer. `--engine parakeet` uses `parakeet-mlx`. `--engine whisper` uses `whisper-cli`. The default chunk size is 600 seconds, or 10 minutes. If Apple is the default and SpeechAnalyzer is unavailable, Recall falls back to Parakeet. Passing `--engine apple` or config `engine = "apple"` errors instead of falling back.
 
 That means a 2-hour call with both `call.m4a` and `mic.m4a` becomes roughly:
 
@@ -129,16 +130,16 @@ The default documented model, `ggml-base.en.bin`, is fast and convenient, but re
 
 On silent or near-silent call audio, Whisper often invents short polite phrases such as `You` or `Thank you.` Those lines are model hallucinations, not meeting speech. A moving **Call** meter during capture is the check that the call track actually had sound. The current local default on this machine is `ggml-large-v3-turbo.bin`, which is stronger than `base.en` but can still hallucinate on empty audio.
 
-Default Apple Silicon backend: NVIDIA **Parakeet TDT 0.6B v3** via `parakeet-mlx`. Whisper/`whisper-cli` remains a first-class fallback. It is a second engine, not a drop-in ggml file.
+Default Apple Silicon backend: on-device **Apple SpeechAnalyzer**. Parakeet (`parakeet-mlx`) and Whisper/`whisper-cli` remain first-class engines. They are not drop-in ggml files.
 
 ```sh
-uv tool install parakeet-mlx
 recall transcribe latest
+recall transcribe latest --engine apple
 recall transcribe latest --engine parakeet
 recall transcribe latest --engine whisper
 ```
 
-`--engine whisper` is always valid. The default Parakeet path needs `parakeet-mlx` on PATH (or `RECALL_PARAKEET_BIN`) and may download `mlx-community/parakeet-tdt-0.6b-v3` on first run. `recall update` does not install that CLI. Weights are NVIDIA **CC-BY-4.0**; credit NVIDIA / the model in user-facing docs. The `parakeet-mlx` runtime is Apache-2.0. Do not commit model weights.
+`--engine whisper` and `--engine parakeet` are always valid. Apple SpeechAnalyzer needs macOS 26+ and an on-device speech model already installed; Recall does not auto-download Apple speech assets or use cloud recognition. The Parakeet path needs `parakeet-mlx` on PATH (or `RECALL_PARAKEET_BIN`) and may download `mlx-community/parakeet-tdt-0.6b-v3` on first Parakeet run. `recall update` does not install that CLI. Parakeet weights are NVIDIA **CC-BY-4.0**; credit NVIDIA / the model in user-facing docs only when that engine ran. The `parakeet-mlx` runtime is Apache-2.0. Do not commit model weights.
 
 If the Parakeet binary is missing, the error includes an install hint. Whisper still works with `--engine whisper`.
 
@@ -150,6 +151,19 @@ recall transcribe latest --model models/ggml-medium.en.bin
 ```
 
 Larger models cost more local compute time but should improve transcript quality.
+
+## Live Transcript
+
+While recording, Apple SpeechAnalyzer can stream a Voice Memos-style preview into the Live Recall pane. Mic and Call are labeled separately. `t` hides or shows the block. Space mute stops feeding live mic samples (the archive still writes silence); call live continues. Enter ends capture immediately, then batch Apple `transcribe-file` writes canonical `transcript.md`. Live text is a preview, not the published transcript.
+
+Default is on. Disable with `--no-live-transcript` or:
+
+```toml
+[live_transcription]
+enabled = false
+```
+
+If SpeechAnalyzer fails, recording continues and Recall toasts that live text is unavailable.
 
 ## Current Behavior
 
@@ -229,13 +243,16 @@ auto_analyze = true
 preset = "general"
 
 [transcription]
-engine = "parakeet"   # default; fallback: "whisper"
+engine = "apple"      # default on Apple Silicon macOS 26+; fallback: "parakeet", then "whisper"
 ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
 whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
 model_path = "~/Documents/Recall/models/ggml-base.en.bin"
 parakeet_bin = "parakeet-mlx"
 parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
 chunk_seconds = 600
+
+[live_transcription]
+enabled = true
 ```
 
 Analysis outputs:
@@ -255,7 +272,8 @@ Recall keeps control of file layout. The agent is asked to return one JSON objec
 Recall currently expects:
 
 - `ffmpeg`
-- `parakeet-mlx` on Apple Silicon (default engine)
+- Apple SpeechAnalyzer on Apple Silicon macOS 26+ (default engine; on-device speech model)
+- `parakeet-mlx` if you select `--engine parakeet` or Apple is unavailable
 - Hugging Face cache of `mlx-community/parakeet-tdt-0.6b-v3` (downloaded on first Parakeet run)
 
 Whisper fallback, still supported:
@@ -315,13 +333,13 @@ If the model is not at `models/ggml-base.en.bin`, set:
 export RECALL_WHISPER_MODEL=/path/to/ggml-model.bin
 ```
 
-Default Parakeet:
+Parakeet:
 
 ```sh
 uv tool install parakeet-mlx
 export RECALL_PARAKEET_BIN=/path/to/parakeet-mlx   # only if it is not on PATH
 export RECALL_PARAKEET_MODEL=mlx-community/parakeet-tdt-0.6b-v3
-recall transcribe latest
+recall transcribe latest --engine parakeet
 ```
 
 ## Recommended Model Location

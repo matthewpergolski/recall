@@ -7,7 +7,7 @@ It records two local tracks:
 - microphone audio: `audio/mic.m4a`
 - meeting/system audio: `audio/call.m4a`
 
-Transcription is local. The default engine on Apple Silicon is NVIDIA Parakeet TDT 0.6B v3 via `parakeet-mlx`. Whisper/`whisper-cli` remains a full fallback. Cloud transcription and hosted LLM services are not required.
+Transcription is local. The default engine on Apple Silicon macOS 26+ is on-device Apple SpeechAnalyzer. Parakeet (`parakeet-mlx`) and Whisper/`whisper-cli` remain full fallbacks. Cloud transcription and hosted LLM services are not required.
 
 ## Status
 
@@ -18,7 +18,9 @@ Recall is usable as a macOS prototype:
 - microphone recording, including AirPods when that is the input at start
 - CoreAudio system/call audio recording when the launching terminal has system-audio permission
 - local session folders
-- local Parakeet transcription command (`parakeet-mlx`, default)
+- local Apple SpeechAnalyzer transcription (default on Apple Silicon macOS 26+)
+- Apple live transcript pane while recording (`t` toggles; `--no-live-transcript` disables)
+- Parakeet transcription command (`parakeet-mlx`) with `--engine parakeet`
 - Whisper/`whisper-cli` fallback with `--engine whisper`
 - chunked local transcription
 - automatic transcription after ending a TUI session
@@ -48,9 +50,13 @@ Required for the app:
 
 Required for transcription:
 
-- `parakeet-mlx` (`uv tool install parakeet-mlx`; not Homebrew)
 - `ffmpeg` for now, used to convert `.m4a` to 16 kHz mono `.wav`
-- NVIDIA Parakeet TDT 0.6B v3 MLX weights (`mlx-community/parakeet-tdt-0.6b-v3`, CC-BY-4.0), downloaded on first run
+- Apple SpeechAnalyzer on Apple Silicon macOS 26+ (default; on-device speech model, no NVIDIA download)
+
+Parakeet fallback (`--engine parakeet`):
+
+- `parakeet-mlx` (`uv tool install parakeet-mlx`; not Homebrew)
+- NVIDIA Parakeet TDT 0.6B v3 MLX weights (`mlx-community/parakeet-tdt-0.6b-v3`, CC-BY-4.0), downloaded on first Parakeet run
 
 Whisper fallback (`--engine whisper`):
 
@@ -138,14 +144,14 @@ export RECALL_WHISPER_MODEL="$PWD/models/ggml-base.en.bin"
 
 The model can come from Hugging Face. The `whisper-cli` and `ffmpeg` binaries should come from source builds, release artifacts, or internal binaries approved by your organization.
 
-Default Parakeet install (does not happen during `recall update`):
+Default Apple SpeechAnalyzer uses the on-device macOS speech model. If SpeechAnalyzer is unavailable, Recall falls back to Parakeet unless you passed `--engine apple`. Parakeet install (does not happen during `recall update`):
 
 ```sh
 uv tool install parakeet-mlx
-recall transcribe latest
+recall transcribe latest --engine parakeet
 ```
 
-First Parakeet run downloads `mlx-community/parakeet-tdt-0.6b-v3` (~1.2 GB) into the local Hugging Face cache. Recall shows that as a one-time download phase with size, rate, and cache path, then starts transcription. NVIDIA Parakeet TDT 0.6B v3 is CC-BY-4.0; credit NVIDIA / the model. `recall doctor` warns if `parakeet-mlx` is missing and still checks `whisper-cli`. Use `--engine whisper` for the Whisper fallback.
+First Parakeet run downloads `mlx-community/parakeet-tdt-0.6b-v3` (~1.2 GB) into the local Hugging Face cache. Recall shows that as a one-time download phase with size, rate, and cache path, then starts transcription. NVIDIA Parakeet TDT 0.6B v3 is CC-BY-4.0; credit NVIDIA / the model only when that engine ran. `recall doctor` checks Apple SpeechAnalyzer and warns if `parakeet-mlx` is missing. Use `--engine whisper` for the Whisper fallback.
 
 ## Usage
 
@@ -256,13 +262,16 @@ auto_analyze = true
 preset = "general"
 
 [transcription]
-engine = "parakeet"
+engine = "apple"          # default on Apple Silicon macOS 26+; "parakeet" or "whisper" to pin
 ffmpeg_bin = "~/Documents/Recall/tools/ffmpeg/bin/ffmpeg"
 whisper_bin = "~/Documents/Recall/tools/whisper/bin/whisper-cli"
 model_path = "~/Documents/Recall/models/ggml-base.en.bin"
 parakeet_bin = "parakeet-mlx"
 parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
 chunk_seconds = 600
+
+[live_transcription]
+enabled = true
 ```
 
 For long recordings, Recall chunks each audio track before transcription. The default chunk size is 10 minutes:
@@ -359,6 +368,7 @@ recall export latest
 recall sources
 recall audio-tap-probe
 recall transcribe latest
+recall transcribe latest --engine apple
 recall transcribe latest --engine whisper
 recall transcribe latest --engine parakeet
 recall transcribe latest --track call

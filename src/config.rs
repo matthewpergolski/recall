@@ -15,6 +15,7 @@ pub struct RecallConfig {
     pub keep_audio: Option<bool>,
     pub analysis: AnalysisConfig,
     pub transcription: TranscriptionConfig,
+    pub live_transcription: LiveTranscriptionConfig,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -27,6 +28,7 @@ pub struct AnalysisConfig {
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptionConfig {
     pub engine: TranscriptionEngine,
+    pub engine_specified: bool,
     pub ffmpeg_bin: Option<PathBuf>,
     pub whisper_bin: Option<PathBuf>,
     pub model_path: Option<PathBuf>,
@@ -35,6 +37,11 @@ pub struct TranscriptionConfig {
     pub parakeet_cache_dir: Option<PathBuf>,
     pub chunk_seconds: Option<u64>,
     pub invalid_engine: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LiveTranscriptionConfig {
+    pub enabled: Option<bool>,
 }
 
 impl RecallConfig {
@@ -111,6 +118,7 @@ impl RecallConfig {
                     if let Some(raw) = parse_string(value) {
                         if let Some(engine) = TranscriptionEngine::parse(&raw) {
                             config.transcription.engine = engine;
+                            config.transcription.engine_specified = true;
                         } else {
                             config.transcription.invalid_engine = Some(raw);
                         }
@@ -136,6 +144,9 @@ impl RecallConfig {
                 }
                 ("transcription", "chunk_seconds") => {
                     config.transcription.chunk_seconds = value.trim().parse::<u64>().ok();
+                }
+                ("live_transcription", "enabled") => {
+                    config.live_transcription.enabled = parse_bool(value);
                 }
                 _ => {}
             }
@@ -195,7 +206,7 @@ mod tests {
     use crate::transcription::TranscriptionEngine;
 
     #[test]
-    fn transcription_engine_defaults_to_parakeet() {
+    fn transcription_engine_defaults_to_platform_engine() {
         let config = RecallConfig::parse(
             r#"
             [transcription]
@@ -204,9 +215,24 @@ mod tests {
             "#,
         );
 
-        assert_eq!(config.transcription.engine, TranscriptionEngine::Parakeet);
+        assert_eq!(config.transcription.engine, TranscriptionEngine::default());
+        assert!(!config.transcription.engine_specified);
         assert!(config.transcription.parakeet_bin.is_none());
         assert!(config.transcription.parakeet_model.is_none());
+    }
+
+    #[test]
+    fn parses_apple_engine_as_explicit_selection() {
+        let config = RecallConfig::parse(
+            r#"
+            [transcription]
+            engine = "apple"
+            "#,
+        );
+
+        assert_eq!(config.transcription.engine, TranscriptionEngine::Apple);
+        assert!(config.transcription.engine_specified);
+        assert!(config.transcription.invalid_engine.is_none());
     }
 
     #[test]
@@ -247,6 +273,7 @@ mod tests {
         assert_eq!(config.analysis.auto_analyze, Some(true));
         assert_eq!(config.analysis.preset.as_deref(), Some("work"));
         assert_eq!(config.transcription.engine, TranscriptionEngine::Whisper);
+        assert!(config.transcription.engine_specified);
         assert!(config.transcription.ffmpeg_bin.is_some());
         assert!(config.transcription.whisper_bin.is_some());
         assert!(config.transcription.model_path.is_some());
@@ -257,6 +284,26 @@ mod tests {
         );
         assert!(config.transcription.parakeet_cache_dir.is_some());
         assert_eq!(config.transcription.chunk_seconds, Some(300));
+        assert!(config.live_transcription.enabled.is_none());
+    }
+
+    #[test]
+    fn parses_live_transcription_enabled() {
+        let enabled = RecallConfig::parse(
+            r#"
+            [live_transcription]
+            enabled = true
+            "#,
+        );
+        assert_eq!(enabled.live_transcription.enabled, Some(true));
+
+        let disabled = RecallConfig::parse(
+            r#"
+            [live_transcription]
+            enabled = false
+            "#,
+        );
+        assert_eq!(disabled.live_transcription.enabled, Some(false));
     }
 
     #[test]
@@ -272,6 +319,7 @@ mod tests {
         );
 
         assert_eq!(config.transcription.engine, TranscriptionEngine::Parakeet);
+        assert!(config.transcription.engine_specified);
         assert!(config.transcription.whisper_bin.is_some());
         assert!(config.transcription.model_path.is_some());
         assert!(config.transcription.parakeet_bin.is_some());
@@ -287,6 +335,7 @@ mod tests {
         );
 
         assert_eq!(config.transcription.engine, TranscriptionEngine::default());
+        assert!(!config.transcription.engine_specified);
         assert_eq!(config.transcription.invalid_engine.as_deref(), Some("nemo"));
     }
 }
