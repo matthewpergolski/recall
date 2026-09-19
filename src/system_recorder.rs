@@ -8,7 +8,11 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::session::state_dir;
+use crate::session::{logs_dir, state_dir};
+
+pub fn stop_system_path(session_dir: &Path) -> PathBuf {
+    state_dir(session_dir).join("stop-system")
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SystemEvent {
@@ -39,7 +43,7 @@ impl SystemRecorder {
     pub fn start(session_dir: &Path, output_name: &str, live_transcript: bool) -> io::Result<Self> {
         let state_dir = state_dir(session_dir);
         fs::create_dir_all(&state_dir)?;
-        let stop_file = state_dir.join("stop-system");
+        let stop_file = stop_system_path(session_dir);
         if stop_file.exists() {
             fs::remove_file(&stop_file)?;
         }
@@ -65,6 +69,32 @@ impl SystemRecorder {
             stop_file,
             receiver,
         })
+    }
+
+    pub fn respawn(
+        &mut self,
+        session_dir: &Path,
+        output_name: &str,
+        live_transcript: bool,
+    ) -> io::Result<()> {
+        let _ = self.child.try_wait();
+        let mut child = spawn_helper(session_dir, &self.stop_file, output_name, live_transcript)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("failed to capture recall-capture stdout"))?;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(event) = serde_json::from_str::<SystemEvent>(&line) {
+                    let _ = sender.send(event);
+                }
+            }
+        });
+        self.child = child;
+        self.receiver = receiver;
+        Ok(())
     }
 
     pub fn drain_events(&mut self) -> Vec<SystemEvent> {
@@ -139,12 +169,25 @@ fn spawn_helper(
         .arg("--output-name")
         .arg(output_name)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(helper_stderr(session_dir, "call.log"));
     if live_transcript {
         command.arg("--live-transcript");
     }
 
     command.spawn()
+}
+
+fn helper_stderr(session_dir: &Path, file_name: &str) -> Stdio {
+    let dir = logs_dir(session_dir);
+    if fs::create_dir_all(&dir).is_err() {
+        return Stdio::null();
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(file_name))
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null())
 }
 
 fn helper_binary(helper_dir: &Path) -> Option<PathBuf> {
@@ -155,4 +198,28 @@ fn helper_binary(helper_dir: &Path) -> Option<PathBuf> {
     ]
     .into_iter()
     .find(|path| path.exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_stderr_log_lives_under_recall_logs() {
+        let session = std::env::temp_dir().join(format!(
+            "recall-call-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert_eq!(
+            stop_system_path(&session),
+            session.join(".recall/state/stop-system")
+        );
+        let _ = helper_stderr(&session, "call.log");
+        assert!(session.join(".recall/logs/call.log").exists());
+        let _ = fs::remove_dir_all(session);
+    }
 }

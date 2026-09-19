@@ -568,6 +568,10 @@ pub fn state_dir(session_path: &Path) -> PathBuf {
     internal_dir(session_path).join("state")
 }
 
+pub fn logs_dir(session_path: &Path) -> PathBuf {
+    internal_dir(session_path).join("logs")
+}
+
 pub fn primary_document_path(session_path: &Path) -> PathBuf {
     for file_name in ["meeting.md", "summary.md", "transcript.md"] {
         let path = session_path.join(file_name);

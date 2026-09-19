@@ -27,15 +27,15 @@ use crate::analysis::{
 };
 use crate::audio::{
     acquire_capture_lock, copy_take1_aliases, earlier_takes_are_transcript_only,
-    maybe_discard_session_audio, next_take_index, prepare_continued_take, read_capture_progress,
-    resume_block_reason, write_capture_progress, AudioRetention, AudioTrack, CaptureLock,
-    CaptureProgress,
+    helper_restart_allowed, maybe_discard_session_audio, next_helper_part_name, next_take_index,
+    prepare_continued_take, read_capture_progress, resume_block_reason, write_capture_progress,
+    AudioRetention, AudioTrack, CaptureLock, CaptureProgress,
 };
 use crate::capture_sources::{
     detect_sources, read_clipboard_text, write_clipboard_image, ClipboardImageOutcome,
     ClipboardTextOutcome, SourceSummary,
 };
-use crate::mic_recorder::{clear_mute_mic, set_mute_mic, MicRecorder};
+use crate::mic_recorder::{clear_mute_mic, set_mute_mic, stop_mic_path, MicRecorder};
 use crate::session::{
     append_session_marker, append_session_note, append_session_note_with_images,
     copy_image_into_session, default_storage_dir, discard_unused_note_images,
@@ -44,7 +44,7 @@ use crate::session::{
     remove_empty_images_dir, resolve_session_target, resolve_timezone, start_session, ConsentMode,
     StartOptions,
 };
-use crate::system_recorder::SystemRecorder;
+use crate::system_recorder::{stop_system_path, SystemRecorder};
 use crate::transcription::{
     engine_status_parts, format_bytes, format_model_download_label, transcribe_with_progress,
     TrackSelection, TranscribeOptions, TranscribeTarget, TranscriptionEngine,
@@ -247,6 +247,8 @@ struct App {
     mic_device_id: Option<String>,
     mic_capture_warning: Option<String>,
     mic_muted: bool,
+    mic_restarts: u32,
+    call_restarts: u32,
     call_level_percent: u16,
     call_level_db: Option<f32>,
     system_capture_failed: bool,
@@ -1282,6 +1284,8 @@ impl App {
             mic_device_id: None,
             mic_capture_warning: None,
             mic_muted: false,
+            mic_restarts: 0,
+            call_restarts: 0,
             call_level_percent: 0,
             call_level_db: None,
             system_capture_failed: false,
@@ -1447,6 +1451,7 @@ impl App {
             KeyCode::Char(' ') => self.toggle_mic_mute()?,
             KeyCode::Char('c') => self.toggle_consent(),
             KeyCode::Char('s') => self.toggle_append_next(),
+            KeyCode::Char('k') => self.toggle_keep_audio(),
             KeyCode::Char('p') => {
                 self.toast =
                     "Pause is disabled for real recording. Press Enter to end.".to_string();
@@ -2116,6 +2121,8 @@ impl App {
         self.mic_capture_warning = None;
         self.mic_device_label = None;
         self.mic_device_id = None;
+        self.mic_restarts = 0;
+        self.call_restarts = 0;
     }
 
     fn start_recorders(
@@ -2151,6 +2158,106 @@ impl App {
         (started, failures)
     }
 
+    fn restart_mic_capture(&mut self) {
+        let Some(session_path) = self.session_path.clone() else {
+            self.mic_recorder = None;
+            return;
+        };
+        let recording = matches!(self.state, CaptureState::Recording);
+        let stop_requested = stop_mic_path(&session_path).exists();
+        if !helper_restart_allowed(recording, stop_requested, self.mic_restarts) {
+            self.mic_recorder = None;
+            self.mic_level_percent = 0;
+            self.mic_level_db = None;
+            if !recording || stop_requested {
+                self.clear_mic_mute();
+                return;
+            }
+            self.toast = "Mic capture stopped. End this take and start a new one.".to_string();
+            self.mic_capture_warning = Some(self.toast.clone());
+            self.live_notes.push(self.toast.clone());
+            return;
+        }
+
+        let take = self.take_index.max(1);
+        let Some(name) = next_helper_part_name(AudioTrack::Mic, take, self.mic_restarts) else {
+            self.mic_recorder = None;
+            self.toast = "Mic capture stopped. End this take and start a new one.".to_string();
+            self.mic_capture_warning = Some(self.toast.clone());
+            self.live_notes.push(self.toast.clone());
+            return;
+        };
+        self.mic_restarts += 1;
+        self.toast = "Mic capture stopped; restarting.".to_string();
+        self.live_notes
+            .push(format!("{} Writing audio/{name}.", self.toast));
+
+        let live = self.live_transcript_enabled;
+        let muted = self.mic_muted;
+        let Some(recorder) = self.mic_recorder.as_mut() else {
+            return;
+        };
+        if let Err(error) = recorder.respawn(&session_path, &name, live) {
+            self.mic_recorder = None;
+            self.toast = format!("Mic capture stopped; restart failed: {error}");
+            self.mic_capture_warning = Some(self.toast.clone());
+            self.live_notes.push(self.toast.clone());
+            return;
+        }
+        if muted {
+            if let Some(recorder) = self.mic_recorder.as_ref() {
+                let _ = recorder.set_muted(true);
+            }
+        }
+    }
+
+    fn restart_call_capture(&mut self) {
+        let Some(session_path) = self.session_path.clone() else {
+            self.system_recorder = None;
+            return;
+        };
+        let recording = matches!(self.state, CaptureState::Recording);
+        let stop_requested = stop_system_path(&session_path).exists();
+        if !helper_restart_allowed(recording, stop_requested, self.call_restarts) {
+            self.system_recorder = None;
+            self.call_level_percent = 0;
+            self.call_level_db = None;
+            if recording && !stop_requested {
+                self.system_capture_failed = true;
+                self.toast = "Call capture stopped. End this take and start a new one.".to_string();
+                self.system_capture_warning = Some(self.toast.clone());
+                self.live_notes.push(self.toast.clone());
+            }
+            return;
+        }
+
+        let take = self.take_index.max(1);
+        let Some(name) = next_helper_part_name(AudioTrack::Call, take, self.call_restarts) else {
+            self.system_recorder = None;
+            self.system_capture_failed = true;
+            self.toast = "Call capture stopped. End this take and start a new one.".to_string();
+            self.system_capture_warning = Some(self.toast.clone());
+            self.live_notes.push(self.toast.clone());
+            return;
+        };
+        self.call_restarts += 1;
+        self.toast = "Call capture stopped; restarting.".to_string();
+        self.live_notes
+            .push(format!("{} Writing audio/{name}.", self.toast));
+
+        let live = self.live_transcript_enabled;
+        let Some(recorder) = self.system_recorder.as_mut() else {
+            return;
+        };
+        if let Err(error) = recorder.respawn(&session_path, &name, live) {
+            self.system_recorder = None;
+            self.system_capture_failed = true;
+            self.toast = format!("Call capture stopped; restart failed: {error}");
+            self.system_capture_warning = Some(self.toast.clone());
+            self.live_notes.push(self.toast.clone());
+        }
+    }
+
     fn toggle_consent(&mut self) {
         self.consent_noted = !self.consent_noted;
         self.toast = if self.consent_noted {
@@ -2170,6 +2277,16 @@ impl App {
         if matches!(self.state, CaptureState::Ended) {
             self.replace_next_action_notes();
         }
+    }
+
+    fn toggle_keep_audio(&mut self) {
+        self.keep_audio = !self.keep_audio;
+        self.toast = if self.keep_audio {
+            "This session will keep audio after transcript.".to_string()
+        } else {
+            "This session will discard audio after transcript (files still record during the take)."
+                .to_string()
+        };
     }
 
     fn replace_next_action_notes(&mut self) {
@@ -2480,11 +2597,6 @@ impl App {
                         .unwrap_or_else(|| "Mic recorder reported an error.".to_string());
                     self.mic_capture_warning = Some(self.toast.clone());
                     self.live_notes.push(format!("mic failed: {}", self.toast));
-                    clear_recorder = true;
-                    self.clear_mic_mute();
-                    self.mic_level_percent = 0;
-                    self.mic_level_db = None;
-                    break;
                 }
                 "live_transcript" => {
                     if let Some(text) = event.text {
@@ -2493,11 +2605,13 @@ impl App {
                     }
                 }
                 "live_transcript_unavailable" => {
-                    let message = event
-                        .message
-                        .unwrap_or_else(|| "Live transcript unavailable for mic.".to_string());
-                    self.toast = format!("Live text unavailable: {message}");
-                    self.live_notes.push(self.toast.clone());
+                    self.toast = "Live text stopped; still recording.".to_string();
+                    if let Some(message) = event.message {
+                        self.live_notes
+                            .push(format!("Live text unavailable: {message}"));
+                    } else {
+                        self.live_notes.push(self.toast.clone());
+                    }
                 }
                 _ => {}
             }
@@ -2516,12 +2630,8 @@ impl App {
                         self.elapsed_label()
                     );
                     self.mic_capture_warning = Some(warning.clone());
-                    self.toast = warning.clone();
                     self.live_notes.push(warning);
-                    self.mic_recorder = None;
-                    self.clear_mic_mute();
-                    self.mic_level_percent = 0;
-                    self.mic_level_db = None;
+                    self.restart_mic_capture();
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -2572,11 +2682,13 @@ impl App {
                     }
                 }
                 "live_transcript_unavailable" => {
-                    let message = event
-                        .message
-                        .unwrap_or_else(|| "Live transcript unavailable for call.".to_string());
-                    self.toast = format!("Live text unavailable: {message}");
-                    self.live_notes.push(self.toast.clone());
+                    self.toast = "Live text stopped; still recording.".to_string();
+                    if let Some(message) = event.message {
+                        self.live_notes
+                            .push(format!("Live text unavailable: {message}"));
+                    } else {
+                        self.live_notes.push(self.toast.clone());
+                    }
                 }
                 "error" => {
                     self.toast = event
@@ -2584,12 +2696,7 @@ impl App {
                         .unwrap_or_else(|| "System audio recorder reported an error.".to_string());
                     self.live_notes
                         .push(format!("system audio failed: {}", self.toast));
-                    self.system_capture_failed = true;
                     self.system_capture_warning = Some(self.toast.clone());
-                    clear_recorder = true;
-                    self.call_level_percent = 0;
-                    self.call_level_db = None;
-                    break;
                 }
                 _ => {}
             }
@@ -2607,13 +2714,9 @@ impl App {
                         "System audio recorder stopped unexpectedly at {} ({status}).",
                         self.elapsed_label()
                     );
-                    self.system_capture_failed = true;
                     self.system_capture_warning = Some(warning.clone());
-                    self.toast = warning.clone();
                     self.live_notes.push(warning);
-                    self.system_recorder = None;
-                    self.call_level_percent = 0;
-                    self.call_level_db = None;
+                    self.restart_call_capture();
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -3208,12 +3311,21 @@ impl App {
         } else {
             "next: new"
         };
+        let audio = if self.keep_audio {
+            "audio: keep"
+        } else {
+            "audio: drop"
+        };
         let mut spans = vec![
             Span::styled(
                 " Recall ",
                 Style::default().fg(Color::Black).bg(Color::Cyan),
             ),
-            Span::raw("  Local meeting memory"),
+            Span::styled(
+                format!(" {} ", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(" Local meeting memory"),
             Span::raw(format!("  {}  ", self.title)),
             Span::raw("  "),
             Span::styled(
@@ -3249,6 +3361,8 @@ impl App {
             Span::styled(consent, Style::default().fg(Color::Gray)),
             Span::raw("  "),
             Span::styled(next, Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::styled(audio, Style::default().fg(Color::Gray)),
         ]);
         let title = Line::from(spans);
         frame.render_widget(
@@ -3974,6 +4088,8 @@ impl App {
             Span::raw(" consent  "),
             Span::styled(" s ", Style::default().fg(Color::Black).bg(Color::Cyan)),
             Span::raw(" append/new  "),
+            Span::styled(" k ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::raw(" keep audio  "),
             Span::styled(" m ", Style::default().fg(Color::Black).bg(Color::Magenta)),
             Span::raw(" marker  "),
             Span::styled(" t ", Style::default().fg(Color::Black).bg(Color::Magenta)),
@@ -4262,6 +4378,8 @@ mod tests {
             mic_device_id: None,
             mic_capture_warning: None,
             mic_muted: false,
+            mic_restarts: 0,
+            call_restarts: 0,
             call_level_percent: 0,
             call_level_db: None,
             system_capture_failed: false,
@@ -4370,6 +4488,19 @@ mod tests {
         type_note(&mut app, "t");
         assert_eq!(app.note_draft.as_ref().unwrap().caption(), "t");
         assert!(app.live_transcript_visible);
+        assert_eq!(app.state, CaptureState::Recording);
+    }
+
+    #[test]
+    fn note_draft_k_types_the_letter_instead_of_toggling_keep_audio() {
+        let mut app = test_app(PathBuf::from("/tmp/recall-keep-audio-note-k"));
+        app.state = CaptureState::Recording;
+        app.keep_audio = true;
+        app.start_manual_note();
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.note_draft.as_ref().unwrap().caption(), "k");
+        assert!(app.keep_audio);
         assert_eq!(app.state, CaptureState::Recording);
     }
 
@@ -4634,6 +4765,33 @@ mod tests {
     }
 
     #[test]
+    fn k_toggles_keep_audio_for_this_session_without_rewriting_config() {
+        let config_dir = unique_storage("keep-audio-config");
+        let config_path = config_dir.join("config.toml");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(&config_path, "keep_audio = true\n").unwrap();
+        let before = fs::read_to_string(&config_path).unwrap();
+
+        let mut app = test_app(PathBuf::from("/tmp/recall-keep-audio-toggle"));
+        app.keep_audio = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.keep_audio);
+        assert_eq!(
+            app.toast,
+            "This session will discard audio after transcript (files still record during the take)."
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.keep_audio);
+        assert_eq!(app.toast, "This session will keep audio after transcript.");
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+
+        let _ = fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
     fn late_take_one_transcript_does_not_overwrite_take_two() {
         let current_session = PathBuf::from("/tmp/recall-continued-session");
         let (sender, receiver) = mpsc::channel();
@@ -4879,6 +5037,46 @@ mod tests {
         assert!(!session.path.join("audio/mic-001.m4a").exists());
         assert!(session.path.join("audio").is_dir());
         assert!(session.path.join("transcript.md").exists());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn quit_discard_honors_keep_audio_toggled_with_k() {
+        let storage = std::env::temp_dir().join(format!(
+            "recall-tui-quit-k-discard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let session = start_session(&StartOptions {
+            title: "Quit K Discard".to_string(),
+            consent: ConsentMode::Noted,
+            storage_dir: storage.clone(),
+            timezone: crate::session::FALLBACK_TIMEZONE.to_string(),
+        })
+        .unwrap();
+        fs::write(session.path.join("audio/mic-001.m4a"), b"mic").unwrap();
+        fs::write(
+            session.path.join("transcript.md"),
+            "# Transcript\n\nGenerated by local Whisper transcription.\n",
+        )
+        .unwrap();
+        let mut app = test_app(session.path.clone());
+        app.keep_audio = true;
+        app.state = CaptureState::Ended;
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.keep_audio);
+        assert!(app.request_quit().unwrap());
+        assert_eq!(
+            app.quit_notice.as_deref(),
+            Some("Audio discarded after transcript.")
+        );
+        assert!(!session.path.join("audio/mic-001.m4a").exists());
+        assert!(session.path.join("audio").is_dir());
 
         let _ = fs::remove_dir_all(storage);
     }
@@ -5474,6 +5672,49 @@ mod tests {
         assert!(!app.mic_muted);
         assert_eq!(app.state, CaptureState::Recording);
         assert!(!crate::mic_recorder::mute_mic_path(&session_path).exists());
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn helper_restart_is_skipped_when_not_recording_or_stop_requested() {
+        let (storage, session_path) = note_session("mic-restart-skip");
+        let mut app = test_app(session_path.clone());
+        app.state = CaptureState::Ended;
+        app.take_index = 1;
+        app.restart_mic_capture();
+        assert_eq!(app.mic_restarts, 0);
+        assert!(app.mic_recorder.is_none());
+
+        app.state = CaptureState::Recording;
+        fs::create_dir_all(session_path.join(".recall/state")).unwrap();
+        fs::write(stop_mic_path(&session_path), b"stop").unwrap();
+        app.restart_mic_capture();
+        assert_eq!(app.mic_restarts, 0);
+        assert!(!app.toast.contains("restarting"));
+
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn helper_restart_cap_toasts_to_start_a_new_take() {
+        let (storage, session_path) = note_session("mic-restart-cap");
+        let mut app = test_app(session_path);
+        app.state = CaptureState::Recording;
+        app.take_index = 1;
+        app.mic_restarts = 3;
+        app.call_restarts = 3;
+        app.restart_mic_capture();
+        assert_eq!(
+            app.toast,
+            "Mic capture stopped. End this take and start a new one."
+        );
+        app.restart_call_capture();
+        assert_eq!(
+            app.toast,
+            "Call capture stopped. End this take and start a new one."
+        );
+        assert!(app.system_capture_failed);
 
         let _ = fs::remove_dir_all(storage);
     }

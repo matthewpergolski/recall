@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::session::state_dir;
+use crate::session::{logs_dir, state_dir};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MicEvent {
@@ -112,6 +112,38 @@ impl MicRecorder {
         })
     }
 
+    pub fn respawn(
+        &mut self,
+        session_dir: &Path,
+        output_name: &str,
+        live_transcript: bool,
+    ) -> io::Result<()> {
+        let _ = self.child.try_wait();
+        let mut child = spawn_helper(
+            session_dir,
+            &self.stop_file,
+            &self.mute_file,
+            output_name,
+            live_transcript,
+        )?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("failed to capture recall-capture stdout"))?;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Ok(event) = serde_json::from_str::<MicEvent>(&line) {
+                    let _ = sender.send(event);
+                }
+            }
+        });
+        self.child = child;
+        self.receiver = receiver;
+        Ok(())
+    }
+
     pub fn drain_events(&mut self) -> Vec<MicEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.receiver.try_recv() {
@@ -205,12 +237,25 @@ fn spawn_helper(
         .arg("--output-name")
         .arg(output_name)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(helper_stderr(session_dir, "mic.log"));
     if live_transcript {
         command.arg("--live-transcript");
     }
 
     command.spawn()
+}
+
+fn helper_stderr(session_dir: &Path, file_name: &str) -> Stdio {
+    let dir = logs_dir(session_dir);
+    if fs::create_dir_all(&dir).is_err() {
+        return Stdio::null();
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(file_name))
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null())
 }
 
 fn helper_binary(helper_dir: &Path) -> Option<PathBuf> {
@@ -236,6 +281,18 @@ mod tests {
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0)
         ))
+    }
+
+    #[test]
+    fn helper_stderr_log_lives_under_recall_logs() {
+        let session = unique_session("logs");
+        assert_eq!(
+            logs_dir(&session).join("mic.log"),
+            session.join(".recall/logs/mic.log")
+        );
+        let _ = helper_stderr(&session, "mic.log");
+        assert!(session.join(".recall/logs/mic.log").exists());
+        let _ = fs::remove_dir_all(session);
     }
 
     #[test]

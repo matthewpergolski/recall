@@ -724,6 +724,13 @@ fn resolve_track_audio(
     segments: &[PathBuf],
     generation: Option<u32>,
 ) -> io::Result<PathBuf> {
+    let segments = crate::audio::usable_audio_segments(ffmpeg, segments);
+    if segments.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("No readable {} audio segments", track.label()),
+        ));
+    }
     if segments.len() == 1 {
         return Ok(segments[0].clone());
     }
@@ -732,7 +739,7 @@ fn resolve_track_audio(
         track.label(),
         generation_suffix(generation)
     ));
-    concat_audio_segments(ffmpeg, segments, &concat_path)?;
+    concat_audio_segments(ffmpeg, &segments, &concat_path)?;
     Ok(concat_path)
 }
 
