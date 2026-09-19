@@ -84,10 +84,13 @@ final class LiveSpeechSession: @unchecked Sendable {
     private let startedAt: Date
     private let speechQueue = DispatchQueue(label: "recall.live-speech")
 
+    private let lock = NSLock()
     private var pending: [AVAudioPCMBuffer] = []
     private var pumping = false
     private var finished = false
     private var ready = false
+    private var dead = false
+    private var unavailableEmitted = false
     private var revision = 0
     private var nextStart = CMTime.zero
     private var accumulator: AVAudioPCMBuffer?
@@ -111,25 +114,41 @@ final class LiveSpeechSession: @unchecked Sendable {
     }
 
     func enqueue(_ buffer: AVAudioPCMBuffer) {
+        guard !isDead() else {
+            return
+        }
         guard let copy = copyPCMBuffer(buffer), copy.frameLength > 0 else {
             return
         }
         speechQueue.async { [weak self] in
-            guard let self, !self.finished else {
+            guard let self, !self.finished, !self.isDead() else {
                 return
             }
-            while self.pending.count >= Self.maxPendingBuffers {
-                self.pending.removeFirst()
-            }
-            self.pending.append(copy)
-            if self.ready && !self.pumping {
-                self.pumping = true
-                self.pump()
+            do {
+                while self.pending.count >= Self.maxPendingBuffers {
+                    self.pending.removeFirst()
+                }
+                self.pending.append(copy)
+                if self.ready && !self.pumping {
+                    self.pumping = true
+                    try self.pump()
+                }
+            } catch {
+                self.markDead("\(error)")
             }
         }
     }
 
     func finish() {
+        if isDead() {
+            speechQueue.async { [weak self] in
+                self?.finished = true
+                self?.pending.removeAll()
+                self?.inputBuilder?.finish()
+                self?.inputBuilder = nil
+            }
+            return
+        }
         let semaphore = DispatchSemaphore(value: 0)
         speechQueue.async { [weak self] in
             guard let self else {
@@ -137,7 +156,11 @@ final class LiveSpeechSession: @unchecked Sendable {
                 return
             }
             self.finished = true
-            self.flushAccumulator()
+            do {
+                try self.flushAccumulator()
+            } catch {
+                self.markDead("\(error)")
+            }
             self.inputBuilder?.finish()
             self.inputBuilder = nil
             let analyzeTask = self.analyzeTask
@@ -145,6 +168,10 @@ final class LiveSpeechSession: @unchecked Sendable {
             let resultsTask = self.resultsTask
             Task {
                 defer { semaphore.signal() }
+                if self.isDead() {
+                    resultsTask?.cancel()
+                    return
+                }
                 if let analyzeTask {
                     do {
                         if let last = try await analyzeTask.value {
@@ -153,7 +180,7 @@ final class LiveSpeechSession: @unchecked Sendable {
                             try await analyzer?.finalizeAndFinishThroughEndOfInput()
                         }
                     } catch {
-                        self.emitUnavailable("\(error)")
+                        self.markDead("\(error)")
                     }
                 }
                 try? await Task.sleep(for: .milliseconds(250))
@@ -187,14 +214,24 @@ final class LiveSpeechSession: @unchecked Sendable {
                         self?.emitResult(result)
                     }
                 } catch {
-                    self?.emitUnavailable("\(error)")
+                    self?.markDead("\(error)")
                 }
             }
-            let analyzeTask = Task {
-                try await analyzer.analyzeSequence(inputSequence)
+            let analyzeTask = Task { [weak self] in
+                do {
+                    return try await analyzer.analyzeSequence(inputSequence)
+                } catch {
+                    self?.markDead("\(error)")
+                    throw error
+                }
             }
             speechQueue.async { [weak self] in
                 guard let self else {
+                    return
+                }
+                if self.isDead() || self.finished {
+                    continuation.finish()
+                    resultsTask.cancel()
                     return
                 }
                 self.analyzer = analyzer
@@ -202,25 +239,25 @@ final class LiveSpeechSession: @unchecked Sendable {
                 self.nextStart = CMTime(value: 0, timescale: CMTimeScale(format.sampleRate))
                 self.resultsTask = resultsTask
                 self.analyzeTask = analyzeTask
-                if self.finished {
-                    continuation.finish()
-                    return
-                }
                 self.inputBuilder = continuation
                 self.ready = true
                 if !self.pending.isEmpty && !self.pumping {
                     self.pumping = true
-                    self.pump()
+                    do {
+                        try self.pump()
+                    } catch {
+                        self.markDead("\(error)")
+                    }
                 }
             }
         } catch {
-            emitUnavailable("\(error)")
+            markDead("\(error)")
         }
     }
 
-    private func pump() {
+    private func pump() throws {
         while true {
-            if finished && pending.isEmpty {
+            if isDead() || (finished && pending.isEmpty) {
                 pumping = false
                 return
             }
@@ -235,7 +272,7 @@ final class LiveSpeechSession: @unchecked Sendable {
             guard let converted = convert(buffer, to: format) else {
                 continue
             }
-            appendAndYield(converted, builder: builder, format: format)
+            try appendAndYield(converted, builder: builder, format: format)
         }
     }
 
@@ -243,11 +280,11 @@ final class LiveSpeechSession: @unchecked Sendable {
         _ buffer: AVAudioPCMBuffer,
         builder: AsyncStream<AnalyzerInput>.Continuation,
         format: AVAudioFormat
-    ) {
+    ) throws {
         let needed = Self.yieldFrameCount
         if buffer.frameLength >= needed {
-            flushAccumulator()
-            yield(buffer, builder: builder)
+            try flushAccumulator()
+            try yieldBuffer(buffer, builder: builder)
             return
         }
         if accumulator == nil {
@@ -256,39 +293,45 @@ final class LiveSpeechSession: @unchecked Sendable {
         }
         if let accumulator, append(buffer, onto: accumulator) {
             if accumulator.frameLength >= needed {
-                flushAccumulator()
+                try flushAccumulator()
             }
             return
         }
-        flushAccumulator()
+        try flushAccumulator()
         if buffer.frameLength >= needed {
-            yield(buffer, builder: builder)
+            try yieldBuffer(buffer, builder: builder)
             return
         }
         accumulator = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: needed)
         accumulator?.frameLength = 0
         if let accumulator, append(buffer, onto: accumulator) {
             if accumulator.frameLength >= needed {
-                flushAccumulator()
+                try flushAccumulator()
             }
         } else {
-            yield(buffer, builder: builder)
+            try yieldBuffer(buffer, builder: builder)
         }
     }
 
-    private func flushAccumulator() {
+    private func flushAccumulator() throws {
         guard let accumulator, accumulator.frameLength > 0, let builder = inputBuilder else {
             self.accumulator = nil
             return
         }
         if let copy = copyPCMBuffer(accumulator) {
-            yield(copy, builder: builder)
+            try yieldBuffer(copy, builder: builder)
         }
         accumulator.frameLength = 0
         self.accumulator = accumulator
     }
 
-    private func yield(_ buffer: AVAudioPCMBuffer, builder: AsyncStream<AnalyzerInput>.Continuation) {
+    private func yieldBuffer(
+        _ buffer: AVAudioPCMBuffer,
+        builder: AsyncStream<AnalyzerInput>.Continuation
+    ) throws {
+        if isDead() {
+            return
+        }
         let start = nextStart
         let duration = CMTime(
             value: CMTimeValue(buffer.frameLength),
@@ -371,13 +414,16 @@ final class LiveSpeechSession: @unchecked Sendable {
     }
 
     private func emitResult(_ result: SpeechTranscriber.Result) {
+        if isDead() {
+            return
+        }
         let text = String(result.text.characters)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
             return
         }
         speechQueue.async { [weak self] in
-            guard let self else {
+            guard let self, !self.isDead() else {
                 return
             }
             self.revision += 1
@@ -393,17 +439,41 @@ final class LiveSpeechSession: @unchecked Sendable {
         }
     }
 
-    private func emitUnavailable(_ message: String) {
-        try? RecallCapture.printJSONLine(LiveTranscriptUnavailableEvent(
-            type: "live_transcript_unavailable",
-            source: source,
-            message: message
-        ))
+    private func isDead() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return dead
+    }
+
+    private func markDead(_ message: String) {
+        lock.lock()
+        let shouldEmit = !unavailableEmitted
+        dead = true
+        unavailableEmitted = true
+        lock.unlock()
+        if shouldEmit {
+            try? RecallCapture.printJSONLine(LiveTranscriptUnavailableEvent(
+                type: "live_transcript_unavailable",
+                source: source,
+                message: message
+            ))
+        }
+        speechQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+            self.ready = false
+            self.pending.removeAll()
+            self.pumping = false
+            self.inputBuilder?.finish()
+            self.inputBuilder = nil
+            self.resultsTask?.cancel()
+        }
     }
 }
 #endif
 
-private func copyPCMBuffer(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+func copyPCMBuffer(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
     guard let copy = AVAudioPCMBuffer(
         pcmFormat: buffer.format,
         frameCapacity: max(buffer.frameLength, 1)

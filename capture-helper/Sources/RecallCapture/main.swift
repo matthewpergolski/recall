@@ -966,13 +966,12 @@ final class MicTapRecorder: @unchecked Sendable {
 
     private let outputURL: URL
     private let muteFile: URL?
-    private let writerQueue = DispatchQueue(label: "recall.mic.writer")
     private let startedAt = Date()
-    private let engine = AVAudioEngine()
     private let muteLock = NSLock()
     private var audioFile: AVAudioFile?
-    private var converter: AVAudioConverter?
-    private var writeFormat: AVAudioFormat?
+    private var inputFormat: AVAudioFormat?
+    private var deviceID = AudioDeviceID(kAudioObjectUnknown)
+    private var ioProcID: AudioDeviceIOProcID?
     private var lastLevelEventAt = Date.distantPast
     private var writeError: Error?
     private var muted = false
@@ -999,7 +998,7 @@ final class MicTapRecorder: @unchecked Sendable {
             path: outputURL.path,
             elapsedSeconds: 0,
             levelDb: nil,
-            message: startedDevice.map { "Mic input: \($0.name)" },
+            message: startedDevice.map { "Mic HAL input: \($0.name)" },
             deviceName: startedDevice?.name,
             deviceID: startedDevice?.uid
         ))
@@ -1009,18 +1008,18 @@ final class MicTapRecorder: @unchecked Sendable {
         {
             refreshMuteState()
             let latestInputDevice = RecallCapture.defaultInputDevice()
-            if latestInputDevice != snapshotInputDevice() {
-                updateInputDevice(latestInputDevice)
+            if let latestInputDevice, latestInputDevice.id != deviceID {
+                let captured = snapshotInputDevice()
                 try RecallCapture.printJSONLine(CaptureEvent(
                     type: "device_changed",
                     source: "mic",
                     path: nil,
                     elapsedSeconds: Date().timeIntervalSince(startedAt),
                     levelDb: nil,
-                    message: latestInputDevice.map { "Mic input changed to \($0.name)" }
-                        ?? "Mic input changed, but current default input could not be resolved.",
-                    deviceName: latestInputDevice?.name,
-                    deviceID: latestInputDevice?.uid
+                    message:
+                        "Default input is now \(latestInputDevice.name); this take still captures \(captured?.name ?? "the original input").",
+                    deviceName: captured?.name,
+                    deviceID: captured?.uid
                 ))
             }
             if let writeError {
@@ -1048,121 +1047,116 @@ final class MicTapRecorder: @unchecked Sendable {
     }
 
     private func start() throws {
-        let input = engine.inputNode
-        engine.prepare()
-        let hardwareFormat = input.inputFormat(forBus: 0)
-        let tapFormat: AVAudioFormat
-        if hardwareFormat.channelCount > 0, hardwareFormat.sampleRate > 0 {
-            tapFormat = hardwareFormat
-        } else if let fallback = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1) {
-            tapFormat = fallback
-        } else {
+        guard let device = RecallCapture.defaultInputDevice() else {
             throw CaptureError.audioFormatUnavailable
         }
-        guard let monoFormat = AVAudioFormat(
-            standardFormatWithSampleRate: tapFormat.sampleRate,
-            channels: 1
-        ) else {
-            throw CaptureError.audioFormatUnavailable
-        }
-        writeFormat = monoFormat
-        if tapFormat.channelCount != 1
-            || tapFormat.commonFormat != monoFormat.commonFormat
-            || tapFormat.isInterleaved != monoFormat.isInterleaved
-        {
-            guard let converter = AVAudioConverter(from: tapFormat, to: monoFormat) else {
-                throw CaptureError.audioFormatUnavailable
-            }
-            self.converter = converter
-        } else {
-            converter = nil
-        }
+        deviceID = device.id
+        updateInputDevice(device)
 
+        var streamDescription = try readInputStreamDescription(deviceID: device.id)
+        guard let format = AVAudioFormat(streamDescription: &streamDescription) else {
+            throw CaptureError.audioFormatUnavailable
+        }
+        inputFormat = format
         audioFile = try AVAudioFile(
             forWriting: outputURL,
             settings: [
                 AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-                AVSampleRateKey: tapFormat.sampleRate,
-                AVNumberOfChannelsKey: 1,
+                AVSampleRateKey: format.sampleRate,
+                AVNumberOfChannelsKey: Int(max(format.channelCount, 1)),
                 AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
             ],
-            commonFormat: monoFormat.commonFormat,
-            interleaved: monoFormat.isInterleaved
+            commonFormat: format.commonFormat,
+            interleaved: format.isInterleaved
         )
 
-        input.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
-            self?.handleTap(buffer)
+        var newIOProcID: AudioDeviceIOProcID?
+        let ioStatus = AudioDeviceCreateIOProcID(
+            deviceID,
+            micHALIOProc,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &newIOProcID
+        )
+        guard ioStatus == noErr, let newIOProcID else {
+            throw CaptureError.audioDeviceIOProcCreationFailed(ioStatus)
         }
+        ioProcID = newIOProcID
 
-        do {
-            try engine.start()
-        } catch {
-            input.removeTap(onBus: 0)
-            throw CaptureError.recorderCreationFailed
+        let startStatus = AudioDeviceStart(deviceID, newIOProcID)
+        guard startStatus == noErr else {
+            throw CaptureError.audioDeviceStartFailed(startStatus)
         }
     }
 
     private func stop() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        writerQueue.sync {
-            self.audioFile = nil
+        if deviceID != kAudioObjectUnknown, let ioProcID {
+            let _ = AudioDeviceStop(deviceID, ioProcID)
+            let _ = AudioDeviceDestroyIOProcID(deviceID, ioProcID)
+            self.ioProcID = nil
         }
+        audioFile = nil
+        deviceID = AudioDeviceID(kAudioObjectUnknown)
     }
 
-    private func handleTap(_ buffer: AVAudioPCMBuffer) {
+    fileprivate func handleInput(_ inputData: UnsafePointer<AudioBufferList>?) -> OSStatus {
+        guard let inputData,
+              let inputFormat,
+              let buffer = makePCMBuffer(from: inputData, format: inputFormat)
+        else {
+            return noErr
+        }
         let muted = isMuted()
         let device = snapshotInputDevice()
-        writerQueue.async { [weak self] in
-            guard let self else {
-                return
-            }
-            do {
-                guard let toWrite = self.monoBuffer(from: buffer) else {
-                    throw CaptureError.audioFormatUnavailable
+        do {
+            if muted {
+                if let silent = silentBuffer(matching: buffer) {
+                    try audioFile?.write(from: silent)
                 }
-                if muted {
-                    if let silent = silentBuffer(matching: toWrite) {
-                        try self.audioFile?.write(from: silent)
-                    }
-                    self.maybeEmitLevel(Self.mutedLevelDb, device: device)
-                } else {
-                    try self.audioFile?.write(from: toWrite)
-                    self.liveFeed?.enqueue(toWrite)
-                    self.maybeEmitLevel(audioLevelDb(toWrite) ?? Self.mutedLevelDb, device: device)
+                maybeEmitLevel(Self.mutedLevelDb, device: device)
+            } else {
+                try audioFile?.write(from: buffer)
+                maybeEmitLevel(audioLevelDb(buffer) ?? Self.mutedLevelDb, device: device)
+                if let copy = copyPCMBuffer(buffer) {
+                    liveFeed?.enqueue(copy)
                 }
-            } catch {
-                self.writeError = error
             }
+        } catch {
+            writeError = error
         }
+        return noErr
     }
 
-    private func monoBuffer(from buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
-        guard let converter, let writeFormat else {
-            return buffer
+    private func makePCMBuffer(
+        from inputData: UnsafePointer<AudioBufferList>,
+        format: AVAudioFormat
+    ) -> AVAudioPCMBuffer? {
+        let sourceBuffers = UnsafeMutableAudioBufferListPointer(
+            UnsafeMutablePointer(mutating: inputData)
+        )
+        guard let firstBuffer = sourceBuffers.first else {
+            return nil
         }
-        let frameCapacity = max(buffer.frameLength, 1)
-        guard let converted = AVAudioPCMBuffer(pcmFormat: writeFormat, frameCapacity: frameCapacity)
+        let bytesPerFrame = max(Int(format.streamDescription.pointee.mBytesPerFrame), 1)
+        let frameCapacity = AVAudioFrameCount(Int(firstBuffer.mDataByteSize) / bytesPerFrame)
+        guard frameCapacity > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity)
         else {
             return nil
         }
-        final class Once: @unchecked Sendable { var done = false }
-        let once = Once()
-        var convertError: NSError?
-        converter.reset()
-        let status = converter.convert(to: converted, error: &convertError) { _, outStatus in
-            if once.done {
-                outStatus.pointee = .noDataNow
-                return nil
+        buffer.frameLength = frameCapacity
+        let destinationBuffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        for index in 0..<min(sourceBuffers.count, destinationBuffers.count) {
+            let source = sourceBuffers[index]
+            var destination = destinationBuffers[index]
+            guard let sourceData = source.mData, let destinationData = destination.mData else {
+                continue
             }
-            once.done = true
-            outStatus.pointee = .haveData
-            return buffer
+            let byteCount = min(Int(source.mDataByteSize), Int(destination.mDataByteSize))
+            memcpy(destinationData, sourceData, byteCount)
+            destination.mDataByteSize = UInt32(byteCount)
+            destinationBuffers[index] = destination
         }
-        if status == .error || convertError != nil {
-            return nil
-        }
-        return converted
+        return buffer
     }
 
     private func refreshMuteState() {
@@ -1386,11 +1380,12 @@ final class CoreAudioTapRecorder: @unchecked Sendable {
         writerQueue.async {
             do {
                 try self.audioFile?.write(from: buffer)
-                self.liveFeed?.enqueue(buffer)
                 self.maybeEmitLevel(buffer)
             } catch {
                 self.writeError = error
+                return
             }
+            self.liveFeed?.enqueue(buffer)
         }
 
         return noErr
@@ -1467,6 +1462,33 @@ private let coreAudioTapIOProc: AudioDeviceIOProc = {
         .fromOpaque(clientData)
         .takeUnretainedValue()
     return recorder.handleInput(inputData)
+}
+
+private let micHALIOProc: AudioDeviceIOProc = {
+    _, _, inputData, _, _, _, clientData in
+    guard let clientData else {
+        return noErr
+    }
+
+    let recorder = Unmanaged<MicTapRecorder>
+        .fromOpaque(clientData)
+        .takeUnretainedValue()
+    return recorder.handleInput(inputData)
+}
+
+private func readInputStreamDescription(deviceID: AudioDeviceID) throws -> AudioStreamBasicDescription {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamFormat,
+        mScope: kAudioDevicePropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var value = AudioStreamBasicDescription()
+    var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+    let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value)
+    guard status == noErr else {
+        throw CaptureError.audioObjectPropertyFailed("kAudioDevicePropertyStreamFormat", status)
+    }
+    return value
 }
 
 private func silentBuffer(matching buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {

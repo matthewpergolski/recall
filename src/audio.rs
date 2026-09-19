@@ -56,6 +56,37 @@ impl AudioTrack {
     pub fn segment_name(self, take: u32) -> String {
         format!("{}-{take:03}.m4a", self.label())
     }
+
+    pub fn part_segment_name(self, take: u32, part: u32) -> String {
+        if part <= 1 {
+            self.segment_name(take)
+        } else {
+            format!("{}-{take:03}-part-{part:02}.m4a", self.label())
+        }
+    }
+}
+
+pub const MAX_HELPER_RESTARTS: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SegmentRef {
+    take: u32,
+    part: u32,
+}
+
+pub fn helper_restart_allowed(
+    is_recording: bool,
+    stop_requested: bool,
+    restarts_used: u32,
+) -> bool {
+    is_recording && !stop_requested && restarts_used < MAX_HELPER_RESTARTS
+}
+
+pub fn next_helper_part_name(track: AudioTrack, take: u32, restarts_used: u32) -> Option<String> {
+    if !helper_restart_allowed(true, false, restarts_used) {
+        return None;
+    }
+    Some(track.part_segment_name(take, restarts_used + 2))
 }
 
 pub fn audio_dir(session_path: &Path) -> PathBuf {
@@ -463,9 +494,7 @@ pub fn earlier_takes_are_transcript_only(session_path: &Path) -> bool {
     }
     let dir = audio_dir(session_path);
     for take in 1..=completed {
-        let mic = dir.join(AudioTrack::Mic.segment_name(take));
-        let call = dir.join(AudioTrack::Call.segment_name(take));
-        if mic.exists() || call.exists() {
+        if take_has_audio(&dir, take) {
             continue;
         }
         if take == 1 {
@@ -480,11 +509,54 @@ pub fn earlier_takes_are_transcript_only(session_path: &Path) -> bool {
     false
 }
 
+fn take_has_audio(audio_dir: &Path, take: u32) -> bool {
+    [AudioTrack::Mic, AudioTrack::Call]
+        .into_iter()
+        .any(|track| {
+            discover_numbered_segments(audio_dir, track, Some(take))
+                .iter()
+                .any(|path| segment_ref(path).is_some_and(|segment| segment.take == take))
+        })
+}
+
+pub fn usable_audio_segments(ffmpeg: &Path, segments: &[PathBuf]) -> Vec<PathBuf> {
+    segments
+        .iter()
+        .filter(|path| audio_segment_is_readable(ffmpeg, path))
+        .cloned()
+        .collect()
+}
+
+fn audio_segment_is_readable(ffmpeg: &Path, path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() < 64 {
+        return false;
+    }
+    Command::new(ffmpeg)
+        .arg("-v")
+        .arg("error")
+        .arg("-i")
+        .arg(path)
+        .arg("-t")
+        .arg("0.05")
+        .arg("-f")
+        .arg("null")
+        .arg("-")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 pub fn concat_audio_segments(ffmpeg: &Path, segments: &[PathBuf], output: &Path) -> io::Result<()> {
+    let segments = usable_audio_segments(ffmpeg, segments);
     if segments.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "No audio segments to concatenate",
+            "No readable audio segments to concatenate",
         ));
     }
     if let Some(parent) = output.parent() {
@@ -496,7 +568,7 @@ pub fn concat_audio_segments(ffmpeg: &Path, segments: &[PathBuf], output: &Path)
     }
 
     let list_path = output.with_extension("concat.txt");
-    write_ffmpeg_concat_list(&list_path, segments)?;
+    write_ffmpeg_concat_list(&list_path, &segments)?;
     let copy_ok = run_ffmpeg_concat(ffmpeg, &list_path, output, true)?;
     if !copy_ok {
         let reencode_ok = run_ffmpeg_concat(ffmpeg, &list_path, output, false)?;
@@ -603,44 +675,70 @@ fn discover_numbered_segments(
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
-            segment_take_index(path)
-                .filter(|take| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with(&format!("{}-", track.label())))
-                        && max_take.is_none_or(|max| *take <= max)
-                })
-                .is_some()
+            parse_segment_name(path, track)
+                .is_some_and(|segment| max_take.is_none_or(|max| segment.take <= max))
         })
         .collect::<Vec<_>>();
-    segments.sort_by_key(|path| segment_take_index(path).unwrap_or(0));
+    segments.sort_by(
+        |left, right| match (segment_ref(left), segment_ref(right)) {
+            (Some(left_ref), Some(right_ref)) => left_ref
+                .cmp(&right_ref)
+                .then_with(|| left.file_name().cmp(&right.file_name())),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.file_name().cmp(&right.file_name()),
+        },
+    );
     segments
 }
 
 fn segment_take_index(path: &Path) -> Option<u32> {
+    segment_ref(path).map(|segment| segment.take)
+}
+
+fn segment_ref(path: &Path) -> Option<SegmentRef> {
+    parse_segment_name(path, AudioTrack::Mic).or_else(|| parse_segment_name(path, AudioTrack::Call))
+}
+
+fn parse_segment_name(path: &Path, track: AudioTrack) -> Option<SegmentRef> {
     let name = path.file_name()?.to_str()?;
     let (stem, ext) = name.rsplit_once('.')?;
     if !ext.eq_ignore_ascii_case("m4a") {
         return None;
     }
-    let (_label, index) = stem.rsplit_once('-')?;
-    if index.len() != 3 || !index.chars().all(|ch| ch.is_ascii_digit()) {
+    let rest = stem.strip_prefix(&format!("{}-", track.label()))?;
+    if let Some((take_str, part_str)) = rest.split_once("-part-") {
+        return Some(SegmentRef {
+            take: parse_fixed_digits(take_str, 3)?,
+            part: parse_fixed_digits(part_str, 2)?,
+        });
+    }
+    Some(SegmentRef {
+        take: parse_fixed_digits(rest, 3)?,
+        part: 1,
+    })
+}
+
+fn parse_fixed_digits(value: &str, width: usize) -> Option<u32> {
+    if value.len() != width || !value.chars().all(|ch| ch.is_ascii_digit()) {
         return None;
     }
-    index.parse().ok()
+    value.parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         acquire_capture_lock, capture_lock_path, discover_track_segments, ffmpeg_concat_list,
-        lock_session_publish, mark_audio_transcribed, maybe_discard_session_audio, next_take_index,
+        helper_restart_allowed, lock_session_publish, mark_audio_transcribed,
+        maybe_discard_session_audio, next_helper_part_name, next_take_index,
         prepare_continued_take, promote_legacy_aliases_to_take1, read_capture_progress,
         remove_lock_if_identity_matches, resume_block_reason, session_folder_is_sticky,
-        write_capture_progress, AudioRetention, AudioTrack, CaptureProgress,
+        usable_audio_segments, write_capture_progress, AudioRetention, AudioTrack, CaptureProgress,
+        MAX_HELPER_RESTARTS,
     };
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn unique_session_dir(label: &str) -> PathBuf {
@@ -658,6 +756,15 @@ mod tests {
     fn numbered_segment_names_use_three_digits() {
         assert_eq!(AudioTrack::Mic.segment_name(1), "mic-001.m4a");
         assert_eq!(AudioTrack::Call.segment_name(2), "call-002.m4a");
+        assert_eq!(
+            AudioTrack::Mic.part_segment_name(1, 2),
+            "mic-001-part-02.m4a"
+        );
+        assert_eq!(
+            AudioTrack::Call.part_segment_name(3, 4),
+            "call-003-part-04.m4a"
+        );
+        assert_eq!(AudioTrack::Mic.part_segment_name(1, 1), "mic-001.m4a");
     }
 
     #[test]
@@ -699,6 +806,75 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn restart_parts_are_discovered_in_take_then_part_order() {
+        let session = unique_session_dir("parts");
+        let audio = session.join("audio");
+        fs::create_dir_all(&audio).unwrap();
+        fs::write(audio.join("mic-002.m4a"), b"take2").unwrap();
+        fs::write(audio.join("mic-001-part-03.m4a"), b"p3").unwrap();
+        fs::write(audio.join("mic-001.m4a"), b"p1").unwrap();
+        fs::write(audio.join("mic-001-part-02.m4a"), b"p2").unwrap();
+        fs::write(audio.join("call-001-part-02.m4a"), b"call").unwrap();
+
+        assert_eq!(
+            discover_track_segments(&session, AudioTrack::Mic, None),
+            vec![
+                audio.join("mic-001.m4a"),
+                audio.join("mic-001-part-02.m4a"),
+                audio.join("mic-001-part-03.m4a"),
+                audio.join("mic-002.m4a"),
+            ]
+        );
+        assert_eq!(
+            discover_track_segments(&session, AudioTrack::Mic, Some(1)),
+            vec![
+                audio.join("mic-001.m4a"),
+                audio.join("mic-001-part-02.m4a"),
+                audio.join("mic-001-part-03.m4a"),
+            ]
+        );
+        assert_eq!(next_take_index(&session), 3);
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn usable_audio_segments_skips_tiny_crash_files() {
+        let session = unique_session_dir("unreadable-part");
+        let audio = session.join("audio");
+        fs::create_dir_all(&audio).unwrap();
+        let truncated = audio.join("mic-001.m4a");
+        let part = audio.join("mic-001-part-02.m4a");
+        fs::write(&truncated, b"nope").unwrap();
+        fs::write(&part, vec![0u8; 128]).unwrap();
+        let usable = usable_audio_segments(Path::new("/usr/bin/false"), &[truncated, part.clone()]);
+        assert!(usable.is_empty() || usable == vec![part]);
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn helper_restarts_are_capped_and_name_part_files() {
+        assert_eq!(MAX_HELPER_RESTARTS, 3);
+        assert_eq!(
+            next_helper_part_name(AudioTrack::Mic, 1, 0).as_deref(),
+            Some("mic-001-part-02.m4a")
+        );
+        assert_eq!(
+            next_helper_part_name(AudioTrack::Call, 2, 1).as_deref(),
+            Some("call-002-part-03.m4a")
+        );
+        assert_eq!(
+            next_helper_part_name(AudioTrack::Mic, 1, 2).as_deref(),
+            Some("mic-001-part-04.m4a")
+        );
+        assert_eq!(next_helper_part_name(AudioTrack::Mic, 1, 3), None);
+        assert!(helper_restart_allowed(true, false, 0));
+        assert!(helper_restart_allowed(true, false, 2));
+        assert!(!helper_restart_allowed(false, false, 0));
+        assert!(!helper_restart_allowed(true, true, 0));
+        assert!(!helper_restart_allowed(true, false, 3));
     }
 
     #[test]
@@ -764,6 +940,16 @@ mod tests {
         let mic_one = list.find("mic-001").unwrap();
         let mic_two = list.find("mic-002").unwrap();
         assert!(mic_one < mic_two);
+
+        let parts = ffmpeg_concat_list(&[
+            PathBuf::from("/tmp/recall/mic-001.m4a"),
+            PathBuf::from("/tmp/recall/mic-001-part-02.m4a"),
+            PathBuf::from("/tmp/recall/mic-002.m4a"),
+        ]);
+        let first = parts.find("mic-001.m4a").unwrap();
+        let part = parts.find("mic-001-part-02.m4a").unwrap();
+        let second = parts.find("mic-002.m4a").unwrap();
+        assert!(first < part && part < second);
     }
 
     #[test]
