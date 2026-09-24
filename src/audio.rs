@@ -567,21 +567,63 @@ pub fn concat_audio_segments(ffmpeg: &Path, segments: &[PathBuf], output: &Path)
         return Ok(());
     }
 
-    let list_path = output.with_extension("concat.txt");
-    write_ffmpeg_concat_list(&list_path, &segments)?;
-    let copy_ok = run_ffmpeg_concat(ffmpeg, &list_path, output, true)?;
-    if !copy_ok {
-        let reencode_ok = run_ffmpeg_concat(ffmpeg, &list_path, output, false)?;
-        if !reencode_ok {
-            let _ = fs::remove_file(&list_path);
+    // Route changes can switch channel count, sample rate, and AAC/ALAC codec.
+    // A successful packet-copy concat does not prove those packets decode correctly.
+    let work = output.with_extension(format!(
+        "concat-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir(&work)?;
+    let result = (|| {
+        let mut normalized = Vec::new();
+        for (index, segment) in segments.iter().enumerate() {
+            let path = work.join(format!("{index:05}.wav"));
+            let status = Command::new(ffmpeg)
+                .args(["-nostdin", "-y", "-v", "error", "-i"])
+                .arg(segment)
+                .args(["-map", "0:a:0", "-af"])
+                .arg(mono_downmix_filter())
+                .args(["-ar", "48000", "-c:a", "pcm_f32le"])
+                .arg(&path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?;
+            if !status.success() {
+                return Err(io::Error::other(format!(
+                    "ffmpeg failed to normalize {}",
+                    segment.display()
+                )));
+            }
+            normalized.push(path);
+        }
+        let list_path = work.join("concat.txt");
+        write_ffmpeg_concat_list(&list_path, &normalized)?;
+        if !run_ffmpeg_concat(ffmpeg, &list_path, output)? {
             return Err(io::Error::other(format!(
                 "ffmpeg failed to concatenate {}",
                 output.display()
             )));
         }
-    }
-    let _ = fs::remove_file(&list_path);
-    Ok(())
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(work);
+    result
+}
+
+pub(crate) fn mono_downmix_filter() -> String {
+    // Use channel indices, not surround labels: a mic-array channel is not LFE.
+    // '<' normalizes over channels actually present, preserving mono gain.
+    format!(
+        "pan=mono|c0<{}",
+        (0..32)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join("+")
+    )
 }
 
 pub fn refresh_track_alias(
@@ -635,12 +677,7 @@ fn write_ffmpeg_concat_list(path: &Path, segments: &[PathBuf]) -> io::Result<()>
     Ok(())
 }
 
-fn run_ffmpeg_concat(
-    ffmpeg: &Path,
-    list_path: &Path,
-    output: &Path,
-    copy_codec: bool,
-) -> io::Result<bool> {
+fn run_ffmpeg_concat(ffmpeg: &Path, list_path: &Path, output: &Path) -> io::Result<bool> {
     let mut command = Command::new(ffmpeg);
     command
         .arg("-y")
@@ -650,11 +687,7 @@ fn run_ffmpeg_concat(
         .arg("0")
         .arg("-i")
         .arg(list_path);
-    if copy_codec {
-        command.arg("-c").arg("copy");
-    } else {
-        command.arg("-c:a").arg("aac").arg("-b:a").arg("192k");
-    }
+    command.args(["-c:a", "aac", "-b:a", "192k", "-nostdin"]);
     let status = command
         .arg(output)
         .stdout(Stdio::null())
@@ -997,6 +1030,68 @@ mod tests {
         assert!(output.exists());
         assert!(fs::metadata(&output).unwrap().len() > 0);
         let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn concat_preserves_speech_on_third_channel_after_aac_to_alac_switch() {
+        let Some(ffmpeg) = find_ffmpeg() else { return };
+        let session = unique_session_dir("concat-format-switch");
+        fs::create_dir_all(&session).unwrap();
+        let first = session.join("mic-001.m4a");
+        let second = session.join("mic-001-part-02.m4a");
+        for (path, source, codec) in [
+            (
+                &first,
+                "sine=frequency=220:sample_rate=44100:duration=1",
+                "aac",
+            ),
+            (
+                &second,
+                "aevalsrc=0|0|0.3*sin(2*PI*880*t):s=48000:d=1:c=3.0",
+                "alac",
+            ),
+        ] {
+            let status = std::process::Command::new(&ffmpeg)
+                .args([
+                    "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", source, "-c:a", codec,
+                ])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let joined = session.join("joined.m4a");
+        super::concat_audio_segments(&ffmpeg, &[first, second], &joined).unwrap();
+        let decoded = std::process::Command::new(&ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&joined)
+            .args(["-ac", "1", "-ar", "16000", "-f", "f32le", "-"])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        let samples: Vec<f32> = decoded
+            .stdout
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert!(
+            (31000..35000).contains(&samples.len()),
+            "joined frames: {}",
+            samples.len()
+        );
+        let energy: f64 = samples[24000..30000]
+            .iter()
+            .map(|s| f64::from(*s).powi(2))
+            .sum();
+        assert!(
+            (energy / 6000.0).sqrt() > 0.02,
+            "third-channel speech was lost"
+        );
+        assert!(!fs::read_dir(&session)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().is_dir()));
+        fs::remove_dir_all(session).unwrap();
     }
 
     fn find_ffmpeg() -> Option<PathBuf> {

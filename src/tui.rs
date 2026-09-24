@@ -428,6 +428,42 @@ impl LiveSourceTranscript {
     }
 }
 
+fn note_char_modifiers_ok(modifiers: KeyModifiers) -> bool {
+    let command = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER;
+    !modifiers.intersects(command)
+}
+
+fn shifted_note_char(ch: char, modifiers: KeyModifiers) -> char {
+    if !modifiers.contains(KeyModifiers::SHIFT) {
+        return ch;
+    }
+    match ch {
+        'a'..='z' => ch.to_ascii_uppercase(),
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        '`' => '~',
+        _ => ch,
+    }
+}
+
 fn same_live_utterance(previous: &str, next: &str) -> bool {
     let previous = previous.trim();
     let next = next.trim();
@@ -1687,10 +1723,11 @@ impl App {
                 self.paste_clipboard_image(false);
             }
             KeyCode::Char(ch)
-                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                if note_char_modifiers_ok(key.modifiers)
+                    && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
             {
                 if let Some(draft) = &mut self.note_draft {
-                    draft.insert_char(ch);
+                    draft.insert_char(shifted_note_char(ch, key.modifiers));
                 }
             }
             _ => {}
@@ -1918,7 +1955,9 @@ impl App {
     }
 
     fn should_apply_generation(&self, session_path: &PathBuf, generation: u32) -> bool {
-        self.is_current_session(session_path) && generation == self.completed_take
+        self.is_current_session(session_path)
+            && generation == self.completed_take
+            && self.take_index <= generation
     }
 
     fn session_label(session_path: &std::path::Path) -> String {
@@ -2081,7 +2120,9 @@ impl App {
             );
             self.started_at = Some(Instant::now());
             self.state = CaptureState::Recording;
-            self.reset_analysis_gauge_for_new_take();
+            self.analysis_status.percent = 0;
+            self.analysis_status.failed = false;
+            self.analysis_status.label = "Analysis waits for this take".to_string();
             let mut toast = if self.has_background_jobs() {
                 "Continuing this session. Previous transcript still running in the background."
                     .to_string()
@@ -2107,12 +2148,6 @@ impl App {
         }
 
         Ok(())
-    }
-
-    fn reset_analysis_gauge_for_new_take(&mut self) {
-        if self.analysis_jobs.is_empty() {
-            self.analysis_status = AnalysisStatus::idle();
-        }
     }
 
     fn reset_capture_health(&mut self) {
@@ -2625,6 +2660,8 @@ impl App {
         if let Some(recorder) = self.mic_recorder.as_mut() {
             match recorder.try_wait() {
                 Ok(Some(status)) => {
+                    self.mic_level_percent = 0;
+                    self.mic_level_db = None;
                     let warning = format!(
                         "Mic recorder stopped unexpectedly at {} ({status}).",
                         self.elapsed_label()
@@ -4685,30 +4722,17 @@ mod tests {
     }
 
     #[test]
-    fn continue_clears_finished_ai_gauge_but_keeps_in_flight_analysis() {
+    fn continue_ignores_previous_take_analysis_while_recording() {
         let current_session = PathBuf::from("/tmp/recall-ai-gauge");
         let mut app = test_app(current_session.clone());
-        app.analysis_status = AnalysisStatus {
-            label: "Meeting notes ready".to_string(),
-            percent: 100,
-            result_path: Some(current_session.join("meeting.md")),
-            failed: false,
-        };
-        app.reset_analysis_gauge_for_new_take();
-        assert_eq!(app.analysis_status.percent, 0);
-        assert_eq!(app.analysis_status.label, "Analysis idle");
-        assert!(app.analysis_status.result_path.is_none());
-
-        let (_sender, receiver) = mpsc::channel();
-        app.analysis_status = AnalysisStatus::running("grok");
-        app.analysis_jobs.push(AnalysisJob {
-            session_path: current_session,
-            generation: 1,
-            receiver,
-        });
-        app.reset_analysis_gauge_for_new_take();
-        assert_eq!(app.analysis_status.percent, 10);
-        assert!(app.analysis_status.label.contains("Analyzing with grok"));
+        app.take_index = 2;
+        app.completed_take = 1;
+        app.state = CaptureState::Recording;
+        assert!(!app.should_apply_generation(&current_session, 1));
+        app.state = CaptureState::Ended;
+        app.take_index = 1;
+        app.completed_take = 1;
+        assert!(app.should_apply_generation(&current_session, 1));
     }
 
     #[test]
@@ -5388,6 +5412,19 @@ mod tests {
         assert!(meeting.contains("second line"));
         assert!(app.note_draft.is_none());
 
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn shift_nine_inserts_an_open_paren_not_a_digit() {
+        let (storage, session_path) = note_session("shift-nine");
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        app.handle_note_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::SHIFT));
+        app.handle_note_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT));
+        app.handle_note_key(KeyEvent::new(KeyCode::Char('('), KeyModifiers::SHIFT));
+        let draft = app.note_draft.as_ref().unwrap();
+        assert_eq!(draft.caption(), "(A(");
         let _ = fs::remove_dir_all(storage);
     }
 

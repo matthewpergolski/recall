@@ -67,23 +67,13 @@ This path has produced audible system audio in controlled macOS-sound tests and 
 
 ## Microphone Device Changes
 
-Recall records the default macOS microphone into `audio/mic.m4a`. This can be fragile if the user changes audio routes during a call, for example:
+Recall records the default macOS microphone with a hardware input callback, not `AVAudioEngine`. The first file is `audio/mic-001.m4a`.
 
-- starts on MacBook speaker/mic
-- switches to AirPods
-- AirPods disconnect or change Bluetooth profile
-- macOS falls back to the MacBook microphone
+A connected Phone or FaceTime call can change that same input from mono to three interleaved channels and back, without changing the device id. Recall follows the new format and continues the take in `audio/mic-001-part-02.m4a` (and later parts). Transcription joins those parts. A brief gap at connect and hangup is still possible.
 
-The capture helper now reports the default input device at mic start and emits `device_changed` events when macOS changes the default input while recording. The TUI surfaces those changes in the capture-health line and live notes.
+The MacBook mic can stay quieter than the call playback during a Phone or FaceTime call. Your words may be easier to hear on `call.m4a` when the phone app plays them back. Speaker bleed is expected when the call comes out of the Mac speakers: the same remote speech can show up on both tracks.
 
-Current behavior is detection and warning. Starting already on AirPods records the mic for the full session. Switching to AirPods after recording has started is reported in the TUI; `mic.m4a` sometimes continues and sometimes ends at the switch. Recall does not yet restart capture onto the new input or stitch mic segments.
-
-Future direction:
-
-1. Lock recording to an explicit selected microphone.
-2. Restart mic capture automatically when the default input changes.
-3. Write segmented mic files, for example `mic-000.m4a`, `mic-001.m4a`.
-4. Stitch or timeline-align mic segments during transcription.
+Switching to AirPods after recording has started is reported in the TUI. Recall reopens the input when the default device or its format changes. It does not yet let you pick a microphone other than the system default.
 
 ## Launcher Permission Model
 
