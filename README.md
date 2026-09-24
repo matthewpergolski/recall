@@ -305,7 +305,7 @@ recall export latest --output ~/Desktop/project-sync.md
 - transcript progress starts after recording ends; a continued take re-transcribes the full concatenated audio
 - `r`: refresh detected sources
 - `m`: add a timestamped marker to the session
-- `n`: type a timestamped note, then `Enter` saves it with the session
+- `n`: type a timestamped note, then `Enter` saves it with the session. Shift types capitals and symbols (`(`), not the unshifted key (`9`)
 - While the note draft is open: click or arrow keys move the caret; pasted pictures show as `[Image #1]`, `[Image #2]`, … and the caret can sit after a chip (Backspace removes it). `Enter` saves; `Ctrl+J`, `Shift+Enter`, or `Alt+Enter` inserts a newline; `Cmd+V` / `Ctrl+V` pastes a clipboard image (or text); `Ctrl+I` / Tab is image-only. Recall enables the terminal keyboard protocol itself so those chords work in Ghostty without a separate setup command. Opening `n` does not read the clipboard. Bare `http(s)` / `www.` URLs become markdown links on save. Esc cancels and deletes unused pasted files.
 - `o`: open the session folder in Finder or the configured editor
 - `O`: open the meeting document

@@ -217,6 +217,12 @@ struct RecallCapture {
             printHelp()
         case "list-sources":
             try printJSON(listSources())
+        case "diagnose-input":
+            guard let device = defaultInputDevice() else {
+                MicInputDiagnostics.emit(["type": "mic_device_diagnostic", "error": "No default input device"])
+                Foundation.exit(1)
+            }
+            MicInputDiagnostics.deviceSnapshot(id: device.id, name: device.name, uid: device.uid, elapsed: 0)
         case "record-mic":
             do {
                 try recordMic(parseRecordMicOptions(Array(args.dropFirst())))
@@ -926,6 +932,7 @@ struct RecallCapture {
 
             USAGE:
                 recall-capture list-sources
+                recall-capture diagnose-input
                 recall-capture record-mic --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--mute-file <path>] [--output-name <file.m4a>] [--live-transcript]
                 recall-capture record-audio-tap --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>] [--live-transcript]
                 recall-capture record-system --session-dir <path> [--duration <seconds>] [--stop-file <path>] [--output-name <file.m4a>]
@@ -938,6 +945,7 @@ struct RecallCapture {
 
             COMMANDS:
                 list-sources    Emit candidate meeting apps and microphones as JSON.
+                diagnose-input  Read mic controls/formats without recording; JSON on stderr.
                 record-mic      Record default microphone audio into <session-dir>/audio/<output-name>.
                                 --mute-file writes digital silence into the same m4a while present.
                                 --live-transcript emits on-device SpeechAnalyzer JSON while recording.
@@ -966,9 +974,13 @@ final class MicTapRecorder: @unchecked Sendable {
 
     private let outputURL: URL
     private let muteFile: URL?
+    private let writerQueue = DispatchQueue(label: "recall.mic.writer")
+    private let diagnostics = ProcessInfo.processInfo.environment["RECALL_MIC_DIAGNOSTICS"] == "1"
+        ? MicInputDiagnostics() : nil
+    private var lastDiagnosticSnapshot = Date.distantPast
     private let startedAt = Date()
     private let muteLock = NSLock()
-    private var audioFile: AVAudioFile?
+    private let archive: MicArchive
     private var inputFormat: AVAudioFormat?
     private var deviceID = AudioDeviceID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
@@ -980,6 +992,7 @@ final class MicTapRecorder: @unchecked Sendable {
 
     init(outputURL: URL, muteFile: URL?, liveTranscript: Bool) {
         self.outputURL = outputURL
+        self.archive = MicArchive(outputURL: outputURL)
         self.muteFile = muteFile
         self.liveFeed = liveTranscript
             ? LiveTranscriptFeed(source: "mic", startedAt: startedAt)
@@ -988,8 +1001,8 @@ final class MicTapRecorder: @unchecked Sendable {
 
     func record(durationSeconds: TimeInterval, stopFile: URL?) throws {
         liveFeed?.start()
+        defer { stop(); liveFeed?.finish() }
         try start()
-        updateInputDevice(RecallCapture.defaultInputDevice())
         let startedDevice = snapshotInputDevice()
 
         try RecallCapture.printJSONLine(CaptureEvent(
@@ -1007,31 +1020,36 @@ final class MicTapRecorder: @unchecked Sendable {
             && !RecallCapture.shouldStopRecording(stopFile: stopFile)
         {
             refreshMuteState()
-            let latestInputDevice = RecallCapture.defaultInputDevice()
-            if let latestInputDevice, latestInputDevice.id != deviceID {
+            if diagnostics != nil, Date().timeIntervalSince(lastDiagnosticSnapshot) >= 1 {
+                lastDiagnosticSnapshot = Date()
                 let captured = snapshotInputDevice()
+                MicInputDiagnostics.deviceSnapshot(id: deviceID, name: captured?.name, uid: captured?.uid,
+                                                    elapsed: Date().timeIntervalSince(startedAt))
+            }
+            let latestInputDevice = RecallCapture.defaultInputDevice()
+            if let latestInputDevice,
+               latestInputDevice.id != deviceID || inputFormatChanged(on: latestInputDevice.id)
+            {
+                logMic("input device or format changed on \(latestInputDevice.name); refreshing capture")
+                try retarget(to: latestInputDevice)
                 try RecallCapture.printJSONLine(CaptureEvent(
                     type: "device_changed",
                     source: "mic",
                     path: nil,
                     elapsedSeconds: Date().timeIntervalSince(startedAt),
                     levelDb: nil,
-                    message:
-                        "Default input is now \(latestInputDevice.name); this take still captures \(captured?.name ?? "the original input").",
-                    deviceName: captured?.name,
-                    deviceID: captured?.uid
+                    message: "Mic input now \(latestInputDevice.name), \(inputFormat?.channelCount ?? 0) channels.",
+                    deviceName: latestInputDevice.name,
+                    deviceID: latestInputDevice.uid
                 ))
             }
-            if let writeError {
-                stop()
-                liveFeed?.finish()
+            if let writeError = snapshotWriteError() {
                 throw writeError
             }
             RunLoop.current.run(until: Date().addingTimeInterval(0.1))
         }
 
         stop()
-        liveFeed?.finish()
         let stoppedDevice = snapshotInputDevice()
 
         try RecallCapture.printJSONLine(CaptureEvent(
@@ -1050,25 +1068,39 @@ final class MicTapRecorder: @unchecked Sendable {
         guard let device = RecallCapture.defaultInputDevice() else {
             throw CaptureError.audioFormatUnavailable
         }
+        logMic("start \(device.name) id=\(device.id) hog=\(hogModeDescription(device.id))")
+        if diagnostics != nil {
+            MicInputDiagnostics.deviceSnapshot(id: device.id, name: device.name, uid: device.uid, elapsed: 0)
+        }
+        try openDevice(device)
+    }
+
+    private func inputFormatChanged(on id: AudioDeviceID) -> Bool {
+        guard let description = try? readInputStreamDescription(deviceID: id),
+              let latest = MicPCM.format(description) else { return false }
+        return latest != inputFormat
+    }
+
+    private func retarget(to device: DefaultInputDevice) throws {
+        detachIOProc()
+        writerQueue.sync {}
+        try openDevice(device)
+    }
+
+    private func openDevice(_ device: DefaultInputDevice) throws {
         deviceID = device.id
         updateInputDevice(device)
-
-        var streamDescription = try readInputStreamDescription(deviceID: device.id)
-        guard let format = AVAudioFormat(streamDescription: &streamDescription) else {
+        let streamDescription = try readInputStreamDescription(deviceID: device.id)
+        guard let format = MicPCM.format(streamDescription) else {
+            if diagnostics != nil {
+                MicInputDiagnostics.emit(["type": "mic_format_rejected",
+                    "device_id": device.id, "format": MicInputDiagnostics.describe(streamDescription)])
+            }
             throw CaptureError.audioFormatUnavailable
         }
         inputFormat = format
-        audioFile = try AVAudioFile(
-            forWriting: outputURL,
-            settings: [
-                AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-                AVSampleRateKey: format.sampleRate,
-                AVNumberOfChannelsKey: Int(max(format.channelCount, 1)),
-                AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
-            ],
-            commonFormat: format.commonFormat,
-            interleaved: format.isInterleaved
-        )
+        logMic("format rate=\(format.sampleRate) channels=\(format.channelCount) hog=\(hogModeDescription(device.id))")
+        try writerQueue.sync { try archive.prepare(format) }
 
         var newIOProcID: AudioDeviceIOProcID?
         let ioStatus = AudioDeviceCreateIOProcID(
@@ -1078,85 +1110,89 @@ final class MicTapRecorder: @unchecked Sendable {
             &newIOProcID
         )
         guard ioStatus == noErr, let newIOProcID else {
+            logMic("AudioDeviceCreateIOProcID failed \(ioStatus)")
             throw CaptureError.audioDeviceIOProcCreationFailed(ioStatus)
         }
         ioProcID = newIOProcID
 
         let startStatus = AudioDeviceStart(deviceID, newIOProcID)
         guard startStatus == noErr else {
+            logMic("AudioDeviceStart failed \(startStatus) hog=\(hogModeDescription(device.id))")
             throw CaptureError.audioDeviceStartFailed(startStatus)
         }
     }
 
-    private func stop() {
+    private func detachIOProc() {
         if deviceID != kAudioObjectUnknown, let ioProcID {
             let _ = AudioDeviceStop(deviceID, ioProcID)
             let _ = AudioDeviceDestroyIOProcID(deviceID, ioProcID)
             self.ioProcID = nil
         }
-        audioFile = nil
+    }
+
+    private func stop() {
+        detachIOProc()
+        writerQueue.sync {
+            self.archive.finish()
+        }
         deviceID = AudioDeviceID(kAudioObjectUnknown)
     }
 
-    fileprivate func handleInput(_ inputData: UnsafePointer<AudioBufferList>?) -> OSStatus {
-        guard let inputData,
-              let inputFormat,
-              let buffer = makePCMBuffer(from: inputData, format: inputFormat)
-        else {
-            return noErr
+    fileprivate func handleInput(
+        _ inputData: UnsafePointer<AudioBufferList>?,
+        inputTime: UnsafePointer<AudioTimeStamp>?
+    ) -> OSStatus {
+        var copiedBuffer: AVAudioPCMBuffer?
+        if let inputData, let inputFormat {
+            copiedBuffer = MicPCM.copy(inputData, nominal: inputFormat)
         }
         let muted = isMuted()
-        let device = snapshotInputDevice()
-        do {
-            if muted {
-                if let silent = silentBuffer(matching: buffer) {
-                    try audioFile?.write(from: silent)
-                }
-                maybeEmitLevel(Self.mutedLevelDb, device: device)
-            } else {
-                try audioFile?.write(from: buffer)
-                maybeEmitLevel(audioLevelDb(buffer) ?? Self.mutedLevelDb, device: device)
-                if let copy = copyPCMBuffer(buffer) {
-                    liveFeed?.enqueue(copy)
-                }
+        let level = copiedBuffer.flatMap { MicPCM.level($0) }
+        let diagnostic = diagnostics?.observe(inputData, format: inputFormat,
+                                               copiedBuffer: copiedBuffer, muted: muted,
+                                               elapsed: Date().timeIntervalSince(startedAt))
+        let queuedAt = ProcessInfo.processInfo.systemUptime
+        guard let buffer = copiedBuffer else {
+            if let diagnostic {
+                writerQueue.async { diagnostic.log(writerDelay: ProcessInfo.processInfo.systemUptime - queuedAt, fileFrames: nil) }
             }
-        } catch {
-            writeError = error
+            return noErr
+        }
+        let device = snapshotInputDevice()
+        writerQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                if muted {
+                    if let silent = silentBuffer(matching: buffer) {
+                        try self.archive.write(silent)
+                    }
+                    self.maybeEmitLevel(Self.mutedLevelDb, device: device)
+                } else {
+                    try self.archive.write(buffer)
+                    self.maybeEmitLevel(level ?? Self.mutedLevelDb, device: device)
+                    if self.liveFeed != nil, let speech = MicPCM.speechBuffer(buffer) {
+                        self.liveFeed?.enqueue(speech)
+                    }
+                }
+                if let diagnostic {
+                    diagnostic.log(writerDelay: ProcessInfo.processInfo.systemUptime - queuedAt,
+                                   fileFrames: self.archive.length)
+                }
+            } catch {
+                let message = "mic write failed: \(error)\n"
+                FileHandle.standardError.write(Data(message.utf8))
+                self.muteLock.lock()
+                self.writeError = error
+                self.muteLock.unlock()
+            }
         }
         return noErr
     }
 
-    private func makePCMBuffer(
-        from inputData: UnsafePointer<AudioBufferList>,
-        format: AVAudioFormat
-    ) -> AVAudioPCMBuffer? {
-        let sourceBuffers = UnsafeMutableAudioBufferListPointer(
-            UnsafeMutablePointer(mutating: inputData)
-        )
-        guard let firstBuffer = sourceBuffers.first else {
-            return nil
-        }
-        let bytesPerFrame = max(Int(format.streamDescription.pointee.mBytesPerFrame), 1)
-        let frameCapacity = AVAudioFrameCount(Int(firstBuffer.mDataByteSize) / bytesPerFrame)
-        guard frameCapacity > 0,
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity)
-        else {
-            return nil
-        }
-        buffer.frameLength = frameCapacity
-        let destinationBuffers = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
-        for index in 0..<min(sourceBuffers.count, destinationBuffers.count) {
-            let source = sourceBuffers[index]
-            var destination = destinationBuffers[index]
-            guard let sourceData = source.mData, let destinationData = destination.mData else {
-                continue
-            }
-            let byteCount = min(Int(source.mDataByteSize), Int(destination.mDataByteSize))
-            memcpy(destinationData, sourceData, byteCount)
-            destination.mDataByteSize = UInt32(byteCount)
-            destinationBuffers[index] = destination
-        }
-        return buffer
+    private func snapshotWriteError() -> Error? {
+        muteLock.lock()
+        defer { muteLock.unlock() }
+        return writeError
     }
 
     private func refreshMuteState() {
@@ -1465,7 +1501,7 @@ private let coreAudioTapIOProc: AudioDeviceIOProc = {
 }
 
 private let micHALIOProc: AudioDeviceIOProc = {
-    _, _, inputData, _, _, _, clientData in
+    _, _, inputData, inputTime, _, _, clientData in
     guard let clientData else {
         return noErr
     }
@@ -1473,7 +1509,30 @@ private let micHALIOProc: AudioDeviceIOProc = {
     let recorder = Unmanaged<MicTapRecorder>
         .fromOpaque(clientData)
         .takeUnretainedValue()
-    return recorder.handleInput(inputData)
+    return recorder.handleInput(inputData, inputTime: inputTime)
+}
+
+private func logMic(_ message: String) {
+    fputs("mic: \(message)\n", stderr)
+    fflush(stderr)
+}
+
+private func hogModeDescription(_ deviceID: AudioDeviceID) -> String {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyHogMode,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var hog = pid_t(-1)
+    var size = UInt32(MemoryLayout<pid_t>.size)
+    let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &hog)
+    if status != noErr {
+        return "unavailable(\(status))"
+    }
+    if hog == -1 {
+        return "shared"
+    }
+    return "hogged-by-pid-\(hog)"
 }
 
 private func readInputStreamDescription(deviceID: AudioDeviceID) throws -> AudioStreamBasicDescription {

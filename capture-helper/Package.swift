@@ -11,6 +11,7 @@ let package = Package(
         .executable(name: "recall-capture", targets: ["RecallCapture"])
     ],
     targets: [
-        .executableTarget(name: "RecallCapture")
+        .executableTarget(name: "RecallCapture"),
+        .testTarget(name: "RecallCaptureTests", dependencies: ["RecallCapture"])
     ]
 )

@@ -1558,6 +1558,8 @@ fn convert_to_wav_chunks(
         .arg("-i")
         .arg(input)
         .arg("-vn")
+        .arg("-af")
+        .arg(crate::audio::mono_downmix_filter())
         .arg("-ar")
         .arg("16000")
         .arg("-ac")
