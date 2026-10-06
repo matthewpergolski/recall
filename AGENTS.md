@@ -36,16 +36,41 @@ Public/user-facing documentation belongs in `README.md` and `docs/`.
 
 The local `memory-bank/` is ignored by Git. It may contain private testing details and project-continuity state.
 
-Before non-trivial code changes, read these files if they exist:
+Maintain four core files:
 
-- `memory-bank/projectbrief.md`
-- `memory-bank/productContext.md`
-- `memory-bank/activeContext.md`
-- `memory-bank/systemPatterns.md`
-- `memory-bank/techContext.md`
-- `memory-bank/progress.md`
+- `activeContext.md`: current task/constraints, state, verified, not verified,
+  next step, and waiting on the user. Rewrite stale sections; target at most
+  60 lines. This is current state, not an append-only investigation log.
+- `projectbrief.md`: stable purpose, constraints, and scope.
+- `decisions.md`: append dated decisions, rationale, and evidence/scope.
+  Mark superseded entries; do not log routine activity.
+- `techContext.md`: durable lessons, reproduction commands, testing caveats,
+  and an index of retained supporting probes/specs.
 
-Update the memory bank after major implementation, architecture, setup, dependency, or product-direction changes.
+Before non-trivial work, read activeContext and projectbrief if present, then
+only relevant decisions, technical sections, and indexed supporting files.
+On a fresh clone, create missing core files when needed from verified source/docs
+and user instructions; mark unknowns. Older files are historical references,
+not competing current-state instructions.
+
+After implementation, a diagnostic result, a material decision, or a handoff
+(and when explicitly asked to update memory):
+
+1. Replace outdated status and next steps; remove claims no longer true.
+2. Separate dated verification evidence from assumptions and untested behavior.
+3. Record new decisions and durable lessons in their respective files.
+4. Label temporary artifacts disposable; include recreation commands rather than
+   relying on old temp binaries/paths. Do not store secrets or raw transcripts.
+5. Check the core file list and supporting-file index match maintained files.
+   Move detail out of activeContext instead of appending more history.
+
+Memory is checkout-local. Identify the checkout and source baseline in
+activeContext; verify Git state before relying on it. It is authoritative only
+for work in that checkout, not another worktree or a newer revision.
+After a merge, reconcile durable decisions, technical findings, verification
+scope, and open issues into the destination's memory. Do not blindly copy logs
+or overwrite newer destination state. Git does not transfer ignored memory;
+explicitly record pending handoffs.
 
 ## Architecture
 

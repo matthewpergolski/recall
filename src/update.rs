@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use crate::config::expand_path;
+use crate::update_progress::{plan_total, UpdateProgress};
 
 const RECALL_REMOTE: &str = "github.com/matthewpergolski/recall";
 const BUILD_COMMIT: &str = env!("RECALL_BUILD_COMMIT");
@@ -50,7 +51,9 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     ensure_update_branch(&checkout)?;
 
     let previous_commit = git_output(&checkout, &["rev-parse", "HEAD"])?;
-    run_quiet_command(
+    let mut progress = UpdateProgress::detect();
+    progress.arm_ephemeral("Checking origin/main");
+    let fetched = run_quiet_command(
         Command::new("git").arg("-C").arg(&checkout).args([
             "fetch",
             "--quiet",
@@ -58,42 +61,70 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             "refs/heads/main:refs/remotes/origin/main",
         ]),
         "fetch origin/main",
-    )?;
+    );
+    let check_shown = progress.disarm_ephemeral();
+    if let Err(error) = fetched {
+        if check_shown {
+            progress.print_static_failure("Checking origin/main")?;
+        }
+        return Err(error);
+    }
     let remote_commit = git_output(&checkout, &["rev-parse", "refs/remotes/origin/main"])?;
 
     if previous_commit == remote_commit && build_matches(&previous_commit, BUILD_COMMIT) {
+        progress.rest();
         println!("Already up to date ({}).", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
-    if previous_commit != remote_commit {
-        run_quiet_command(
+    let refreshing = previous_commit == remote_commit;
+    let crate_version = if refreshing {
+        let crate_version = validate_checkout(&checkout)?;
+        if progress.is_interactive() {
+            progress.open_bar(
+                &format!("Refreshing Recall {crate_version}"),
+                plan_total(&["Tests", "Capture helper", "Install"]),
+            )?;
+        } else {
+            println!("Refreshing Recall {crate_version}...");
+        }
+        crate_version
+    } else {
+        if progress.is_interactive() {
+            progress.open_bar(
+                &format!(
+                    "Updating Recall {} → {}",
+                    short_commit(&previous_commit),
+                    short_commit(&remote_commit)
+                ),
+                plan_total(&["Fast-forward", "Tests", "Capture helper", "Install"]),
+            )?;
+        } else {
+            println!(
+                "Updating Recall {} -> {}...",
+                short_commit(&previous_commit),
+                short_commit(&remote_commit)
+            );
+        }
+        run_quiet_step(
+            &mut progress,
+            "Fast-forward",
             Command::new("git").arg("-C").arg(&checkout).args([
                 "merge",
                 "--ff-only",
                 "--quiet",
                 "refs/remotes/origin/main",
             ]),
-            "fast-forward to origin/main",
         )?;
-    }
-
-    let crate_version = validate_checkout(&checkout)?;
+        validate_checkout(&checkout)?
+    };
     ensure_clean(&checkout)?;
     ensure_at_origin_main(&checkout)?;
 
     let current_commit = git_output(&checkout, &["rev-parse", "HEAD"])?;
-    if previous_commit == current_commit {
-        println!("Refreshing Recall {crate_version}...");
-    } else {
-        println!(
-            "Updating Recall {} -> {}...",
-            short_commit(&previous_commit),
-            short_commit(&current_commit)
-        );
-    }
 
     run_quiet_step(
+        &mut progress,
         "Tests",
         Command::new("cargo")
             .arg("test")
@@ -102,6 +133,7 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             .arg(checkout.join("Cargo.toml")),
     )?;
     run_quiet_step(
+        &mut progress,
         "Capture helper",
         Command::new("swift")
             .arg("build")
@@ -111,6 +143,7 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     ensure_clean(&checkout)?;
     ensure_at_origin_main(&checkout)?;
     run_quiet_step(
+        &mut progress,
         "Install",
         Command::new("cargo")
             .arg("install")
@@ -120,9 +153,21 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             .arg("--force"),
     )?;
 
-    if previous_commit == current_commit {
+    if progress.is_interactive() {
+        let summary = if refreshing {
+            format!("Refreshed {crate_version}")
+        } else {
+            format!(
+                "Updated to {crate_version} ({})",
+                short_commit(&current_commit)
+            )
+        };
+        progress.conclude(&summary)?;
+    } else if refreshing {
+        progress.rest();
         println!("Recall refreshed ({crate_version}).");
     } else {
+        progress.rest();
         println!(
             "Recall updated to {crate_version} ({}).",
             short_commit(&current_commit)
@@ -358,16 +403,16 @@ fn run_quiet_command(command: &mut Command, description: &str) -> io::Result<()>
     command_output(command, description).map(|_| ())
 }
 
-fn run_quiet_step(label: &str, command: &mut Command) -> io::Result<()> {
-    print!("  {label}... ");
-    io::stdout().flush()?;
+fn run_quiet_step(
+    progress: &mut UpdateProgress,
+    label: &str,
+    command: &mut Command,
+) -> io::Result<()> {
+    progress.start_step(label)?;
     match run_quiet_command(command, label) {
-        Ok(()) => {
-            println!("done");
-            Ok(())
-        }
+        Ok(()) => progress.succeed(),
         Err(error) => {
-            println!("failed");
+            let _ = progress.fail();
             Err(error)
         }
     }
