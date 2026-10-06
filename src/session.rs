@@ -707,6 +707,15 @@ pub fn resume_hint(session_path: &Path) -> Option<String> {
     ))
 }
 
+/// Dim gray for a terminal hint. `fade` is false for pipes, `NO_COLOR`, and `TERM=dumb`.
+pub fn faded_text(text: &str, fade: bool) -> String {
+    if fade {
+        format!("\u{1b}[2;38;5;242m{text}\u{1b}[0m")
+    } else {
+        text.to_string()
+    }
+}
+
 pub fn export_session(session_path: &Path, output_path: Option<&Path>) -> io::Result<PathBuf> {
     let meeting_path = primary_document_path(session_path);
     if !meeting_path.exists() {
@@ -1039,7 +1048,7 @@ mod tests {
     use super::{
         append_session_marker, append_session_note, append_session_note_with_images,
         copy_image_into_session, detect_system_iana_timezone, discard_unused_note_images,
-        editor_invocation, escape_json, export_session, format_session_note_bullet,
+        editor_invocation, escape_json, export_session, faded_text, format_session_note_bullet,
         linkify_note_caption, list_sessions, mark_transcript_ready, next_note_image_relative_path,
         pasted_image_path, read_session_consent, readable_session_stamp_for,
         resolve_session_target, resolve_timezone, resume_hint, session_entries, slugify,
@@ -1401,6 +1410,20 @@ mod tests {
             "Resume this session with:\n  recall --resume 2026-05-26_1921-et-grill-supper-and-weber-gift\nOr: recall --resume latest"
         );
         assert!(resume_hint(Path::new("/")).is_none());
+    }
+
+    #[test]
+    fn faded_resume_hint_is_gray_and_plain_text_stays_unchanged() {
+        let hint = resume_hint(&PathBuf::from(
+            "/tmp/sessions/2026-05-26_1921-et-grill-supper-and-weber-gift",
+        ))
+        .unwrap();
+        assert_eq!(faded_text(&hint, false), hint);
+        let faded = faded_text(&hint, true);
+        assert!(faded.starts_with("\u{1b}[2;38;5;242m"));
+        assert!(faded.ends_with("\u{1b}[0m"));
+        assert!(faded.contains("recall --resume 2026-05-26_1921-et-grill-supper-and-weber-gift"));
+        assert!(!hint.contains('\u{1b}'));
     }
 
     fn tiny_png() -> Vec<u8> {

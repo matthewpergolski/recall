@@ -172,8 +172,16 @@ extension RecallCapture {
         for transcriber: SpeechTranscriber,
         locale: Locale
     ) async throws {
-        if try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) != nil {
-            throw CaptureError.appleSpeechModelNotInstalled(appleLocaleIdentifier(locale))
+        let requestPending =
+            try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) != nil
+        let installed = await SpeechTranscriber.installedLocales.map(appleLocaleIdentifier)
+        let wanted = appleLocaleIdentifier(locale)
+        guard appleSpeechAssetsReady(
+            requestPending: requestPending,
+            locale: wanted,
+            installedLocales: installed
+        ) else {
+            throw CaptureError.appleSpeechModelNotInstalled(wanted)
         }
     }
 
@@ -307,6 +315,17 @@ extension RecallCapture {
         locale.identifier(.bcp47)
     }
     #endif
+
+    /// A pending installation request alone does not mean the model is missing:
+    /// macOS 26.7 was seen returning an empty request with the locale already
+    /// installed. Only a pending request for a locale that is not installed counts.
+    static func appleSpeechAssetsReady(
+        requestPending: Bool,
+        locale: String,
+        installedLocales: [String]
+    ) -> Bool {
+        !requestPending || installedLocales.contains(locale)
+    }
 }
 
 #if compiler(>=6.2)

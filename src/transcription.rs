@@ -290,13 +290,13 @@ enum AsrEngine {
         bin: PathBuf,
         model: PathBuf,
         fallback_from_parakeet: bool,
-        fallback_from_apple: bool,
+        apple_fallback_reason: Option<String>,
     },
     Parakeet {
         bin: PathBuf,
         model: String,
         cache_dir: Option<PathBuf>,
-        fallback_from_apple: bool,
+        apple_fallback_reason: Option<String>,
     },
 }
 
@@ -320,17 +320,17 @@ impl AsrEngine {
     fn fallback_note(&self) -> Option<String> {
         match self {
             Self::Parakeet {
-                fallback_from_apple: true,
+                apple_fallback_reason: Some(reason),
                 ..
             } => Some(format!(
-                "Apple SpeechAnalyzer unavailable; falling back to Parakeet. {APPLE_SPEECH_HINT}"
+                "Apple SpeechAnalyzer unavailable; falling back to Parakeet. {reason}"
             )),
             Self::Whisper {
-                fallback_from_apple: true,
+                apple_fallback_reason: Some(reason),
                 fallback_from_parakeet: true,
                 ..
             } => Some(format!(
-                "Apple SpeechAnalyzer unavailable and Parakeet CLI missing; falling back to Whisper. {APPLE_SPEECH_HINT} {PARAKEET_INSTALL_HINT}"
+                "Apple SpeechAnalyzer unavailable and Parakeet CLI missing; falling back to Whisper. {reason} {PARAKEET_INSTALL_HINT}"
             )),
             Self::Whisper {
                 fallback_from_parakeet: true,
@@ -862,12 +862,14 @@ fn resolve_model_path(options: &TranscribeOptions) -> io::Result<PathBuf> {
 
 fn resolve_asr_engine(options: &TranscribeOptions) -> io::Result<AsrEngine> {
     match options.engine {
-        TranscriptionEngine::Whisper => resolve_whisper_engine(options, false, false),
-        TranscriptionEngine::Parakeet => resolve_parakeet_engine(options, false),
+        TranscriptionEngine::Whisper => resolve_whisper_engine(options, false, None),
+        TranscriptionEngine::Parakeet => resolve_parakeet_engine(options, None),
         TranscriptionEngine::Apple => match resolve_apple_engine() {
             Ok(engine) => Ok(engine),
             Err(error) if options.require_apple => Err(error),
-            Err(_) => resolve_parakeet_engine(options, true),
+            Err(error) => {
+                resolve_parakeet_engine(options, Some(apple_fallback_reason(&error.to_string())))
+            }
         },
     }
 }
@@ -875,19 +877,19 @@ fn resolve_asr_engine(options: &TranscribeOptions) -> io::Result<AsrEngine> {
 fn resolve_whisper_engine(
     options: &TranscribeOptions,
     fallback_from_parakeet: bool,
-    fallback_from_apple: bool,
+    apple_fallback_reason: Option<String>,
 ) -> io::Result<AsrEngine> {
     Ok(AsrEngine::Whisper {
         bin: resolve_whisper_binary(options)?,
         model: resolve_model_path(options)?,
         fallback_from_parakeet,
-        fallback_from_apple,
+        apple_fallback_reason,
     })
 }
 
 fn resolve_parakeet_engine(
     options: &TranscribeOptions,
-    fallback_from_apple: bool,
+    apple_fallback_reason: Option<String>,
 ) -> io::Result<AsrEngine> {
     if let Some(bin) = find_parakeet_binary(options.parakeet_bin.as_deref())
         .filter(|path| parakeet_binary_is_present(path))
@@ -896,7 +898,7 @@ fn resolve_parakeet_engine(
             bin,
             model: resolve_parakeet_model(options),
             cache_dir: resolve_parakeet_cache_dir(options),
-            fallback_from_apple,
+            apple_fallback_reason,
         });
     }
 
@@ -907,13 +909,13 @@ fn resolve_parakeet_engine(
         ));
     }
 
-    match resolve_whisper_engine(options, true, fallback_from_apple) {
+    match resolve_whisper_engine(options, true, apple_fallback_reason.clone()) {
         Ok(engine) => Ok(engine),
         Err(_) => Err(io::Error::new(
             io::ErrorKind::NotFound,
-            if fallback_from_apple {
+            if let Some(reason) = apple_fallback_reason {
                 format!(
-                    "Apple SpeechAnalyzer unavailable, Parakeet CLI (`{DEFAULT_PARAKEET_BIN}`) missing, and Whisper is not available either. {APPLE_SPEECH_HINT} {PARAKEET_INSTALL_HINT}"
+                    "Apple SpeechAnalyzer unavailable, Parakeet CLI (`{DEFAULT_PARAKEET_BIN}`) missing, and Whisper is not available either. {reason} {PARAKEET_INSTALL_HINT}"
                 )
             } else {
                 format!(
@@ -939,11 +941,20 @@ fn resolve_apple_engine() -> io::Result<AsrEngine> {
             .message
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| APPLE_SPEECH_HINT.to_string());
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Apple SpeechAnalyzer is unavailable. {detail}"),
-        ))
+        Err(io::Error::new(io::ErrorKind::NotFound, detail))
     }
+}
+
+/// Helper failures can be multi-line stderr; keep the fallback note to one short sentence.
+fn apple_fallback_reason(error: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let mut reason = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    if reason.chars().count() > MAX_CHARS {
+        reason = reason.chars().take(MAX_CHARS).collect::<String>() + "…";
+    } else if !reason.ends_with(['.', '!', '?']) {
+        reason.push('.');
+    }
+    reason
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2622,15 +2633,41 @@ fn unix_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_conversation_segments, clean_transcript_text, clean_whisper_text_block, format_bytes,
-        format_model_download_label, format_timestamp, huggingface_repo_dir_name,
-        parakeet_binary_doctor_level, parse_hf_progress_line, parse_vtt_segments_with_offset,
-        path_with_added_extension, resolve_parakeet_model_id, track_chunks_dir, DoctorCheckLevel,
-        Track, TrackSelection, TranscriptSegment, TranscriptionEngine, APPLE_SPEECH_MODEL_LABEL,
-        DEFAULT_PARAKEET_MODEL,
+        apple_fallback_reason, clean_conversation_segments, clean_transcript_text,
+        clean_whisper_text_block, format_bytes, format_model_download_label, format_timestamp,
+        huggingface_repo_dir_name, parakeet_binary_doctor_level, parse_hf_progress_line,
+        parse_vtt_segments_with_offset, path_with_added_extension, resolve_parakeet_model_id,
+        track_chunks_dir, DoctorCheckLevel, Track, TrackSelection, TranscriptSegment,
+        TranscriptionEngine, APPLE_SPEECH_MODEL_LABEL, DEFAULT_PARAKEET_MODEL,
     };
     use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn apple_fallback_note_reports_the_helper_reason() {
+        let reason = apple_fallback_reason(
+            "error: build failed\n  Rebuild capture-helper with Xcode 26 or later for Apple SpeechAnalyzer\n",
+        );
+        assert_eq!(
+            reason,
+            "error: build failed Rebuild capture-helper with Xcode 26 or later for Apple SpeechAnalyzer."
+        );
+
+        let engine = super::AsrEngine::Parakeet {
+            bin: "parakeet-mlx".into(),
+            model: DEFAULT_PARAKEET_MODEL.to_string(),
+            cache_dir: None,
+            apple_fallback_reason: Some(reason.clone()),
+        };
+        assert_eq!(
+            engine.fallback_note().unwrap(),
+            format!("Apple SpeechAnalyzer unavailable; falling back to Parakeet. {reason}")
+        );
+
+        let long = apple_fallback_reason(&"x".repeat(400));
+        assert_eq!(long.chars().count(), 241);
+        assert!(long.ends_with('…'));
+    }
 
     #[test]
     fn overlapping_takes_use_separate_chunk_directories() {

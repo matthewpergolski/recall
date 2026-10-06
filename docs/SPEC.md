@@ -120,7 +120,7 @@ New folder names use a 12-digit inverted UTC key plus a local `YYYY-MM-DD_HHMM` 
 
 `keep_audio` defaults to true. Set `keep_audio = false` to unlink `audio/*.m4a` after a successful transcript once the session is no longer the open TUI folder (quit from ENDED, start a new folder, or detached/CLI transcribe). Recording, missing/failed transcripts, and in-TUI transcribe completion keep the files. The `audio/` directory remains.
 
-After a TUI session that created or resumed a folder, quitting restores the terminal and prints:
+After a TUI session that created or resumed a folder, quitting restores the terminal and prints the hint below. In a terminal it is dim gray, so it sits back from the next prompt. Piped output and `NO_COLOR` stay plain.
 
 ```text
 Resume this session with:

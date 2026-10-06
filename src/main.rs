@@ -8,6 +8,7 @@ mod system_recorder;
 mod transcription;
 mod tui;
 mod update;
+mod update_progress;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,7 @@ use analysis::{analyze, known_agents, AnalyzeOptions, AnalyzeTarget};
 use capture_sources::{detect_sources, probe_audio_tap};
 use config::{config_path, RecallConfig};
 use session::{
-    default_storage_dir, export_session, latest_session, list_sessions, open_path,
+    default_storage_dir, export_session, faded_text, latest_session, list_sessions, open_path,
     primary_document_path, resolve_timezone, resume_hint, start_session, ConsentMode, StartOptions,
 };
 use transcription::{
@@ -204,7 +205,7 @@ fn run_tui_with_options(options: TuiOptions) {
             if let Some(path) = exit.session_path {
                 if let Some(hint) = resume_hint(&path) {
                     println!();
-                    println!("{hint}");
+                    println!("{}", faded_text(&hint, fade_stdout()));
                 }
             }
         }
@@ -217,6 +218,13 @@ fn run_tui_with_options(options: TuiOptions) {
             std::process::exit(1);
         }
     }
+}
+
+fn fade_stdout() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").ok().as_deref() != Some("dumb")
 }
 
 fn run_resume(args: Vec<String>, mut tui_defaults: TuiOptions) {
