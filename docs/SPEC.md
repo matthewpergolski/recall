@@ -120,12 +120,14 @@ New folder names use a 12-digit inverted UTC key plus a local `YYYY-MM-DD_HHMM` 
 
 `keep_audio` defaults to true. Set `keep_audio = false` to unlink `audio/*.m4a` after a successful transcript once the session is no longer the open TUI folder (quit from ENDED, start a new folder, or detached/CLI transcribe). Recording, missing/failed transcripts, and in-TUI transcribe completion keep the files. The `audio/` directory remains.
 
-After a TUI session that created or resumed a folder, quitting restores the terminal and prints the hint below. In a terminal it is dim gray, so it sits back from the next prompt. Piped output and `NO_COLOR` stay plain.
+After a TUI session that created or resumed a folder, quitting restores the terminal and prints the hint below. In a terminal it is dimmed, so it sits back from the next prompt. Piped output and `NO_COLOR` stay plain.
 
 ```text
 Resume this session with:
-  recall --resume 797394737678-2026-05-26_1921-et-design-sync
+recall --resume 2026-05-26_1921-et-design-sync
 Or: recall --resume latest
 ```
+
+The hint drops the 12-digit key when the rest of the name still means one session, and prints the full folder name otherwise. `--resume` takes the folder name, the name without its key, or any part of the name, ignoring case. A part that matches several sessions lists them and resumes none.
 
 `--resume` reopens that folder in the ENDED TUI state. Enter records the next numbered take (`mic-002.m4a` / `call-002.m4a`). Plain `recall` still starts a new session. Resume refuses if another Recall process is already recording into that folder, or if `capture.json` shows an unfinished take.

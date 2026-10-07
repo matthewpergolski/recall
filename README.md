@@ -175,12 +175,13 @@ recall --title "Project sync"
 
 When you press Enter to end a recording, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready. The header `next:` indicator (toggle with `s`, like consent) chooses what the next Enter does after ENDED: append another take in this folder, or start a new session.
 
-Quitting (`q` / Ctrl+C) leaves transcription and analysis running in the background, then prints a copy-paste resume command. Plain `recall` starts a new session; `recall --resume` reopens the latest folder, and `recall --resume <session-id>` reopens that meeting so Enter can append another take.
+Quitting (`q` / Ctrl+C) leaves transcription and analysis running in the background, then prints a copy-paste resume command. Plain `recall` starts a new session; `recall --resume` reopens the latest folder, and `recall --resume <session-id>` reopens that meeting so Enter can append another take. The session id can be the folder name, the name without its leading 12-digit key, or any part of the name that matches one session.
 
 ```sh
 recall --resume
 recall --resume latest
-recall --resume 797394737678-2026-05-26_1921-et-design-sync
+recall --resume 2026-05-26_1921-et-design-sync
+recall --resume design-sync
 recall resume latest
 ```
 

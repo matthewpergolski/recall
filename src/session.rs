@@ -681,13 +681,88 @@ pub fn resolve_session_target(storage_dir: &Path, target: &str) -> io::Result<Pa
         return Ok(stored);
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!(
-            "No Recall session matching '{target}' in {}. Pass a session folder name, a session path, or latest.",
-            storage_dir.display()
-        ),
-    ))
+    let mut matches = sessions_matching(storage_dir, target)?;
+    match matches.len() {
+        0 => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "No Recall session matching '{target}' in {}. Pass a session folder name or a unique part of it, a session path, or latest.",
+                storage_dir.display()
+            ),
+        )),
+        1 => Ok(matches.remove(0)),
+        count => {
+            let names: Vec<&str> = matches
+                .iter()
+                .filter_map(|path| path.file_name()?.to_str())
+                .collect();
+            // A short name shared by two matches cannot pick one, so those keep their key.
+            let shown: Vec<String> = names
+                .iter()
+                .take(AMBIGUOUS_SESSIONS_SHOWN)
+                .map(|name| {
+                    let short = short_session_id(name);
+                    let shared = names
+                        .iter()
+                        .filter(|other| short_session_id(other).eq_ignore_ascii_case(short))
+                        .count()
+                        > 1;
+                    format!("  {}", if shared { name } else { short })
+                })
+                .collect();
+            let more = if count > shown.len() { "\n  ..." } else { "" };
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "'{target}' matches {count} Recall sessions in {}:\n{}{more}\nPass more of the name.",
+                    storage_dir.display(),
+                    shown.join("\n")
+                ),
+            ))
+        }
+    }
+}
+
+const AMBIGUOUS_SESSIONS_SHOWN: usize = 5;
+
+/// Sessions a partial name could mean, newest first. A folder whose name
+/// without the sort key equals the target wins over folders that only contain it.
+fn sessions_matching(storage_dir: &Path, target: &str) -> io::Result<Vec<PathBuf>> {
+    if target.contains('/') || target.contains('\\') {
+        return Ok(Vec::new());
+    }
+    let wanted = target.to_lowercase();
+    let named: Vec<(String, PathBuf)> = list_sessions(storage_dir)?
+        .into_iter()
+        .filter_map(|path| Some((path.file_name()?.to_str()?.to_lowercase(), path)))
+        .collect();
+    let by_short_id: Vec<PathBuf> = named
+        .iter()
+        .filter(|(name, _)| short_session_id(name) == wanted)
+        .map(|(_, path)| path.clone())
+        .collect();
+    if !by_short_id.is_empty() {
+        return Ok(by_short_id);
+    }
+    Ok(named
+        .into_iter()
+        .filter(|(name, _)| name.contains(&wanted))
+        .map(|(_, path)| path)
+        .collect())
+}
+
+/// Folder name without the 12-digit sort key that new session folders lead with.
+pub fn short_session_id(folder: &str) -> &str {
+    match folder.split_once('-') {
+        Some((key, rest))
+            if key.len() == 12
+                && key.bytes().all(|byte| byte.is_ascii_digit())
+                && !rest.is_empty() =>
+        {
+            rest
+        }
+        _ => folder,
+    }
 }
 
 pub fn read_session_consent(session_path: &Path) -> Option<ConsentMode> {
@@ -698,19 +773,35 @@ pub fn read_session_consent(session_path: &Path) -> Option<ConsentMode> {
 }
 
 pub fn resume_hint(session_path: &Path) -> Option<String> {
-    let id = session_path.file_name()?.to_str()?.trim();
-    if id.is_empty() {
+    let folder = session_path.file_name()?.to_str()?.trim();
+    if folder.is_empty() {
         return None;
     }
+    let id = resume_id(session_path, folder);
     Some(format!(
-        "Resume this session with:\n  recall --resume {id}\nOr: recall --resume latest"
+        "Resume this session with:\nrecall --resume {id}\nOr: recall --resume latest"
     ))
 }
 
-/// Dim gray for a terminal hint. `fade` is false for pipes, `NO_COLOR`, and `TERM=dumb`.
+/// The short name when it still means only this session, the folder name otherwise.
+fn resume_id<'a>(session_path: &Path, folder: &'a str) -> &'a str {
+    let short = short_session_id(folder);
+    let resolves_here = session_path
+        .parent()
+        .and_then(|storage_dir| resolve_session_target(storage_dir, short).ok())
+        .is_some_and(|found| found.file_name() == session_path.file_name());
+    if resolves_here {
+        short
+    } else {
+        folder
+    }
+}
+
+/// Terminal dim for a hint, on the default text color so it stays readable in
+/// any theme. `fade` is false for pipes, `NO_COLOR`, and `TERM=dumb`.
 pub fn faded_text(text: &str, fade: bool) -> String {
     if fade {
-        format!("\u{1b}[2;38;5;242m{text}\u{1b}[0m")
+        format!("\u{1b}[2m{text}\u{1b}[0m")
     } else {
         text.to_string()
     }
@@ -1051,8 +1142,8 @@ mod tests {
         editor_invocation, escape_json, export_session, faded_text, format_session_note_bullet,
         linkify_note_caption, list_sessions, mark_transcript_ready, next_note_image_relative_path,
         pasted_image_path, read_session_consent, readable_session_stamp_for,
-        resolve_session_target, resolve_timezone, resume_hint, session_entries, slugify,
-        start_session, zone_token, ConsentMode, StartOptions, FALLBACK_TIMEZONE,
+        resolve_session_target, resolve_timezone, resume_hint, session_entries, short_session_id,
+        slugify, start_session, zone_token, ConsentMode, StartOptions, FALLBACK_TIMEZONE,
     };
     use jiff::{civil::date, tz::TimeZone};
     use std::fs;
@@ -1407,20 +1498,129 @@ mod tests {
         let path = PathBuf::from("/tmp/sessions/2026-05-26_1921-et-grill-supper-and-weber-gift");
         assert_eq!(
             resume_hint(&path).unwrap(),
-            "Resume this session with:\n  recall --resume 2026-05-26_1921-et-grill-supper-and-weber-gift\nOr: recall --resume latest"
+            "Resume this session with:\nrecall --resume 2026-05-26_1921-et-grill-supper-and-weber-gift\nOr: recall --resume latest"
         );
         assert!(resume_hint(Path::new("/")).is_none());
     }
 
+    fn storage_with_sessions(label: &str, folders: &[&str]) -> PathBuf {
+        let storage_dir = std::env::temp_dir().join(format!(
+            "recall-{label}-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        for (index, folder) in folders.iter().enumerate() {
+            let session = storage_dir.join(folder);
+            fs::create_dir_all(session.join(".recall")).unwrap();
+            fs::write(
+                session.join(".recall/metadata.json"),
+                format!(r#"{{"created_at_unix": {}, "title": "T"}}"#, 100 + index),
+            )
+            .unwrap();
+        }
+        storage_dir
+    }
+
     #[test]
-    fn faded_resume_hint_is_gray_and_plain_text_stays_unchanged() {
+    fn short_session_id_drops_only_a_leading_sort_key() {
+        assert_eq!(
+            short_session_id("797394737678-2026-05-26_1921-et-design-sync"),
+            "2026-05-26_1921-et-design-sync"
+        );
+        assert_eq!(
+            short_session_id("2026-05-26_1921-et-design-sync"),
+            "2026-05-26_1921-et-design-sync"
+        );
+        assert_eq!(
+            short_session_id("05-26-2026_8-21pm-et-x"),
+            "05-26-2026_8-21pm-et-x"
+        );
+        assert_eq!(short_session_id("797394737678-"), "797394737678-");
+    }
+
+    #[test]
+    fn resume_accepts_the_short_name_or_a_unique_part() {
+        let design = "797394737678-2026-05-26_1921-et-design-sync";
+        let review = "797394737600-2026-05-26_2039-et-design-sync-review";
+        let lunch = "797394730000-2026-05-27_1200-et-lunch";
+        let storage_dir = storage_with_sessions("resume-part", &[design, review, lunch]);
+
+        let resolve = |target: &str| resolve_session_target(&storage_dir, target);
+        // The full folder name still works.
+        assert_eq!(resolve(design).unwrap(), storage_dir.join(design));
+        // The short name wins even though another folder contains it.
+        assert_eq!(
+            resolve("2026-05-26_1921-et-design-sync").unwrap(),
+            storage_dir.join(design)
+        );
+        assert_eq!(resolve("LUNCH").unwrap(), storage_dir.join(lunch));
+        assert_eq!(resolve("sync-review").unwrap(), storage_dir.join(review));
+
+        let ambiguous = resolve("design-sync").unwrap_err().to_string();
+        assert!(
+            ambiguous.contains("matches 2 Recall sessions"),
+            "{ambiguous}"
+        );
+        // Newest first, without the sort key.
+        assert!(
+            ambiguous.contains(
+                "  2026-05-26_2039-et-design-sync-review\n  2026-05-26_1921-et-design-sync\n"
+            ),
+            "{ambiguous}"
+        );
+        assert!(resolve("standup")
+            .unwrap_err()
+            .to_string()
+            .contains("No Recall session matching"));
+        assert!(resolve("nested/lunch")
+            .unwrap_err()
+            .to_string()
+            .contains("No Recall session matching"));
+
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn resume_hint_prints_the_short_name_only_when_it_is_unique() {
+        let first = "797394737678-2026-11-01_0130-ct-standup";
+        let second = "797394737618-2026-11-01_0130-ct-standup";
+        let lunch = "797394730000-2026-11-01_1200-ct-lunch";
+        let storage_dir = storage_with_sessions("resume-hint", &[first, second, lunch]);
+
+        assert_eq!(
+            resume_hint(&storage_dir.join(lunch)).unwrap(),
+            "Resume this session with:\nrecall --resume 2026-11-01_1200-ct-lunch\nOr: recall --resume latest"
+        );
+        // Two folders share a short name (a repeated local hour), so the hint
+        // keeps the full folder name.
+        assert!(resume_hint(&storage_dir.join(first))
+            .unwrap()
+            .contains(&format!("recall --resume {first}\n")));
+        // Asking by that shared name lists both with their keys, which resolve.
+        let ambiguous = resolve_session_target(&storage_dir, "2026-11-01_0130-ct-standup")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            ambiguous.contains(&format!("  {second}\n  {first}\n")),
+            "{ambiguous}"
+        );
+        assert_eq!(
+            resolve_session_target(&storage_dir, first).unwrap(),
+            storage_dir.join(first)
+        );
+
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn faded_resume_hint_is_dim_and_plain_text_stays_unchanged() {
         let hint = resume_hint(&PathBuf::from(
             "/tmp/sessions/2026-05-26_1921-et-grill-supper-and-weber-gift",
         ))
         .unwrap();
         assert_eq!(faded_text(&hint, false), hint);
         let faded = faded_text(&hint, true);
-        assert!(faded.starts_with("\u{1b}[2;38;5;242m"));
+        assert!(faded.starts_with("\u{1b}[2mResume this session with:"));
         assert!(faded.ends_with("\u{1b}[0m"));
         assert!(faded.contains("recall --resume 2026-05-26_1921-et-grill-supper-and-weber-gift"));
         assert!(!hint.contains('\u{1b}'));

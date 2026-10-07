@@ -5,6 +5,7 @@ mod config;
 mod mic_recorder;
 mod session;
 mod system_recorder;
+mod terminal;
 mod transcription;
 mod tui;
 mod update;
@@ -84,7 +85,7 @@ USAGE:
     recall --consent provided             Open TUI with consent already marked
     recall --title "Project sync"         Open TUI with a session title
     recall --resume                       Resume the latest session in the TUI
-    recall --resume <session-id>          Resume a named session folder
+    recall --resume <session-id>          Resume a session by folder name or a unique part of it
     recall resume latest                  Same as --resume latest
     recall start --title "Design Sync"    Create a local session folder
     recall list                           List local sessions
@@ -205,7 +206,7 @@ fn run_tui_with_options(options: TuiOptions) {
             if let Some(path) = exit.session_path {
                 if let Some(hint) = resume_hint(&path) {
                     println!();
-                    println!("{}", faded_text(&hint, fade_stdout()));
+                    println!("{}", faded_text(&hint, terminal::stdout_takes_style()));
                 }
             }
         }
@@ -218,13 +219,6 @@ fn run_tui_with_options(options: TuiOptions) {
             std::process::exit(1);
         }
     }
-}
-
-fn fade_stdout() -> bool {
-    use std::io::IsTerminal;
-    std::io::stdout().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none()
-        && std::env::var("TERM").ok().as_deref() != Some("dumb")
 }
 
 fn run_resume(args: Vec<String>, mut tui_defaults: TuiOptions) {
