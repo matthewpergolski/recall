@@ -128,6 +128,6 @@ recall --resume 2026-05-26_1921-et-design-sync
 Or: recall --resume latest
 ```
 
-The hint drops the 12-digit key when the rest of the name still means one session, and prints the full folder name otherwise. `--resume` takes the folder name, the name without its key, or any part of the name, ignoring case. A part that matches several sessions lists them and resumes none.
+The hint drops the 12-digit key when the rest of the name still means one session, and prints the full folder name otherwise. `--resume` takes the folder name, the name without its key, or any part of the name, ignoring case. A part that matches several sessions lists them and resumes none. `recall transcribe`, `analyze`, `open`, and `export` accept the same names; an existing path is always used as given.
 
 `--resume` reopens that folder in the ENDED TUI state. Enter records the next numbered take (`mic-002.m4a` / `call-002.m4a`). Plain `recall` still starts a new session. Resume refuses if another Recall process is already recording into that folder, or if `capture.json` shows an unfinished take.

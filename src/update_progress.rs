@@ -635,6 +635,26 @@ mod tests {
         progress.conclude("recall updated").unwrap();
     }
 
+    /// A step that fails: the bar stops and the failed step is named under it.
+    /// `cargo test live_block_failure_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore = "paints to a real terminal"]
+    fn live_block_failure_smoke() {
+        let pause = || std::thread::sleep(Duration::from_millis(500));
+        println!();
+        let mut progress = UpdateProgress::with_mode(true, false);
+        progress
+            .open_bar("Updating recall", plan_total(&["Tests", "Install"]))
+            .unwrap();
+        progress.start_step("Tests").unwrap();
+        pause();
+        progress.succeed().unwrap();
+        progress.start_step("Install").unwrap();
+        pause();
+        progress.fail().unwrap();
+        progress.rest();
+    }
+
     #[test]
     fn rows_never_reach_the_wrap_column() {
         let long = Duration::from_secs(3661);

@@ -19,7 +19,8 @@ use capture_sources::{detect_sources, probe_audio_tap};
 use config::{config_path, RecallConfig};
 use session::{
     default_storage_dir, export_session, faded_text, latest_session, list_sessions, open_path,
-    primary_document_path, resolve_timezone, resume_hint, start_session, ConsentMode, StartOptions,
+    primary_document_path, resolve_timezone, resume_hint, session_from_arg, start_session,
+    ConsentMode, StartOptions,
 };
 use transcription::{
     find_parakeet_binary, format_bytes, format_model_download_label, parakeet_binary_doctor_level,
@@ -109,7 +110,7 @@ START OPTIONS:
 
 TRANSCRIBE OPTIONS:
     recall transcribe latest [options]
-    recall transcribe <session-path> [options]
+    recall transcribe <session-id|path> [options]
     --engine <apple|parakeet|whisper>     ASR engine, default: apple on Apple Silicon
     --track <both|call|mic>               Audio track selection, default: both
     --ffmpeg <path>                       ffmpeg binary path
@@ -125,7 +126,7 @@ TRANSCRIBE OPTIONS:
 
 ANALYZE OPTIONS:
     recall analyze latest [options]
-    recall analyze <session-path> [options]
+    recall analyze <session-id|path> [options]
     --agent <grok|cline|codex|claude|opencode|pi>  Headless agent profile to run
     --preset <general|work|personal>      Analysis prompt preset, default: general
     --storage <path>                      Storage directory for latest lookup
@@ -153,14 +154,14 @@ TUI OPTIONS:
 
 OPEN OPTIONS:
     recall open latest [options]
-    recall open <session-path> [options]
+    recall open <session-id|path> [options]
     --dir                                 Open the session folder instead of meeting.md
     --editor <command>                    Folder opener: code, cursor, zed, or an app name
     --storage <path>                      Storage directory for latest lookup
 
 EXPORT OPTIONS:
     recall export latest [options]
-    recall export <session-path> [options]
+    recall export <session-id|path> [options]
     --output <path>                       Output path, default: meeting-export.md in session
     --storage <path>                      Storage directory for latest lookup
 
@@ -643,17 +644,18 @@ fn parse_open_args(
         }
     }
 
-    let session_path = match target.unwrap_or(None) {
-        Some(path) => path,
-        None => {
-            let storage_dir =
-                storage_dir
+    let session_path =
+        match target.unwrap_or(None) {
+            Some(path) => session_from_arg(storage_dir.as_deref(), &path)
+                .map_err(|error| error.to_string())?,
+            None => {
+                let storage_dir = storage_dir
                     .unwrap_or(default_storage_dir().map_err(|error| {
                         format!("Failed to resolve storage directory: {error}")
                     })?);
-            latest_session(&storage_dir).map_err(|error| error.to_string())?
-        }
-    };
+                latest_session(&storage_dir).map_err(|error| error.to_string())?
+            }
+        };
 
     Ok(OpenCommandOptions {
         session_path,
@@ -705,7 +707,9 @@ fn parse_session_document_args(
     }
 
     match target.unwrap_or(None) {
-        Some(path) => Ok((path, output_path)),
+        Some(path) => session_from_arg(storage_dir.as_deref(), &path)
+            .map(|path| (path, output_path))
+            .map_err(|error| error.to_string()),
         None => {
             let storage_dir =
                 storage_dir
@@ -1281,9 +1285,16 @@ fn print_apple_doctor(engine: TranscriptionEngine) {
         available,
         locale,
         installed_locales,
+        install_request_pending,
         message,
         helper_path,
     } = probe_apple_speech_status();
+    let print_install_request = || {
+        if let Some(pending) = install_request_pending {
+            let answer = if pending { "yes" } else { "no" };
+            println!("        macOS install request pending: {answer}");
+        }
+    };
     let role = if engine == TranscriptionEngine::Apple {
         "selected engine"
     } else {
@@ -1304,6 +1315,7 @@ fn print_apple_doctor(engine: TranscriptionEngine) {
                 installed_locales.join(", ")
             );
         }
+        print_install_request();
         return;
     }
 
@@ -1316,6 +1328,13 @@ fn print_apple_doctor(engine: TranscriptionEngine) {
         println!("  warn Apple SpeechAnalyzer ({role}): unavailable");
     }
     println!("        {detail}");
+    if !installed_locales.is_empty() {
+        println!(
+            "        installed locales: {}",
+            installed_locales.join(", ")
+        );
+    }
+    print_install_request();
 }
 
 fn print_parakeet_doctor(

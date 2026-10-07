@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::audio::{generation_is_current, lock_session_publish, session_folder_is_sticky};
 use crate::session::{
     analysis_dir, default_storage_dir, list_sessions, markers_path, metadata_path, notes_path,
-    read_session_title, session_entries,
+    read_session_title, session_entries, session_from_arg,
 };
 
 #[derive(Debug, Clone)]
@@ -223,7 +223,7 @@ pub fn known_agents() -> Vec<&'static str> {
 
 fn resolve_session_path(options: &AnalyzeOptions) -> io::Result<PathBuf> {
     match &options.target {
-        AnalyzeTarget::Session(path) => Ok(path.clone()),
+        AnalyzeTarget::Session(path) => session_from_arg(options.storage_dir.as_deref(), path),
         AnalyzeTarget::Latest => {
             let storage_dir = match &options.storage_dir {
                 Some(path) => path.clone(),

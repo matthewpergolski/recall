@@ -15,6 +15,40 @@ Recall is a local-first macOS terminal app for meeting memory. It captures micro
 - Use `apply_patch` for manual edits.
 - Do not revert user changes unless explicitly asked.
 - Keep changes scoped and incremental.
+- Do not add a line that says an agent made something: no "Generated with ..." in a pull request, a release note, a comment, or a file, and no `Co-Authored-By` line for an agent in a commit.
+- Do not force-push, rewrite pushed history, or skip hooks unless the user asks.
+- Never invent a command or a test result. If you could not run a check, say so.
+
+## Working
+
+- State assumptions. If a request has two readings, ask. Do not pick silently.
+- Write the minimum code for the asked task. No speculative features or extra abstraction.
+- Touch only the task. No drive-by refactors or reformats. Match local style.
+- Name the verify command before you edit. Run it.
+- A test must check a behavior. Confirm that a new check can fail.
+- If confused, stop and name the confusion.
+- Ask first: a new dependency; anything that makes Recall use the network or download a model; a change to what is recorded or when; deleting a file you did not add; anything that touches secrets.
+
+## Writing
+
+For summaries, commit messages, and memory notes. Not for code or identifiers.
+
+- One action per sentence. Active voice. Imperative for steps.
+- Plain words, one meaning each. The same word for the same thing.
+- A summary says what changed, why, the verify command and its result, and what was left alone.
+
+## Features and Specs
+
+A change is small when it touches one or two files and changes no rule of behavior: a wording change, a layout tweak, a typo. Make it, run the check that covers it, and stop.
+
+Anything larger takes these steps:
+
+1. Write a spec in `memory-bank/specs/YYYY-MM-DD-<feature>.md`: goal, behavior with the unhappy paths, out of scope, how we verify, ask-first items, risks. Do not write code yet.
+2. Wait for an explicit yes. A reply that only answers a question is not approval. Write the date and the user's words of approval at the top of the spec.
+3. Build what the spec says and nothing more. If the work shows the spec was wrong, stop and go back to the user.
+4. Run the commands the spec named. Report what ran, what failed, and what you could not run.
+5. Before a user-facing push, have a reviewer that did not write the code read the diff: a different headless agent. Give each finding one answer in writing: fixed, accepted with the reason, or rejected with the reason.
+6. When the feature ships, add a line at the top of the spec: where it landed and what changed after approval. From then on the spec is frozen. It records what was agreed; `activeContext.md` records what is true now.
 
 ## Progressive Context
 
@@ -39,16 +73,27 @@ The local `memory-bank/` is ignored by Git. It may contain private testing detai
 Maintain four core files:
 
 - `activeContext.md`: current task/constraints, state, verified, not verified,
-  next step, and waiting on the user. Rewrite stale sections; target at most
-  60 lines. This is current state, not an append-only investigation log.
+  next step, and waiting on the user. Rewrite stale sections; at most 60 lines.
+  This is current state, not an append-only investigation log. Name the commit
+  it describes as `HEAD abc1234`.
 - `projectbrief.md`: stable purpose, constraints, and scope.
 - `decisions.md`: append dated decisions, rationale, and evidence/scope.
   Mark superseded entries; do not log routine activity.
-- `techContext.md`: durable lessons, reproduction commands, testing caveats,
-  and an index of retained supporting probes/specs.
+- `techContext.md`: an index. One line per subject file in `tech/` saying when
+  to read it, and one line per spec in `specs/`. Durable lessons, reproduction
+  commands, and testing caveats live in the subject files.
+
+Specs live in `specs/`; "Features and Specs" above says when to write one and
+when it is frozen.
+
+Run `uv run scripts/check_memory.py` at the start and at the end of a session
+and fix what it reports. It finds the signs of a stale note: too long, no date,
+another commit, a file that is gone, a subject missing from the index, a secret.
+It cannot tell whether a note is true; that is still your job. Meet a limit by
+cutting, not by packing more into a line.
 
 Before non-trivial work, read activeContext and projectbrief if present, then
-only relevant decisions, technical sections, and indexed supporting files.
+only relevant decisions, the subject files you need, and indexed specs.
 On a fresh clone, create missing core files when needed from verified source/docs
 and user instructions; mark unknowns. Older files are historical references,
 not competing current-state instructions.
@@ -61,8 +106,8 @@ After implementation, a diagnostic result, a material decision, or a handoff
 3. Record new decisions and durable lessons in their respective files.
 4. Label temporary artifacts disposable; include recreation commands rather than
    relying on old temp binaries/paths. Do not store secrets or raw transcripts.
-5. Check the core file list and supporting-file index match maintained files.
-   Move detail out of activeContext instead of appending more history.
+5. Move detail out of activeContext instead of appending more history, and
+   add a new subject or spec to the techContext index in the same step.
 
 Memory is checkout-local. Identify the checkout and source baseline in
 activeContext; verify Git state before relying on it. It is authoritative only
@@ -146,6 +191,13 @@ swift run recall-capture list-sources
 ```
 
 In sandboxed Codex sessions, SwiftPM may need elevated execution because it uses normal macOS sandbox/cache paths.
+
+## Not Yet: Pull Requests and Releases
+
+Recall has no pull requests and no tagged releases yet. Work lands on `main` by a direct push, and `recall update` installs from `origin/main`.
+
+- Do not open a pull request, create a tag, or publish a GitHub release unless the user asks.
+- The intended shape, for when the user starts them: one pull request per feature, with a plain summary, how to test, and the review findings with their answers; and one tagged release per version, with notes.
 
 ## Installed Command
 

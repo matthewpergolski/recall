@@ -15,6 +15,8 @@ struct AppleTranscribeStatus: Encodable {
     let locale: String?
     let installedLocales: [String]
     let message: String?
+    /// Whether macOS reports an asset install request for the locale. Nil when unknown.
+    var installRequestPending: Bool? = nil
 }
 
 struct AppleTranscriptFile: Encodable {
@@ -117,17 +119,26 @@ extension RecallCapture {
             )
         }
 
+        let installed = await SpeechTranscriber.installedLocales.map(appleLocaleIdentifier)
         do {
-            let prepared = try await prepareAppleTranscriber()
-            let installed = await SpeechTranscriber.installedLocales.map(appleLocaleIdentifier)
+            let locale = try await resolvedAppleSpeechLocale()
+            let wanted = appleLocaleIdentifier(locale)
+            let transcriber = SpeechTranscriber(locale: locale, preset: .transcription)
+            let requestPending =
+                try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) != nil
+            let ready = appleSpeechAssetsReady(
+                requestPending: requestPending,
+                locale: wanted,
+                installedLocales: installed
+            )
             return AppleTranscribeStatus(
-                available: true,
-                locale: appleLocaleIdentifier(prepared.locale),
+                available: ready,
+                locale: ready ? wanted : nil,
                 installedLocales: installed,
-                message: nil
+                message: ready ? nil : "\(CaptureError.appleSpeechModelNotInstalled(wanted))",
+                installRequestPending: requestPending
             )
         } catch {
-            let installed = await SpeechTranscriber.installedLocales.map(appleLocaleIdentifier)
             return AppleTranscribeStatus(
                 available: false,
                 locale: nil,
