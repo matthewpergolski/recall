@@ -11,8 +11,9 @@ use std::os::unix::process::CommandExt;
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
-    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -428,17 +429,58 @@ impl LiveSourceTranscript {
     }
 }
 
+/// The key a dashboard shortcut is matched on. With the keyboard protocol
+/// Recall turns on, the terminal sends Shift+A as "a, with Shift held". Read
+/// as it comes, that would run the plain key's action: Shift+A would switch
+/// auto-analyze on or off, and never change the agent.
+fn dashboard_key(key: &KeyEvent) -> KeyCode {
+    match key.code {
+        KeyCode::Char(ch) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Char(ch.to_ascii_uppercase())
+        }
+        code => code,
+    }
+}
+
+/// The keys that move the caret in a note: the arrows, Home, End, and the
+/// Ctrl+A and Ctrl+E line jumps.
+fn moves_note_caret(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End => true,
+        KeyCode::Char('a' | 'e') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
 fn note_char_modifiers_ok(modifiers: KeyModifiers) -> bool {
     let command = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER;
     !modifiers.intersects(command)
 }
 
-fn shifted_note_char(ch: char, modifiers: KeyModifiers) -> char {
-    if !modifiers.contains(KeyModifiers::SHIFT) {
+/// The character a key types in a note. With the keyboard protocol Recall
+/// turns on, the terminal sends the plain key and says apart whether Shift is
+/// held and whether Caps Lock is on, so both are applied here.
+fn shifted_note_char(ch: char, modifiers: KeyModifiers, state: KeyEventState) -> char {
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
+    if ch.is_ascii_alphabetic() {
+        // Caps Lock makes letters capital, and Shift turns that around.
+        return if shift != state.contains(KeyEventState::CAPS_LOCK) {
+            ch.to_ascii_uppercase()
+        } else if state.contains(KeyEventState::CAPS_LOCK) {
+            ch.to_ascii_lowercase()
+        } else {
+            ch
+        };
+    }
+    if !shift {
         return ch;
     }
     match ch {
-        'a'..='z' => ch.to_ascii_uppercase(),
         '1' => '!',
         '2' => '@',
         '3' => '#',
@@ -719,6 +761,16 @@ struct NoteDraft {
     caret_piece: usize,
     /// Char offset in a text piece, or `0` before / `1` after an image chip.
     caret_offset: usize,
+    /// Where a drag began, as a piece and an offset. The selection runs from
+    /// here to the caret, in either direction.
+    anchor: Option<(usize, usize)>,
+    /// True from a press inside the note box until the button is let go. A
+    /// selection outlives its drag, so the anchor alone cannot say this.
+    dragging: bool,
+    /// The first line drawn, held still from a press until the next key or
+    /// edit. The view otherwise follows the caret, which would slide the text
+    /// out from under the pointer in a note longer than the box.
+    pinned_first_line: Option<usize>,
 }
 
 impl Default for NoteDraft {
@@ -727,6 +779,9 @@ impl Default for NoteDraft {
             pieces: vec![NotePiece::Text(String::new())],
             caret_piece: 0,
             caret_offset: 0,
+            anchor: None,
+            dragging: false,
+            pinned_first_line: None,
         }
     }
 }
@@ -810,6 +865,8 @@ impl NoteDraft {
     }
 
     fn merge_text(&mut self) {
+        // Every edit ends here. After one, the view follows the caret again.
+        self.pinned_first_line = None;
         let mut merged: Vec<NotePiece> = Vec::new();
         let (caret_piece, caret_offset) = (self.caret_piece, self.caret_offset);
         let mut new_caret_piece = 0;
@@ -854,6 +911,115 @@ impl NoteDraft {
             self.caret_offset = new_caret_offset;
         }
         self.clamp_caret();
+    }
+
+    /// Marks the caret as the place a selection starts from.
+    fn anchor_at_caret(&mut self) {
+        self.anchor = Some((self.caret_piece, self.caret_offset));
+    }
+
+    fn clear_selection(&mut self) {
+        self.anchor = None;
+    }
+
+    /// The selected span, earlier end first. None when nothing is selected.
+    fn selection(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.anchor?;
+        let caret = (self.caret_piece, self.caret_offset);
+        match anchor.cmp(&caret) {
+            std::cmp::Ordering::Less => Some((anchor, caret)),
+            std::cmp::Ordering::Greater => Some((caret, anchor)),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+
+    /// An image chip is in a span when the span covers both its sides.
+    fn chip_in_span(piece: usize, start: (usize, usize), end: (usize, usize)) -> bool {
+        start <= (piece, 0) && end >= (piece, 1)
+    }
+
+    /// The part of a drawn run that is selected, as a range of its characters.
+    fn selected_chars(&self, run: &NoteRun) -> Option<std::ops::Range<usize>> {
+        let (start, end) = self.selection()?;
+        let len = Self::char_len(&run.text);
+        if run.image {
+            return Self::chip_in_span(run.piece, start, end).then_some(0..len);
+        }
+        let run_start = (run.piece, run.start_offset);
+        let run_end = (run.piece, run.start_offset + len);
+        if start >= run_end || end <= run_start {
+            return None;
+        }
+        let from = if start <= run_start {
+            0
+        } else {
+            start.1 - run.start_offset
+        };
+        let to = if end >= run_end {
+            len
+        } else {
+            end.1 - run.start_offset
+        };
+        (from < to).then_some(from..to)
+    }
+
+    /// Removes the selected span and leaves the caret where it began. Returns
+    /// the images that were in it, or None when nothing was selected.
+    fn delete_selection(&mut self) -> Option<Vec<String>> {
+        let (start, end) = self.selection()?;
+        self.anchor = None;
+        let mut removed = Vec::new();
+        let mut kept: Vec<NotePiece> = Vec::new();
+        let mut caret = (0, 0);
+        for (index, piece) in std::mem::take(&mut self.pieces).into_iter().enumerate() {
+            match piece {
+                NotePiece::Text(text) if index < start.0 || index > end.0 => {
+                    kept.push(NotePiece::Text(text));
+                }
+                NotePiece::Text(text) => {
+                    let left: String = if index == start.0 {
+                        text.chars().take(start.1).collect()
+                    } else {
+                        String::new()
+                    };
+                    let right: String = if index == end.0 {
+                        text.chars().skip(end.1).collect()
+                    } else {
+                        String::new()
+                    };
+                    if index == start.0 {
+                        caret = (kept.len(), Self::char_len(&left));
+                    }
+                    kept.push(NotePiece::Text(format!("{left}{right}")));
+                }
+                NotePiece::Image(path) => {
+                    if index == start.0 {
+                        // Before whatever comes next when the chip goes, or
+                        // after the chip when the span began behind it.
+                        caret = (kept.len(), start.1);
+                    }
+                    if Self::chip_in_span(index, start, end) {
+                        removed.push(path);
+                    } else {
+                        kept.push(NotePiece::Image(path));
+                    }
+                }
+            }
+        }
+        if kept.is_empty() {
+            kept.push(NotePiece::Text(String::new()));
+        }
+        self.pieces = kept;
+        if caret.0 >= self.pieces.len() {
+            // The span ran to the end and took the last piece with it.
+            self.caret_piece = self.pieces.len() - 1;
+            self.caret_offset = usize::MAX;
+        } else {
+            self.caret_piece = caret.0;
+            self.caret_offset = caret.1;
+        }
+        self.merge_text();
+        Some(removed)
     }
 
     fn insert_str(&mut self, text: &str) {
@@ -1190,8 +1356,11 @@ impl NoteDraft {
         if total <= max {
             return 0;
         }
-        let (line, _) = self.caret_line_cells();
         let max_first = total - max;
+        if let Some(pinned) = self.pinned_first_line {
+            return pinned.min(max_first);
+        }
+        let (line, _) = self.caret_line_cells();
         line.saturating_sub(max.saturating_sub(1)).min(max_first)
     }
 
@@ -1479,7 +1648,7 @@ impl App {
             return self.request_quit();
         }
 
-        match key.code {
+        match dashboard_key(&key) {
             KeyCode::Char('q') => {
                 return self.request_quit();
             }
@@ -1653,18 +1822,36 @@ impl App {
     }
 
     fn handle_note_key(&mut self, key: KeyEvent) {
+        // A click that was never dragged left a start point and no selection.
+        // Forget it, or the next caret move would look like a selection.
+        if !self.note_has_selection() {
+            self.clear_note_selection();
+        }
+        // The mouse held the view still; a key lets it follow the caret again.
+        if let Some(draft) = &mut self.note_draft {
+            draft.pinned_first_line = None;
+        }
         match key.code {
             KeyCode::Enter
                 if key
                     .modifiers
                     .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
             {
+                self.delete_note_selection();
                 self.insert_note_newline();
             }
             KeyCode::Enter => self.save_manual_note(),
+            // Esc first lets go of a selection, and only then cancels the note.
+            KeyCode::Esc if self.note_has_selection() => self.clear_note_selection(),
             KeyCode::Esc => self.cancel_manual_note(),
+            KeyCode::Backspace | KeyCode::Delete if self.delete_note_selection() => {}
             KeyCode::Backspace => self.backspace_note_draft(),
             KeyCode::Delete => self.delete_note_forward(),
+            _ if self.note_has_selection() && moves_note_caret(&key) => {
+                // A key that moves the caret lets go of the selection and
+                // keeps the text.
+                self.clear_note_selection();
+            }
             KeyCode::Left => {
                 if let Some(draft) = &mut self.note_draft {
                     draft.move_left();
@@ -1696,8 +1883,12 @@ impl App {
                 }
             }
             KeyCode::Tab => self.paste_clipboard_image(false),
-            KeyCode::Char('\n') | KeyCode::Char('\r') => self.insert_note_newline(),
+            KeyCode::Char('\n') | KeyCode::Char('\r') => {
+                self.delete_note_selection();
+                self.insert_note_newline();
+            }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_note_selection();
                 self.insert_note_newline();
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1726,12 +1917,43 @@ impl App {
                 if note_char_modifiers_ok(key.modifiers)
                     && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
             {
+                // Typing replaces what is selected.
+                self.delete_note_selection();
                 if let Some(draft) = &mut self.note_draft {
-                    draft.insert_char(shifted_note_char(ch, key.modifiers));
+                    draft.insert_char(shifted_note_char(ch, key.modifiers, key.state));
                 }
             }
             _ => {}
         }
+    }
+
+    fn note_has_selection(&self) -> bool {
+        self.note_draft
+            .as_ref()
+            .is_some_and(|draft| draft.selection().is_some())
+    }
+
+    fn clear_note_selection(&mut self) {
+        if let Some(draft) = &mut self.note_draft {
+            draft.clear_selection();
+        }
+    }
+
+    /// Removes the selected part of the note and discards the images that
+    /// were in it. False when nothing was selected.
+    fn delete_note_selection(&mut self) -> bool {
+        let Some(draft) = self.note_draft.as_mut() else {
+            return false;
+        };
+        let Some(images) = draft.delete_selection() else {
+            // No span, but a click may have left its start point behind.
+            draft.clear_selection();
+            return false;
+        };
+        if let (Some(session_path), false) = (&self.session_path, images.is_empty()) {
+            let _ = discard_unused_note_images(session_path, &images);
+        }
+        true
     }
 
     fn insert_note_newline(&mut self) {
@@ -1761,15 +1983,29 @@ impl App {
             self.import_note_image_from_path(&path);
             return;
         }
+        // A paste replaces what is selected.
+        self.delete_note_selection();
         if let Some(draft) = &mut self.note_draft {
             draft.insert_str(text);
         }
     }
 
     fn handle_note_mouse(&mut self, mouse: MouseEvent) {
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
+        let dragging = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => false,
+            MouseEventKind::Drag(MouseButton::Left) => true,
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(draft) = &mut self.note_draft {
+                    draft.dragging = false;
+                }
+                // A click with no drag selects nothing.
+                if !self.note_has_selection() {
+                    self.clear_note_selection();
+                }
+                return;
+            }
+            _ => return,
+        };
         let area = self.note_footer;
         if area.width < 3 || area.height < 3 {
             return;
@@ -1778,33 +2014,65 @@ impl App {
         let inner_y = area.y.saturating_add(1);
         let inner_width = area.width.saturating_sub(2);
         let inner_height = area.height.saturating_sub(2);
-        if mouse.column < inner_x
-            || mouse.row < inner_y
-            || mouse.column >= inner_x.saturating_add(inner_width)
-            || mouse.row >= inner_y.saturating_add(inner_height)
-        {
-            return;
-        }
-        let row = (mouse.row - inner_y) as usize;
-        if row >= NOTE_PREVIEW_LINES {
-            return;
-        }
+        let text_rows = (inner_height as usize).min(NOTE_PREVIEW_LINES);
+        let right_edge = inner_x.saturating_add(inner_width);
+        let inside = mouse.column >= inner_x
+            && mouse.row >= inner_y
+            && mouse.column < right_edge
+            && ((mouse.row - inner_y) as usize) < text_rows;
         let Some(draft) = self.note_draft.as_mut() else {
             return;
         };
-        let first = draft.first_visible_line(NOTE_PREVIEW_LINES);
+        if dragging {
+            // A drag selects only when its own press was in the note box. An
+            // older selection must not be stretched by a drag from elsewhere.
+            if !draft.dragging {
+                return;
+            }
+        } else if !inside {
+            // A press outside the box lets go of the selection.
+            draft.dragging = false;
+            draft.pinned_first_line = None;
+            draft.clear_selection();
+            return;
+        }
+        // Hold the view where it is, so the lines stay under the pointer. A
+        // drag past the top or bottom edge scrolls one line at a time.
+        let total_lines = draft.visual_lines().len();
+        let mut first = draft.first_visible_line(NOTE_PREVIEW_LINES);
+        if dragging {
+            let below = mouse.row >= inner_y && (mouse.row - inner_y) as usize >= text_rows;
+            if mouse.row < inner_y {
+                first = first.saturating_sub(1);
+            } else if below && first + NOTE_PREVIEW_LINES < total_lines {
+                first += 1;
+            }
+        }
+        draft.pinned_first_line = Some(first);
+        // A drag that leaves the box selects up to the edge it left by.
+        let row = if mouse.row < inner_y {
+            0
+        } else {
+            ((mouse.row - inner_y) as usize).min(text_rows.saturating_sub(1))
+        };
         let caption_line = first + row;
         let prefix = if row == 0 {
             note_prefix_width()
         } else {
             UnicodeWidthStr::width(NOTE_CONT) as u16
         };
-        let col = if mouse.column <= inner_x + prefix {
+        let col = if mouse.row < inner_y || mouse.column <= inner_x + prefix {
             0
+        } else if mouse.column >= right_edge || (mouse.row - inner_y) as usize >= text_rows {
+            usize::MAX / 4
         } else {
             (mouse.column - inner_x - prefix) as usize
         };
         draft.click_to_cursor(caption_line, col);
+        if !dragging {
+            draft.anchor_at_caret();
+            draft.dragging = true;
+        }
     }
 
     fn try_attach_clipboard_image(&mut self) -> bool {
@@ -1879,6 +2147,8 @@ impl App {
     }
 
     fn attach_note_image(&mut self, relative: String) {
+        // A pasted image replaces what is selected, as pasted text does.
+        self.delete_note_selection();
         if let Some(draft) = &mut self.note_draft {
             draft.insert_image(relative.clone());
             let number = draft.images().len().saturating_sub(1);
@@ -4056,12 +4326,26 @@ impl App {
                     spans.push(Span::raw(NOTE_CONT));
                 }
                 for run in runs {
+                    let selected = draft.selected_chars(&run);
+                    let reversed = Style::default().add_modifier(Modifier::REVERSED);
                     if run.image {
+                        let chip = Style::default().fg(Color::Black).bg(Color::Magenta);
                         spans.push(Span::raw(" "));
                         spans.push(Span::styled(
                             NoteDraft::chip_label(run.chip_index),
-                            Style::default().fg(Color::Black).bg(Color::Magenta),
+                            if selected.is_some() {
+                                chip.add_modifier(Modifier::REVERSED)
+                            } else {
+                                chip
+                            },
                         ));
+                    } else if let Some(range) = selected {
+                        let chars: Vec<char> = run.text.chars().collect();
+                        let part =
+                            |from: usize, to: usize| chars[from..to].iter().collect::<String>();
+                        spans.push(Span::raw(part(0, range.start)));
+                        spans.push(Span::styled(part(range.start, range.end), reversed));
+                        spans.push(Span::raw(part(range.end, chars.len())));
                     } else {
                         spans.push(Span::raw(run.text));
                     }
@@ -4085,7 +4369,7 @@ impl App {
                     " Cmd+V ",
                     Style::default().fg(Color::Black).bg(Color::Magenta),
                 ),
-                Span::raw(" paste  click to move"),
+                Span::raw(" paste  click moves, drag selects"),
             ]));
             frame.render_widget(
                 Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
@@ -5429,6 +5713,77 @@ mod tests {
     }
 
     #[test]
+    fn shift_a_changes_the_agent_and_never_flips_auto_analyze() {
+        let (storage, session_path) = note_session("shift-a");
+        let mut app = test_app(session_path);
+        let auto_analyze = app.auto_analyze;
+        let agent = app.agent.clone();
+
+        // As Ghostty sends it: the plain letter, with Shift held.
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.auto_analyze, auto_analyze);
+        assert_ne!(app.agent, agent);
+        // As an older terminal sends it: the capital itself.
+        let agent = app.agent.clone();
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.auto_analyze, auto_analyze);
+        assert_ne!(app.agent, agent);
+        // The plain key still switches auto-analyze, and leaves the agent.
+        let agent = app.agent.clone();
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
+        assert_ne!(app.auto_analyze, auto_analyze);
+        assert_eq!(app.agent, agent);
+
+        // Shift+O is the capital too, and a shifted key with no action of its
+        // own does not fall back to the plain key's.
+        let shifted = |ch| dashboard_key(&KeyEvent::new(KeyCode::Char(ch), KeyModifiers::SHIFT));
+        assert_eq!(shifted('o'), KeyCode::Char('O'));
+        assert_eq!(shifted('q'), KeyCode::Char('Q'));
+        assert_eq!(
+            dashboard_key(&KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            KeyCode::Char('o')
+        );
+        assert_eq!(
+            dashboard_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            KeyCode::Enter
+        );
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn caps_lock_types_capital_letters_and_shift_turns_it_around() {
+        use crossterm::event::KeyEventState;
+        let (storage, session_path) = note_session("caps-lock");
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        let mut press = |ch: char, modifiers: KeyModifiers, state: KeyEventState| {
+            app.handle_note_key(KeyEvent::new_with_kind_and_state(
+                KeyCode::Char(ch),
+                modifiers,
+                KeyEventKind::Press,
+                state,
+            ));
+        };
+        // Caps Lock on: letters are capital, digits and symbols are not changed.
+        press('h', KeyModifiers::NONE, KeyEventState::CAPS_LOCK);
+        press('i', KeyModifiers::NONE, KeyEventState::CAPS_LOCK);
+        press('9', KeyModifiers::NONE, KeyEventState::CAPS_LOCK);
+        press('/', KeyModifiers::NONE, KeyEventState::CAPS_LOCK);
+        // Shift with Caps Lock on gives a small letter, and still shifts a digit.
+        press('x', KeyModifiers::SHIFT, KeyEventState::CAPS_LOCK);
+        press('1', KeyModifiers::SHIFT, KeyEventState::CAPS_LOCK);
+        // Caps Lock off: as before.
+        press('y', KeyModifiers::NONE, KeyEventState::NONE);
+        press('z', KeyModifiers::SHIFT, KeyEventState::NONE);
+        let draft = app.note_draft.as_ref().unwrap();
+        assert_eq!(draft.caption(), "HI9/x!yZ");
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
     fn shift_enter_inserts_a_newline_without_saving() {
         let (storage, session_path) = note_session("shift-enter");
         let mut app = test_app(session_path.clone());
@@ -5473,6 +5828,350 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(storage);
+    }
+
+    /// A note box at a known place, so a test can aim the mouse at a character.
+    fn place_note_box(app: &mut App) {
+        app.note_footer = ratatui::layout::Rect::new(0, 20, 60, 6);
+    }
+
+    /// The screen cell of character `index` on a visible row of the note box.
+    fn note_cell(row: u16, index: u16) -> (u16, u16) {
+        let prefix = if row == 0 {
+            note_prefix_width()
+        } else {
+            UnicodeWidthStr::width(NOTE_CONT) as u16
+        };
+        (1 + prefix + index, 21 + row)
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, cell: (u16, u16)) {
+        app.handle_note_mouse(MouseEvent {
+            kind,
+            column: cell.0,
+            row: cell.1,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    fn drag(app: &mut App, from: (u16, u16), to: (u16, u16)) {
+        mouse(app, MouseEventKind::Down(MouseButton::Left), from);
+        mouse(app, MouseEventKind::Drag(MouseButton::Left), to);
+        mouse(app, MouseEventKind::Up(MouseButton::Left), to);
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_note_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn caption(app: &App) -> String {
+        app.note_draft.as_ref().unwrap().caption()
+    }
+
+    #[test]
+    fn a_drag_selects_text_and_backspace_or_delete_removes_all_of_it() {
+        let (storage, session_path) = note_session("drag-delete");
+        for key in [KeyCode::Backspace, KeyCode::Delete] {
+            let mut app = test_app(session_path.clone());
+            app.start_manual_note();
+            place_note_box(&mut app);
+            type_note(&mut app, "hello brave new world");
+            // Drag over "brave new ", left to right.
+            drag(&mut app, note_cell(0, 6), note_cell(0, 16));
+            assert!(app.note_has_selection());
+            press(&mut app, key);
+            assert_eq!(caption(&app), "hello world");
+            assert_eq!(app.note_draft.as_ref().unwrap().caption_cursor(), 6);
+            assert!(!app.note_has_selection());
+            // With nothing selected the key is back to one character.
+            press(&mut app, key);
+            let expected = if key == KeyCode::Backspace {
+                "helloworld"
+            } else {
+                "hello orld"
+            };
+            assert_eq!(caption(&app), expected);
+        }
+
+        // The same span dragged right to left.
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        place_note_box(&mut app);
+        type_note(&mut app, "hello brave new world");
+        drag(&mut app, note_cell(0, 16), note_cell(0, 6));
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(caption(&app), "hello world");
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn a_drag_across_lines_removes_the_lines_between() {
+        let (storage, session_path) = note_session("drag-lines");
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        place_note_box(&mut app);
+        app.handle_note_paste("one\ntwo\nthree");
+        // From after "o" on the first line to after "th" on the third.
+        drag(&mut app, note_cell(0, 1), note_cell(2, 2));
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(caption(&app), "oree");
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn typing_or_pasting_replaces_the_selection() {
+        let (storage, session_path) = note_session("drag-replace");
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        place_note_box(&mut app);
+        type_note(&mut app, "call Sam today");
+        drag(&mut app, note_cell(0, 5), note_cell(0, 8));
+        type_note(&mut app, "Ana");
+        assert_eq!(caption(&app), "call Ana today");
+        drag(&mut app, note_cell(0, 9), note_cell(0, 14));
+        app.handle_note_paste("on Friday");
+        assert_eq!(caption(&app), "call Ana on Friday");
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn an_arrow_or_one_escape_lets_go_of_the_selection_and_keeps_the_text() {
+        let (storage, session_path) = note_session("drag-release");
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        place_note_box(&mut app);
+        type_note(&mut app, "keep all of this");
+        drag(&mut app, note_cell(0, 0), note_cell(0, 8));
+        press(&mut app, KeyCode::Left);
+        assert!(!app.note_has_selection());
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(caption(&app), "keep al of this");
+
+        // Ctrl+A and Ctrl+E move the caret too, so they let go as the arrows do.
+        for jump in ['a', 'e'] {
+            drag(&mut app, note_cell(0, 2), note_cell(0, 6));
+            app.handle_note_key(KeyEvent::new(KeyCode::Char(jump), KeyModifiers::CONTROL));
+            assert!(!app.note_has_selection());
+            assert_eq!(caption(&app), "keep al of this");
+        }
+
+        drag(&mut app, note_cell(0, 0), note_cell(0, 4));
+        press(&mut app, KeyCode::Esc);
+        // The first Esc only lets go; the note is still open.
+        assert!(app.note_draft.is_some());
+        assert!(!app.note_has_selection());
+        assert_eq!(caption(&app), "keep al of this");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.note_draft.is_none());
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn a_click_with_no_drag_selects_nothing() {
+        let (storage, session_path) = note_session("click-only");
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        place_note_box(&mut app);
+        type_note(&mut app, "abcdef");
+        // Press and release in one place, then move and type.
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            note_cell(0, 2),
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            note_cell(0, 2),
+        );
+        assert!(!app.note_has_selection());
+        type_note(&mut app, "X");
+        assert_eq!(caption(&app), "abXcdef");
+        // A press whose release never arrives must not select when keys move the caret.
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            note_cell(0, 1),
+        );
+        press(&mut app, KeyCode::End);
+        assert!(!app.note_has_selection());
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(caption(&app), "abXcde");
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn a_drag_follows_the_pointer_to_the_edge_of_the_box_and_needs_a_press_inside() {
+        let (storage, session_path) = note_session("drag-edges");
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        place_note_box(&mut app);
+        type_note(&mut app, "first line");
+        // The pointer leaves by the right edge: the selection runs to the line's end.
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            note_cell(0, 6),
+        );
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), (200, 21));
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(caption(&app), "first ");
+        // It leaves by the top: the selection runs to the start.
+        type_note(&mut app, "line");
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            note_cell(0, 5),
+        );
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), (3, 2));
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(caption(&app), " line");
+        // A drag that began outside the box selects nothing.
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), (3, 2));
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            note_cell(0, 3),
+        );
+        assert!(!app.note_has_selection());
+
+        // Nor does it stretch a selection that an earlier drag left behind.
+        drag(&mut app, note_cell(0, 1), note_cell(0, 3));
+        assert!(app.note_has_selection());
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), (3, 2));
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            note_cell(0, 5),
+        );
+        assert!(!app.note_has_selection());
+        // The caret is still where the earlier drag ended, after " li", and
+        // Backspace takes one character there, not a span.
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(caption(&app), " lne");
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn a_drag_in_a_long_note_selects_the_lines_under_the_pointer() {
+        let (storage, session_path) = note_session("drag-long");
+        let mut app = test_app(session_path);
+        app.start_manual_note();
+        place_note_box(&mut app);
+        // Six lines in a box that shows three. With the caret at the end the
+        // box shows the last three.
+        app.handle_note_paste("l0\nl1\nl2\nl3\nl4\nline5");
+        assert_eq!(app.note_draft.as_ref().unwrap().first_visible_line(3), 3);
+
+        // Press on the first row shown (l3) and drag to the third (line5).
+        // The view must not slide when the caret lands on the first row.
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            note_cell(0, 0),
+        );
+        assert_eq!(app.note_draft.as_ref().unwrap().first_visible_line(3), 3);
+        mouse(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            note_cell(2, 2),
+        );
+        mouse(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            note_cell(2, 2),
+        );
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(caption(&app), "l0\nl1\nl2\nne5");
+
+        // A drag past the top edge scrolls up one line for each move.
+        app.handle_note_paste("\nl6\nl7");
+        assert_eq!(app.note_draft.as_ref().unwrap().first_visible_line(3), 3);
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            note_cell(2, 2),
+        );
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), (5, 2));
+        assert_eq!(app.note_draft.as_ref().unwrap().first_visible_line(3), 2);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), (5, 2));
+        assert_eq!(app.note_draft.as_ref().unwrap().first_visible_line(3), 1);
+        // A key lets the view follow the caret again.
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.note_draft.as_ref().unwrap().pinned_first_line, None);
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn deleting_a_selection_takes_the_image_chips_inside_it() {
+        let (storage, session_path) = note_session("drag-chips");
+        let source = storage.join("board.png");
+        fs::write(&source, tiny_png()).unwrap();
+        let mut app = test_app(session_path.clone());
+        app.start_manual_note();
+        place_note_box(&mut app);
+        type_note(&mut app, "ab");
+        app.handle_note_paste(&source.to_string_lossy());
+        type_note(&mut app, "cd");
+        let image = app.note_draft.as_ref().unwrap().images()[0].clone();
+        assert!(session_path.join(&image).exists());
+
+        // From after "a" to the end of the line: "b", the chip, and "cd".
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            note_cell(0, 1),
+        );
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), (200, 21));
+        // The run under the chip is drawn selected.
+        let draft = app.note_draft.as_ref().unwrap();
+        let chip_run = draft.visual_lines()[0]
+            .iter()
+            .find(|run| run.image)
+            .map(|run| draft.selected_chars(run))
+            .unwrap();
+        assert!(chip_run.is_some());
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(caption(&app), "a");
+        assert!(app.note_draft.as_ref().unwrap().images().is_empty());
+        assert!(!session_path.join(&image).exists());
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn a_selection_that_starts_behind_a_chip_leaves_the_chip() {
+        let mut draft = NoteDraft::default();
+        draft.insert_str("ab");
+        draft.insert_image("images/one.png".to_string());
+        draft.insert_str("cd");
+        // Put the caret right after the chip (one step reaches its front,
+        // the next its back), and select from there to the end.
+        draft.set_caption_cursor(2);
+        draft.move_right();
+        draft.move_right();
+        assert_eq!(draft.caret_after_chip(), Some(0));
+        draft.anchor_at_caret();
+        draft.move_line_end();
+        let removed = draft.delete_selection().unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(draft.caption(), "ab");
+        assert_eq!(draft.images().len(), 1);
+        // Nothing selected: nothing to remove.
+        assert_eq!(draft.delete_selection(), None);
+    }
+
+    #[test]
+    fn the_drawn_selection_covers_the_dragged_characters_only() {
+        let mut draft = NoteDraft::default();
+        draft.insert_str("hello\nworld");
+        draft.click_to_cursor(0, 3);
+        draft.anchor_at_caret();
+        draft.click_to_cursor(1, 2);
+        let lines = draft.visual_lines();
+        assert_eq!(draft.selected_chars(&lines[0][0]), Some(3..5));
+        assert_eq!(draft.selected_chars(&lines[1][0]), Some(0..2));
+        draft.clear_selection();
+        assert_eq!(draft.selected_chars(&lines[0][0]), None);
     }
 
     #[test]
