@@ -2588,7 +2588,7 @@ fn longest_common_unremoved_block(
     (best_len > 0).then_some((best_start, best_len))
 }
 
-fn normalized_tokens(text: &str) -> Vec<String> {
+pub(crate) fn normalized_tokens(text: &str) -> Vec<String> {
     text_tokens(text)
         .into_iter()
         .map(|token| token.normalized)
@@ -2637,7 +2637,7 @@ fn meaningful_token_count(text: &str) -> usize {
         .count()
 }
 
-fn multiset_intersection_count(left: &[String], right: &[String]) -> usize {
+pub(crate) fn multiset_intersection_count(left: &[String], right: &[String]) -> usize {
     let mut right_tokens = right.to_vec();
     let mut count = 0;
 

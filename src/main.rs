@@ -1,6 +1,7 @@
 mod analysis;
 mod audio;
 mod capture_sources;
+mod citations;
 mod config;
 mod mic_recorder;
 mod session;
