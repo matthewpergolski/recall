@@ -7,6 +7,7 @@ mod mic_recorder;
 mod session;
 mod system_recorder;
 mod terminal;
+mod timeline;
 mod transcription;
 mod tui;
 mod update;

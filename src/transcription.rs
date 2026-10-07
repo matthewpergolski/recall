@@ -11,13 +11,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use crate::audio::{
-    concat_audio_segments, discover_track_segments, generation_is_current, lock_session_publish,
-    maybe_discard_session_audio, refresh_track_alias, AudioRetention, AudioTrack,
+    audio_duration_ms, concat_audio_segments_with_gaps, discover_track_segments,
+    generation_is_current, lock_session_publish, maybe_discard_session_audio, refresh_track_alias,
+    segment_take_index, usable_audio_segments, AudioRetention, AudioTrack,
 };
 use crate::session::{
     default_storage_dir, list_sessions, mark_transcript_ready, read_session_title,
     session_from_arg, transcription_dir, transcription_work_dir,
 };
+use crate::timeline::{part_start_ns, place, Part, TrackPlacement};
 
 pub const TRANSCRIPTION_CHUNK_SECONDS: u64 = 600;
 pub const DEFAULT_PARAKEET_BIN: &str = "parakeet-mlx";
@@ -527,6 +529,7 @@ where
     let mut sections = Vec::new();
     let mut segments = Vec::new();
     let mut track_results = Vec::new();
+    let timeline = TimelinePlan::for_session(&ffmpeg, &session_path, options.generation);
 
     for track in options.track.tracks() {
         let audio_segments =
@@ -534,11 +537,13 @@ where
         if audio_segments.is_empty() {
             continue;
         }
+        let placement = timeline.placement(track);
         let audio_path = resolve_track_audio(
             &ffmpeg,
             &work_dir,
             track,
             &audio_segments,
+            &placement.gap_lengths_ms(),
             options.generation,
         )?;
         if !audio_path.exists() {
@@ -639,7 +644,7 @@ where
                     &chunk.output_base,
                     &chunk.wav_path,
                     track.label(),
-                    chunk.start_ms,
+                    chunk.start_ms + placement.offset_ms,
                 )
                 .unwrap_or_default(),
             );
@@ -690,6 +695,8 @@ where
         return Ok(stale_transcribe_result(&session_path));
     }
 
+    // Debug output only: how the tracks were placed, ahead of the raw tracks.
+    sections.insert(0, format!("## Timeline\n\n{}\n", timeline.note(&segments)));
     let transcript_path = session_path.join("transcript.md");
     let debug_dir = transcription_dir(&session_path);
     write_transcription_outputs(
@@ -767,14 +774,106 @@ fn generation_suffix(generation: Option<u32>) -> String {
         .unwrap_or_default()
 }
 
+/// Where the call and mic tracks sit on the shared timeline, or why their
+/// parts are joined back to back as they were before start times existed.
+struct TimelinePlan {
+    call: TrackPlacement,
+    mic: TrackPlacement,
+    fallback: Option<String>,
+}
+
+impl TimelinePlan {
+    fn for_session(ffmpeg: &Path, session_path: &Path, generation: Option<u32>) -> Self {
+        let parts = |track: Track| -> Result<Vec<Part>, String> {
+            let segments = discover_track_segments(session_path, track.audio_track(), generation);
+            usable_audio_segments(ffmpeg, &segments)
+                .iter()
+                .map(|path| {
+                    Ok(Part {
+                        take: segment_take_index(path).unwrap_or(1),
+                        start_ns: part_start_ns(path),
+                        duration_ms: audio_duration_ms(ffmpeg, path).ok_or_else(|| {
+                            format!("ffmpeg gave no duration for {}", path.display())
+                        })?,
+                    })
+                })
+                .collect()
+        };
+        let placed = parts(Track::Call)
+            .and_then(|call| Ok((call, parts(Track::Mic)?)))
+            .and_then(|(call, mic)| place(&[call, mic]));
+        match placed {
+            Ok(mut placements) => {
+                let mic = placements.pop().unwrap_or_default();
+                let call = placements.pop().unwrap_or_default();
+                Self {
+                    call,
+                    mic,
+                    fallback: None,
+                }
+            }
+            Err(reason) => Self {
+                call: TrackPlacement::default(),
+                mic: TrackPlacement::default(),
+                fallback: Some(reason),
+            },
+        }
+    }
+
+    fn placement(&self, track: Track) -> &TrackPlacement {
+        match track {
+            Track::Call => &self.call,
+            Track::Mic => &self.mic,
+        }
+    }
+
+    /// One paragraph for the debug transcript: how the tracks were placed, and
+    /// how many mic lines the bleed rules suppressed with and without it.
+    fn note(&self, segments: &[TranscriptSegment]) -> String {
+        if let Some(reason) = &self.fallback {
+            return format!(
+                "Timeline: parts are joined back to back and each track counts from its own start ({reason})."
+            );
+        }
+        let unaligned: Vec<TranscriptSegment> = segments
+            .iter()
+            .map(|segment| {
+                let placement = if segment.track == "mic" {
+                    &self.mic
+                } else {
+                    &self.call
+                };
+                TranscriptSegment {
+                    start_ms: placement.unaligned_ms(segment.start_ms),
+                    end_ms: placement.unaligned_ms(segment.end_ms),
+                    ..segment.clone()
+                }
+            })
+            .collect();
+        let silence =
+            |placement: &TrackPlacement| -> u64 { placement.gap_lengths_ms().iter().sum() };
+        format!(
+            "Timeline: both tracks are placed on one clock. The call track starts at {} and the mic track at {}. Time lost between parts and kept as silence: call {} ms, mic {} ms. Mic lines suppressed as bleed: {} with this placement, {} without.",
+            format_timestamp(self.call.offset_ms),
+            format_timestamp(self.mic.offset_ms),
+            silence(&self.call),
+            silence(&self.mic),
+            clean_conversation_segments(segments).1,
+            clean_conversation_segments(&unaligned).1,
+        )
+    }
+}
+
 fn resolve_track_audio(
     ffmpeg: &Path,
     work_dir: &Path,
     track: Track,
     segments: &[PathBuf],
+    gaps_ms: &[u64],
     generation: Option<u32>,
 ) -> io::Result<PathBuf> {
-    let segments = crate::audio::usable_audio_segments(ffmpeg, segments);
+    // The plan was made from the readable parts, so its gaps fit this list.
+    let segments = usable_audio_segments(ffmpeg, segments);
     if segments.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -789,7 +888,7 @@ fn resolve_track_audio(
         track.label(),
         generation_suffix(generation)
     ));
-    concat_audio_segments(ffmpeg, &segments, &concat_path)?;
+    concat_audio_segments_with_gaps(ffmpeg, &segments, gaps_ms, &concat_path)?;
     Ok(concat_path)
 }
 

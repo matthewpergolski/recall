@@ -75,6 +75,10 @@ The MacBook mic can stay quieter than the call playback during a Phone or FaceTi
 
 Switching to AirPods after recording has started is reported in the TUI. Recall reopens the input when the default device or its format changes. It does not yet let you pick a microphone other than the system default.
 
+## Part Start Times
+
+Each recorder writes one small record per audio file to `.recall/timeline/<file>.json`: the host-clock time of the file's first buffer. The microphone recorder writes one for each part it rolls. The CoreAudio process-tap recorder writes one for its file. The ScreenCaptureKit fallback recorder writes none. The record holds times only, and a failure to write one never stops a recording. The microphone can also stop for a moment with no format change, for example while a Phone call is set up or ended. The recorder sees that as a buffer that starts more than 100 ms after the one before it ended, writes `clock jumped ...` to `.recall/logs/mic.log`, and starts a new part, so the lost time is kept. The call recorder logs such a jump and does not split its file. `docs/TRANSCRIPTION.md` says how the times are used.
+
 ## Launcher Permission Model
 
 macOS attributes microphone and system-audio permission to the application that launches Recall. The `recall` executable does not currently appear as an independently signed macOS application.
