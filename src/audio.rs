@@ -831,13 +831,22 @@ fn parse_segment_name(path: &Path, track: AudioTrack) -> Option<SegmentRef> {
     if let Some((take_str, part_str)) = rest.split_once("-part-") {
         return Some(SegmentRef {
             take: parse_fixed_digits(take_str, 3)?,
-            part: parse_fixed_digits(part_str, 2)?,
+            part: parse_part_number(part_str)?,
         });
     }
     Some(SegmentRef {
         take: parse_fixed_digits(rest, 3)?,
         part: 1,
     })
+}
+
+/// A part number is written with at least two digits and grows past them:
+/// `02`, `99`, `100`. A take can roll that many parts when the mic pauses often.
+fn parse_part_number(value: &str) -> Option<u32> {
+    if value.len() < 2 || !value.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
 }
 
 fn parse_fixed_digits(value: &str, width: usize) -> Option<u32> {
@@ -886,6 +895,49 @@ mod tests {
             "call-003-part-04.m4a"
         );
         assert_eq!(AudioTrack::Mic.part_segment_name(1, 1), "mic-001.m4a");
+    }
+
+    #[test]
+    fn a_take_with_more_than_ninety_nine_parts_keeps_every_part_in_order() {
+        // A mic that pauses often rolls a new part each time; the recorder
+        // names part 100 with three digits.
+        let session = unique_session_dir("many-parts");
+        let audio = session.join("audio");
+        fs::create_dir_all(&audio).unwrap();
+        for name in [
+            "mic-001.m4a",
+            "mic-001-part-02.m4a",
+            "mic-001-part-99.m4a",
+            "mic-001-part-100.m4a",
+            "mic-001-part-101.m4a",
+            "mic-002.m4a",
+        ] {
+            fs::write(audio.join(name), b"x").unwrap();
+        }
+        // Not part files: a one-digit part and a part with no number.
+        fs::write(audio.join("mic-001-part-3.m4a"), b"x").unwrap();
+        fs::write(audio.join("mic-001-part-.m4a"), b"x").unwrap();
+
+        let names: Vec<String> = discover_track_segments(&session, AudioTrack::Mic, None)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "mic-001.m4a",
+                "mic-001-part-02.m4a",
+                "mic-001-part-99.m4a",
+                "mic-001-part-100.m4a",
+                "mic-001-part-101.m4a",
+                "mic-002.m4a",
+            ]
+        );
+        assert_eq!(
+            AudioTrack::Mic.part_segment_name(1, 100),
+            "mic-001-part-100.m4a"
+        );
+        let _ = fs::remove_dir_all(session);
     }
 
     #[test]
