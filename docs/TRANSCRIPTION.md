@@ -40,7 +40,7 @@ The debug files include:
 - the microphone transcript section
 - a full debug transcript containing clean, combined, and raw track sections
 
-The clean conversation timeline is not full speaker diarization. It starts from the combined timestamped segments, suppresses likely duplicate mic segments, and trims obvious call-audio phrases from mixed mic segments. The raw combined timeline is kept in `.recall/transcription/` for audit/debugging. Dedupe thresholds were tuned on Whisper segment sizes; Parakeet sentence cues can be longer or shorter, so speaker-bleed output should be checked on a real dual-track call.
+The clean conversation timeline is not full speaker diarization. It starts from the combined timestamped segments, suppresses likely duplicate mic segments, and trims obvious call-audio phrases from mixed mic segments. The raw combined timeline is kept in `.recall/transcription/` for audit/debugging. Bleed is decided from the audio where the two tracks share a timeline, and from the words otherwise; see "Mic bleed from speakers" below.
 
 ## One Timeline for Both Tracks
 
@@ -124,20 +124,29 @@ Best current mitigation:
 
 - Use headphones or earbuds during calls so remote audio stays mostly out of the mic track.
 
-Current software mitigation:
+How Recall decides, for each line on the mic track:
 
-- The `Clean Conversation` section prefers call/system audio for likely duplicated remote speech.
-- It suppresses mic segments that are mostly contained in overlapping call audio.
-- It removes contiguous call-audio phrases from mixed mic segments when enough local mic text remains.
+Recall measures the loudness of both tracks in 10 ms steps and decides from the audio first. The recognizer garbles bleed and invents words from room noise, so the words alone cannot tell.
 
-Future software mitigations:
+1. **No speech under the line.** The line is left out when the mic's audio never rises above the room: less than 15% of the line is 6 dB over the quiet level of its audio part, and the line's level is under 6 dB over it. A line with no words, such as a lone ".", is left out too. This rule needs only the mic track, so it applies to every session.
+2. **The call side is silent during the line.** The line is kept, whatever its words. A real "yeah" or "right" stays.
+3. **The line is only the call's sound.** Two measurements must agree. The mic's loudness follows the call's, at a match of 0.55 or more with the mic within 250 ms of where the timeline put it. And when the call's sound is cancelled out of the mic, 30% or less of the line is left. Then the line is dropped as bleed, however short or garbled. The second measurement is what protects a person who speaks over loud speakers: their voice is what cancelling leaves behind.
+4. **The mic heard something else.** At a match under 0.30 the line is kept, even when its words are the call's.
+5. **Otherwise the words decide,** as in older versions: a mic line whose words are mostly in the call lines beside it is dropped, and call phrases are trimmed out of a mixed line.
 
-- Tune the dedupe thresholds against more speaker-mode recordings.
-- Add a stricter "prefer call on overlap" merge mode for remote-speaker-heavy meetings.
-- Investigate macOS voice-processing / echo-cancellation input for microphone capture.
-- Add optional speaker labeling after transcript quality is stable.
+Rules 2 to 4 need both tracks on one timeline (see "One Timeline for Both Tracks"). Without it, and for a line the audio cannot speak for, only rule 5 applies. When the mic matches the call only in a wider search, the tracks were placed wrong, and the words decide for that line.
 
-Status: initial implementation exists. It is conservative and should be validated against more real speaker-mode recordings before treating it as done.
+Cancelling uses ffmpeg's adaptive filter (`anlms`, in ffmpeg 5.1 and newer) as a measurement only. No audio file is changed. The filter needs a few seconds to settle when the far side starts, after the user speaks, and after a device change. Bleed in those seconds looks like the user's voice, so it goes to rule 5 and some of it stays. With an older ffmpeg, rule 3 never applies.
+
+`transcript.md` counts the bleed that went: "Suppressed N likely duplicate mic segments caused by speaker bleed". The lines left out by rule 1 are listed under the conversation, each with its time and its words, because a very quiet voice measures the same as made-up words: speech about 14 dB under a normal voice was left out in a test. The summary agent is not sent that list; see `docs/AGENT_ANALYSIS.md`. Nothing is deleted from disk. `.recall/transcription/full-debug-transcript.md` has a `## Mic Lines and the Audio` section with every mic line, what was measured, and which rule decided, and the combined timeline there still holds every line.
+
+Limits:
+
+- The numbers come from three recordings with one far voice, on a Studio Display and a MacBook. Other rooms and speakers may need other numbers.
+- Some bleed stays: short lines and garbled lines from the seconds when the filter has not settled.
+- A voice much quieter than the bleed around it may leave too little behind to be noticed.
+- Headphones remain the best fix: with no bleed there is nothing to decide.
+- This removes lines from the transcript. It does not remove bleed from the audio, and it is not echo cancellation or speaker labeling.
 
 ### Model quality
 

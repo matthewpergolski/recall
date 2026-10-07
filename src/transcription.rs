@@ -15,6 +15,7 @@ use crate::audio::{
     generation_is_current, lock_session_publish, maybe_discard_session_audio, refresh_track_alias,
     segment_take_index, usable_audio_segments, AudioRetention, AudioTrack,
 };
+use crate::loudness::{follow, left_over_share, Loudness, Rise, NEAR_LAG_MS, WIDE_LAG_MS};
 use crate::session::{
     default_storage_dir, list_sessions, mark_transcript_ready, read_session_title,
     session_from_arg, transcription_dir, transcription_work_dir,
@@ -530,6 +531,10 @@ where
     let mut segments = Vec::new();
     let mut track_results = Vec::new();
     let timeline = TimelinePlan::for_session(&ffmpeg, &session_path, options.generation);
+    let mut call_loudness = None;
+    let mut mic_loudness = None;
+    let mut call_audio = None;
+    let mut mic_audio_path = None;
 
     for track in options.track.tracks() {
         let audio_segments =
@@ -548,6 +553,19 @@ where
         )?;
         if !audio_path.exists() {
             continue;
+        }
+        // The same audio the lines are timed against. Without it the cleanup
+        // falls back to the words alone.
+        let heard = Loudness::from_audio(&ffmpeg, &audio_path).ok();
+        match track {
+            Track::Call => {
+                call_loudness = heard;
+                call_audio = Some(audio_path.clone());
+            }
+            Track::Mic => {
+                mic_loudness = heard;
+                mic_audio_path = Some(audio_path.clone());
+            }
         }
 
         let chunks_dir = track_chunks_dir(&work_dir, track, options.generation);
@@ -690,13 +708,45 @@ where
         ));
     }
 
+    // The slow part, a pass over both tracks, runs before the publish lock is
+    // taken: the recorder writes its progress under that lock.
+    // What is left of the mic once the call's sound is cancelled out of it.
+    // Only tracks that share a clock can be cancelled against each other.
+    let mic_without_call = match (&call_audio, &mic_audio_path) {
+        (Some(call), Some(mic)) if timeline.fallback.is_none() => {
+            let mic_after_call_ms = timeline.mic.offset_ms as i64 - timeline.call.offset_ms as i64;
+            Loudness::of_mic_without_call(&ffmpeg, call, mic, mic_after_call_ms).ok()
+        }
+        _ => None,
+    };
+    mark_stage("compare tracks", &mut stages, &mut stage_started);
+    let mic_audio = MicAudio::measure(
+        &segments,
+        &timeline,
+        mic_loudness.as_ref(),
+        call_loudness.as_ref(),
+        mic_without_call.as_ref(),
+    );
     let _lock = lock_session_publish(&session_path)?;
     if transcription_generation_is_stale(&session_path, options.generation) {
         return Ok(stale_transcribe_result(&session_path));
     }
 
-    // Debug output only: how the tracks were placed, ahead of the raw tracks.
-    sections.insert(0, format!("## Timeline\n\n{}\n", timeline.note(&segments)));
+    let conversation = Conversation {
+        segments: &segments,
+        audio: &mic_audio,
+    };
+    // Debug output only, ahead of the raw tracks: how the tracks were placed,
+    // and what the audio said about each mic line.
+    let dropped_as_bleed = clean_conversation_segments(&segments, &mic_audio).bleed;
+    sections.insert(0, mic_audio.debug_section(&segments));
+    sections.insert(
+        0,
+        format!(
+            "## Timeline\n\n{}\n",
+            timeline.note(&segments, dropped_as_bleed)
+        ),
+    );
     let transcript_path = session_path.join("transcript.md");
     let debug_dir = transcription_dir(&session_path);
     write_transcription_outputs(
@@ -705,7 +755,7 @@ where
         &title,
         engine.kind(),
         &engine.model_label(),
-        &segments,
+        &conversation,
         &sections,
     )?;
     mark_stage("write outputs", &mut stages, &mut stage_started);
@@ -780,6 +830,27 @@ struct TimelinePlan {
     call: TrackPlacement,
     mic: TrackPlacement,
     fallback: Option<String>,
+    /// Where each mic part begins and ends in the mic track's own audio.
+    /// Empty when the parts could not be measured.
+    mic_part_spans: Vec<(u64, u64)>,
+}
+
+/// The span of each part in a track's joined audio: parts in order, with the
+/// silence that was kept before each one after the first.
+fn part_spans(durations_ms: &[u64], gaps_ms: &[u64]) -> Vec<(u64, u64)> {
+    let mut next_start = 0;
+    durations_ms
+        .iter()
+        .enumerate()
+        .map(|(index, duration)| {
+            if let Some(before) = index.checked_sub(1) {
+                next_start += gaps_ms.get(before).copied().unwrap_or(0);
+            }
+            let span = (next_start, next_start + duration);
+            next_start += duration;
+            span
+        })
+        .collect()
 }
 
 impl TimelinePlan {
@@ -799,14 +870,21 @@ impl TimelinePlan {
                 })
                 .collect()
         };
-        let placed = parts(Track::Call)
-            .and_then(|call| Ok((call, parts(Track::Mic)?)))
+        let call_parts = parts(Track::Call);
+        let mic_parts = parts(Track::Mic);
+        let mic_durations: Vec<u64> = mic_parts
+            .as_ref()
+            .map(|parts| parts.iter().map(|part| part.duration_ms).collect())
+            .unwrap_or_default();
+        let placed = call_parts
+            .and_then(|call| Ok((call, mic_parts?)))
             .and_then(|(call, mic)| place(&[call, mic]));
         match placed {
             Ok(mut placements) => {
                 let mic = placements.pop().unwrap_or_default();
                 let call = placements.pop().unwrap_or_default();
                 Self {
+                    mic_part_spans: part_spans(&mic_durations, &mic.gap_lengths_ms()),
                     call,
                     mic,
                     fallback: None,
@@ -816,6 +894,7 @@ impl TimelinePlan {
                 call: TrackPlacement::default(),
                 mic: TrackPlacement::default(),
                 fallback: Some(reason),
+                mic_part_spans: part_spans(&mic_durations, &[]),
             },
         }
     }
@@ -827,9 +906,10 @@ impl TimelinePlan {
         }
     }
 
-    /// One paragraph for the debug transcript: how the tracks were placed, and
-    /// how many mic lines the bleed rules suppressed with and without it.
-    fn note(&self, segments: &[TranscriptSegment]) -> String {
+    /// One paragraph for the debug transcript: how the tracks were placed, how
+    /// many mic lines were dropped as bleed, and how many the words alone
+    /// would have dropped with and without the placement.
+    fn note(&self, segments: &[TranscriptSegment], dropped_as_bleed: usize) -> String {
         if let Some(reason) = &self.fallback {
             return format!(
                 "Timeline: parts are joined back to back and each track counts from its own start ({reason})."
@@ -852,14 +932,17 @@ impl TimelinePlan {
             .collect();
         let silence =
             |placement: &TrackPlacement| -> u64 { placement.gap_lengths_ms().iter().sum() };
+        let by_words = |lines: &[TranscriptSegment]| {
+            clean_conversation_segments(lines, &MicAudio::default()).bleed
+        };
         format!(
-            "Timeline: both tracks are placed on one clock. The call track starts at {} and the mic track at {}. Time lost between parts and kept as silence: call {} ms, mic {} ms. Mic lines suppressed as bleed: {} with this placement, {} without.",
+            "Timeline: both tracks are placed on one clock. The call track starts at {} and the mic track at {}. Time lost between parts and kept as silence: call {} ms, mic {} ms. Mic lines dropped as bleed: {dropped_as_bleed}. The words alone would drop {} with this placement and {} without.",
             format_timestamp(self.call.offset_ms),
             format_timestamp(self.mic.offset_ms),
             silence(&self.call),
             silence(&self.mic),
-            clean_conversation_segments(segments).1,
-            clean_conversation_segments(&unaligned).1,
+            by_words(segments),
+            by_words(&unaligned),
         )
     }
 }
@@ -2232,9 +2315,10 @@ fn write_transcription_outputs(
     title: &str,
     engine: TranscriptionEngine,
     model_label: &str,
-    segments: &[TranscriptSegment],
+    conversation: &Conversation,
     sections: &[String],
 ) -> io::Result<()> {
+    let segments = conversation.segments;
     if debug_dir.exists() {
         fs::remove_dir_all(debug_dir)?;
     }
@@ -2242,7 +2326,7 @@ fn write_transcription_outputs(
 
     fs::write(
         transcript_path,
-        transcript_markdown(title, engine, model_label, segments),
+        transcript_markdown(title, engine, model_label, conversation),
     )?;
     fs::write(
         debug_dir.join("combined-timeline.md"),
@@ -2254,7 +2338,7 @@ fn write_transcription_outputs(
     )?;
     fs::write(
         debug_dir.join("full-debug-transcript.md"),
-        full_debug_transcript_markdown(title, engine, model_label, segments, sections),
+        full_debug_transcript_markdown(title, engine, model_label, conversation, sections),
     )?;
 
     Ok(())
@@ -2322,9 +2406,9 @@ fn transcript_markdown(
     title: &str,
     engine: TranscriptionEngine,
     model_label: &str,
-    segments: &[TranscriptSegment],
+    conversation: &Conversation,
 ) -> String {
-    let clean_timeline = clean_conversation_markdown(segments);
+    let clean_timeline = clean_conversation_markdown(conversation);
     format!(
         "# Transcript: {title}\n\n{}\n\n{}",
         transcript_header(engine, model_label),
@@ -2366,11 +2450,11 @@ fn full_debug_transcript_markdown(
     title: &str,
     engine: TranscriptionEngine,
     model_label: &str,
-    segments: &[TranscriptSegment],
+    conversation: &Conversation,
     sections: &[String],
 ) -> String {
-    let clean_timeline = clean_conversation_markdown(segments);
-    let timeline = combined_timeline_markdown(segments);
+    let clean_timeline = clean_conversation_markdown(conversation);
+    let timeline = combined_timeline_markdown(conversation.segments);
     format!(
         "# Full Debug Transcript: {title}\n\n{}\n\n{}{}{}\n",
         transcript_header(engine, model_label),
@@ -2380,17 +2464,25 @@ fn full_debug_transcript_markdown(
     )
 }
 
-fn clean_conversation_markdown(segments: &[TranscriptSegment]) -> String {
-    if segments.is_empty() {
+fn clean_conversation_markdown(conversation: &Conversation) -> String {
+    if conversation.segments.is_empty() {
         return String::new();
     }
 
-    let (clean_segments, suppressed_count) = clean_conversation_segments(segments);
-    if clean_segments.is_empty() {
+    let CleanConversation {
+        kept: clean_segments,
+        bleed: suppressed_count,
+        left_out,
+    } = clean_conversation_segments(conversation.segments, conversation.audio);
+    // Lines that were left out are still shown, even when nothing else is.
+    if clean_segments.is_empty() && left_out.is_empty() {
         return String::new();
     }
 
     let mut markdown = String::from("## Clean Conversation\n\n");
+    if clean_segments.is_empty() {
+        markdown.push_str("_No conversation lines remain._\n");
+    }
     for segment in clean_segments {
         markdown.push_str(&format!(
             "- [{} - {}] **{}:** {}\n",
@@ -2411,33 +2503,312 @@ fn clean_conversation_markdown(segments: &[TranscriptSegment]) -> String {
             markdown.push_str("s caused by speaker bleed._\n");
         }
     }
+    if !left_out.is_empty() {
+        // Listed, not only counted: a very quiet voice measures the same as
+        // words made up from room noise, and nothing should vanish unseen.
+        // No speaker label, so these are not read as lines of the conversation.
+        let lines = if left_out.len() == 1 { "line" } else { "lines" };
+        markdown.push_str(&format!(
+            "\n{LEFT_OUT_NOTE_START}{} mic {lines} with no speech under them. Most likely the recognizer made the words up from room noise; a very quiet voice is the other possibility:_\n\n",
+            left_out.len()
+        ));
+        for segment in &left_out {
+            markdown.push_str(&format!(
+                "- [{} - {}] {}\n",
+                format_timestamp(segment.start_ms),
+                format_timestamp(segment.end_ms),
+                segment.text
+            ));
+        }
+    }
 
     markdown.push('\n');
     markdown
 }
 
-fn clean_conversation_segments(segments: &[TranscriptSegment]) -> (Vec<TranscriptSegment>, usize) {
-    // Thresholds were tuned on Whisper segment sizes. Parakeet sentence cues can
-    // be longer or shorter; re-check mic bleed on a real dual-track call before
-    // tightening.
+/// The timed lines of a session, with what the audio says about the mic's.
+struct Conversation<'a> {
+    segments: &'a [TranscriptSegment],
+    audio: &'a MicAudio,
+}
+
+/// What the audio says about one mic line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AudioVerdict {
+    /// The mic's audio never rises above the room, or the line has no words.
+    NoSpeech,
+    /// The call side is silent during the line, so the mic heard the user.
+    CallSilent,
+    /// The mic's loudness follows the call's: the far side, from the speakers.
+    Bleed,
+    /// The mic heard something that is not the call.
+    OwnVoice,
+    /// The audio cannot say. The words decide, as they did before.
+    Unsure,
+}
+
+/// A mic line whose loudness follows the call's this closely may be bleed...
+const BLEED_FOLLOW: f32 = 0.55;
+/// ...when no more than this share of it is left after the call's sound is
+/// cancelled out. More than that, and something else was heard: the user.
+const BLEED_LEFT_OVER: f32 = 0.30;
+/// Under this the mic heard something other than the call.
+const OWN_VOICE_FOLLOW: f32 = 0.30;
+/// A line is made up from silence when less than this share of it is loud...
+const NO_SPEECH_LOUD_SHARE: f32 = 0.15;
+/// ...and its level is less than this far over the quiet level of its part.
+const NO_SPEECH_OVER_QUIET_DB: f32 = 6.0;
+
+/// How closely a mic line follows the call: with the mic where the timeline
+/// put it, and in a wider search that finds a track placed wrong.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Follows {
+    near: f32,
+    wide: f32,
+}
+
+/// Decides one mic line from what was measured. `call_silent`, `follows`,
+/// and `left_over` are None when the tracks could not be compared.
+///
+/// A line is dropped as bleed only when two measurements agree: its loudness
+/// follows the call's, and cancelling the call's sound leaves little of it.
+/// The first alone is fooled when loud speakers drown the user's voice.
+fn audio_verdict(
+    words: usize,
+    rise: Option<Rise>,
+    call_silent: Option<bool>,
+    follows: Option<Follows>,
+    left_over: Option<f32>,
+) -> AudioVerdict {
+    let never_rises = rise.is_some_and(|rise| {
+        rise.loud_share < NO_SPEECH_LOUD_SHARE && rise.over_quiet_db < NO_SPEECH_OVER_QUIET_DB
+    });
+    if words == 0 || never_rises {
+        return AudioVerdict::NoSpeech;
+    }
+    match (call_silent, follows) {
+        (Some(true), _) => AudioVerdict::CallSilent,
+        (Some(false), Some(follows)) if follows.near >= BLEED_FOLLOW => {
+            if left_over.is_some_and(|share| share <= BLEED_LEFT_OVER) {
+                AudioVerdict::Bleed
+            } else {
+                // The line sounds like the call, and something else is in
+                // it too, or the cancelling could not tell. Let the words
+                // trim the call's phrases and keep the rest.
+                AudioVerdict::Unsure
+            }
+        }
+        // The same sound, but not where the timeline put it: the placement
+        // is off, so the audio cannot speak for this line.
+        (Some(false), Some(follows)) if follows.wide >= BLEED_FOLLOW => AudioVerdict::Unsure,
+        (Some(false), Some(follows)) if follows.near < OWN_VOICE_FOLLOW => AudioVerdict::OwnVoice,
+        _ => AudioVerdict::Unsure,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LineAudio {
+    verdict: AudioVerdict,
+    rise: Option<Rise>,
+    call_silent: Option<bool>,
+    follows: Option<Follows>,
+    left_over: Option<f32>,
+}
+
+/// What the audio says about each mic line, keyed by the line's times.
+/// Empty when nothing could be measured; every line is then `Unsure`.
+#[derive(Debug, Default)]
+struct MicAudio {
+    lines: std::collections::HashMap<(u64, u64), LineAudio>,
+}
+
+impl MicAudio {
+    fn measure(
+        segments: &[TranscriptSegment],
+        timeline: &TimelinePlan,
+        mic: Option<&Loudness>,
+        call: Option<&Loudness>,
+        mic_without_call: Option<&Loudness>,
+    ) -> Self {
+        let Some(mic) = mic else {
+            return Self::default();
+        };
+        // The two tracks can be compared only when they share a clock.
+        let call = call.filter(|_| timeline.fallback.is_none());
+        let quiet_levels: Vec<Option<f32>> = timeline
+            .mic_part_spans
+            .iter()
+            .map(|(start, end)| mic.quiet_level(*start, *end))
+            .collect();
+
+        let mut lines = std::collections::HashMap::new();
+        for segment in segments.iter().filter(|segment| segment.track == "mic") {
+            // The line's times on the mic track's own audio.
+            let start = segment.start_ms.saturating_sub(timeline.mic.offset_ms);
+            let end = segment.end_ms.saturating_sub(timeline.mic.offset_ms);
+            let middle = start + (end - start) / 2;
+            let quiet = timeline
+                .mic_part_spans
+                .iter()
+                .position(|(part_start, part_end)| (*part_start..*part_end).contains(&middle))
+                .and_then(|part| quiet_levels[part]);
+            let rise = quiet.and_then(|quiet| mic.rise(start, end, quiet));
+            let left_over = quiet
+                .zip(mic_without_call)
+                .and_then(|(quiet, cancelled)| left_over_share(mic, cancelled, start, end, quiet));
+            let (call_silent, follows) = match call {
+                // The call track had not started when the line ended.
+                Some(_) if segment.end_ms <= timeline.call.offset_ms => (Some(true), None),
+                // The line began before the call track did. The two windows
+                // would not cover the same moments, so the audio does not
+                // speak for this line and the words decide.
+                Some(_) if segment.start_ms < timeline.call.offset_ms => (None, None),
+                Some(call) => {
+                    let call_start = segment.start_ms - timeline.call.offset_ms;
+                    let call_end = segment.end_ms - timeline.call.offset_ms;
+                    let length = call_end - call_start;
+                    let near = follow(mic, start, call, call_start, length, NEAR_LAG_MS);
+                    let wide = follow(mic, start, call, call_start, length, WIDE_LAG_MS);
+                    (
+                        Some(call.is_silent(call_start, call_end)),
+                        near.zip(wide).map(|(near, wide)| Follows { near, wide }),
+                    )
+                }
+                None => (None, None),
+            };
+            // Any script counts: the word tokenizer of the text rules keeps
+            // only ASCII and would call a line of Chinese or Russian empty.
+            let words = segment
+                .text
+                .split_whitespace()
+                .filter(|word| word.chars().any(char::is_alphanumeric))
+                .count();
+            lines.insert(
+                (segment.start_ms, segment.end_ms),
+                LineAudio {
+                    verdict: audio_verdict(words, rise, call_silent, follows, left_over),
+                    rise,
+                    call_silent,
+                    follows,
+                    left_over,
+                },
+            );
+        }
+        Self { lines }
+    }
+
+    fn verdict(&self, segment: &TranscriptSegment) -> AudioVerdict {
+        if segment.track != "mic" {
+            return AudioVerdict::Unsure;
+        }
+        self.lines
+            .get(&(segment.start_ms, segment.end_ms))
+            .map_or(AudioVerdict::Unsure, |line| line.verdict)
+    }
+
+    /// One line per mic line for the debug transcript: what was measured and
+    /// which rule decided.
+    fn debug_section(&self, segments: &[TranscriptSegment]) -> String {
+        let mut section = String::from("## Mic Lines and the Audio\n\n");
+        if self.lines.is_empty() {
+            section.push_str("The mic audio was not measured. The words alone decided.\n");
+            return section;
+        }
+        let mut mic_lines: Vec<&TranscriptSegment> = segments
+            .iter()
+            .filter(|segment| segment.track == "mic")
+            .collect();
+        mic_lines.sort_by_key(|segment| (segment.start_ms, segment.end_ms));
+        for segment in mic_lines {
+            let Some(line) = self.lines.get(&(segment.start_ms, segment.end_ms)) else {
+                continue;
+            };
+            let decision = match line.verdict {
+                AudioVerdict::NoSpeech => "left out, no speech under it",
+                AudioVerdict::CallSilent => "kept, the call side is silent",
+                AudioVerdict::Bleed => "dropped as bleed",
+                AudioVerdict::OwnVoice => "kept, not the call's sound",
+                AudioVerdict::Unsure => "the words decide",
+            };
+            let left_over = line.left_over.map_or("not measured".to_string(), |share| {
+                format!("{:.0}%", share * 100.0)
+            });
+            let follows = line.follows.map_or("not compared".to_string(), |value| {
+                format!("{:.2} (wide search {:.2})", value.near, value.wide)
+            });
+            let rise = line.rise.map_or("not measured".to_string(), |rise| {
+                format!(
+                    "{:.0}% loud, {:.1} dB over quiet",
+                    rise.loud_share * 100.0,
+                    rise.over_quiet_db
+                )
+            });
+            let call = match line.call_silent {
+                Some(true) => "silent",
+                Some(false) => "speaking",
+                None => "not compared",
+            };
+            section.push_str(&format!(
+                "- [{} - {}] {decision}. Follows the call: {follows}. Left after cancelling the call: {left_over}. Call side: {call}. Mic: {rise}.\n",
+                format_timestamp(segment.start_ms),
+                format_timestamp(segment.end_ms),
+            ));
+        }
+        section
+    }
+}
+
+/// How the note above the left-out lines begins in transcript.md. The
+/// analysis prompt finds the list by it and leaves the list out.
+pub(crate) const LEFT_OUT_NOTE_START: &str = "_Left out ";
+
+/// The lines that stay, how many mic lines went as bleed, and the mic lines
+/// left out because no speech was found under them. Those are listed in the
+/// transcript: a very quiet voice measures the same as made-up words.
+struct CleanConversation {
+    kept: Vec<TranscriptSegment>,
+    bleed: usize,
+    left_out: Vec<TranscriptSegment>,
+}
+
+fn clean_conversation_segments(
+    segments: &[TranscriptSegment],
+    audio: &MicAudio,
+) -> CleanConversation {
+    // The word thresholds were tuned on Whisper segment sizes. They decide
+    // only where the audio cannot.
     let mut sorted = segments.to_vec();
     sorted.sort_by_key(|segment| (segment.start_ms, segment.end_ms, segment.track));
 
-    let mut clean = Vec::new();
-    let mut suppressed_count = 0;
+    let mut kept = Vec::new();
+    let mut bleed = 0;
+    let mut left_out = Vec::new();
     for segment in &sorted {
         let candidate = clean_segment_text(segment, &sorted);
-        if is_likely_duplicate_mic_segment(segment, &sorted)
-            || is_low_value_mic_filler(&candidate, &sorted)
-            || is_repeated_mic_loop(&candidate, &clean)
-        {
-            suppressed_count += 1;
-        } else {
-            clean.push(candidate);
+        match audio.verdict(segment) {
+            AudioVerdict::NoSpeech => left_out.push(segment.clone()),
+            AudioVerdict::Bleed => bleed += 1,
+            // The user spoke. Keep the line as it was heard, whatever its
+            // words are: no trimming of phrases the call also said.
+            AudioVerdict::CallSilent | AudioVerdict::OwnVoice => kept.push(segment.clone()),
+            AudioVerdict::Unsure => {
+                if is_likely_duplicate_mic_segment(segment, &sorted)
+                    || is_low_value_mic_filler(&candidate, &sorted)
+                    || is_repeated_mic_loop(&candidate, &kept)
+                {
+                    bleed += 1;
+                } else {
+                    kept.push(candidate);
+                }
+            }
         }
     }
 
-    (clean, suppressed_count)
+    CleanConversation {
+        kept,
+        bleed,
+        left_out,
+    }
 }
 
 fn clean_segment_text(
@@ -2854,6 +3225,338 @@ mod tests {
     }
 
     #[test]
+    fn the_audio_decides_a_mic_line_before_the_words_do() {
+        use super::{audio_verdict, AudioVerdict, Follows};
+        use crate::loudness::Rise;
+        let speech = Some(Rise {
+            loud_share: 0.6,
+            over_quiet_db: 12.0,
+        });
+        // Cancelling the call left little of the line: nothing else was heard.
+        const CLEAN: Option<f32> = Some(0.1);
+        // The same score near and wide: the tracks are placed right.
+        let follows = |score: f32| {
+            Some(Follows {
+                near: score,
+                wide: score,
+            })
+        };
+        // The call side is silent: the user spoke, whatever the match says.
+        assert_eq!(
+            audio_verdict(3, speech, Some(true), follows(0.9), CLEAN),
+            AudioVerdict::CallSilent
+        );
+        // The mic follows the call: bleed, however short or garbled the words.
+        assert_eq!(
+            audio_verdict(1, speech, Some(false), follows(0.55), CLEAN),
+            AudioVerdict::Bleed
+        );
+        // The mic heard something else while the call spoke.
+        assert_eq!(
+            audio_verdict(5, speech, Some(false), follows(0.29), CLEAN),
+            AudioVerdict::OwnVoice
+        );
+        // In between, or not compared: the words decide.
+        assert_eq!(
+            audio_verdict(5, speech, Some(false), follows(0.4), CLEAN),
+            AudioVerdict::Unsure
+        );
+        // The line follows the call, yet much of it is left once the call is
+        // cancelled: the user spoke over loud speakers. The measured case:
+        // "Aaron Rogers." followed at 0.86 with 71% left over. Not bleed.
+        assert_eq!(
+            audio_verdict(2, speech, Some(false), follows(0.86), Some(0.71)),
+            AudioVerdict::Unsure
+        );
+        // At the limit it is still bleed; with no cancelling at all, never.
+        assert_eq!(
+            audio_verdict(2, speech, Some(false), follows(0.86), Some(0.30)),
+            AudioVerdict::Bleed
+        );
+        assert_eq!(
+            audio_verdict(2, speech, Some(false), follows(0.86), None),
+            AudioVerdict::Unsure
+        );
+        // The mic follows the call only in the wide search: the tracks are
+        // placed wrong, and a low near score must not be read as the user.
+        let misplaced = Some(Follows {
+            near: 0.1,
+            wide: 0.8,
+        });
+        assert_eq!(
+            audio_verdict(5, speech, Some(false), misplaced, CLEAN),
+            AudioVerdict::Unsure
+        );
+        assert_eq!(
+            audio_verdict(5, speech, Some(false), None, CLEAN),
+            AudioVerdict::Unsure
+        );
+        assert_eq!(
+            audio_verdict(5, speech, None, None, None),
+            AudioVerdict::Unsure
+        );
+        assert_eq!(
+            audio_verdict(5, None, None, None, None),
+            AudioVerdict::Unsure
+        );
+    }
+
+    #[test]
+    fn a_line_with_no_speech_under_it_is_made_up() {
+        use super::{audio_verdict, AudioVerdict};
+        use crate::loudness::Rise;
+        let rise = |loud_share, over_quiet_db| {
+            Some(Rise {
+                loud_share,
+                over_quiet_db,
+            })
+        };
+        // The room only: the numbers of the made-up lines in the test call.
+        assert_eq!(
+            audio_verdict(1, rise(0.02, 3.0), Some(true), None, None),
+            AudioVerdict::NoSpeech
+        );
+        assert_eq!(
+            audio_verdict(20, rise(0.11, 4.0), Some(false), None, None),
+            AudioVerdict::NoSpeech
+        );
+        // Both must hold. A few loud moments, or a raised level, is speech.
+        assert_eq!(
+            audio_verdict(2, rise(0.27, 7.7), Some(true), None, None),
+            AudioVerdict::CallSilent
+        );
+        assert_eq!(
+            audio_verdict(2, rise(0.10, 6.5), Some(true), None, None),
+            AudioVerdict::CallSilent
+        );
+        assert_eq!(
+            audio_verdict(2, rise(0.20, 4.0), Some(true), None, None),
+            AudioVerdict::CallSilent
+        );
+        // A line with no words in it, such as a lone full stop.
+        assert_eq!(
+            audio_verdict(0, rise(0.9, 30.0), Some(true), None, None),
+            AudioVerdict::NoSpeech
+        );
+    }
+
+    fn mic_line(start_ms: u64, end_ms: u64, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            start_ms,
+            end_ms,
+            track: "mic",
+            text: text.to_string(),
+        }
+    }
+
+    fn call_line(start_ms: u64, end_ms: u64, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            start_ms,
+            end_ms,
+            track: "call",
+            text: text.to_string(),
+        }
+    }
+
+    fn mic_audio(verdicts: &[((u64, u64), super::AudioVerdict)]) -> super::MicAudio {
+        super::MicAudio {
+            lines: verdicts
+                .iter()
+                .map(|(times, verdict)| {
+                    (
+                        *times,
+                        super::LineAudio {
+                            verdict: *verdict,
+                            rise: None,
+                            call_silent: None,
+                            follows: None,
+                            left_over: None,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_clean_conversation_follows_the_audio_verdicts() {
+        use super::AudioVerdict;
+        let segments = vec![
+            mic_line(500, 3_000, "you."),
+            call_line(
+                10_000,
+                14_000,
+                "Second, trick or treating evolved from a medieval practice.",
+            ),
+            // Garbled bleed: the words alone would keep this.
+            mic_line(
+                10_100,
+                14_200,
+                "Second, stripper treating evolved from a medieval polling.",
+            ),
+            call_line(15_000, 15_800, "You got it."),
+            mic_line(15_100, 15_700, "Got it."),
+            // The user's own short reply beside a call line: the words alone
+            // would drop it as filler.
+            mic_line(16_000, 16_400, "Yeah."),
+            // The user repeats the call's words while it speaks.
+            call_line(20_000, 22_000, "light kept all night no ships lost"),
+            mic_line(20_500, 22_500, "light kept all night no ships lost"),
+            // The user answers with the call's phrase and more of their own.
+            call_line(30_000, 32_000, "I think the window is open"),
+            mic_line(31_000, 34_000, "the window is open but it is cold in here"),
+            // Speech in a script the word rules cannot read.
+            mic_line(40_000, 41_000, "你好"),
+        ];
+        let audio = mic_audio(&[
+            ((500, 3_000), AudioVerdict::NoSpeech),
+            ((10_100, 14_200), AudioVerdict::Bleed),
+            ((15_100, 15_700), AudioVerdict::Bleed),
+            ((16_000, 16_400), AudioVerdict::CallSilent),
+            ((20_500, 22_500), AudioVerdict::OwnVoice),
+            ((31_000, 34_000), AudioVerdict::OwnVoice),
+            ((40_000, 41_000), AudioVerdict::CallSilent),
+        ]);
+
+        let cleaned = clean_conversation_segments(&segments, &audio);
+        let mic_kept: Vec<&str> = cleaned
+            .kept
+            .iter()
+            .filter(|segment| segment.track == "mic")
+            .map(|segment| segment.text.as_str())
+            .collect();
+        assert_eq!(
+            mic_kept,
+            [
+                "Yeah.",
+                "light kept all night no ships lost",
+                // Kept whole: the audio said the user spoke, so nothing is trimmed.
+                "the window is open but it is cold in here",
+                "你好",
+            ]
+        );
+        assert_eq!(cleaned.bleed, 2);
+        assert_eq!(cleaned.left_out.len(), 1);
+        assert_eq!(cleaned.left_out[0].text, "you.");
+
+        // With no audio to go on, the words decide as they did before: the
+        // made-up line and "Got it." stay, the garbled bleed stays with the
+        // call's phrases trimmed out of it, and both real replies are dropped.
+        let by_words = clean_conversation_segments(&segments, &super::MicAudio::default());
+        let mic_kept: Vec<&str> = by_words
+            .kept
+            .iter()
+            .filter(|segment| segment.track == "mic")
+            .map(|segment| segment.text.as_str())
+            .collect();
+        assert_eq!(
+            mic_kept,
+            [
+                "you.",
+                "Second, stripper polling.",
+                "Got it.",
+                // The words trim the call's phrase out of the reply.
+                "but it is cold in here",
+                "你好",
+            ]
+        );
+        assert!(by_words.left_out.is_empty());
+
+        let markdown = super::transcript_markdown(
+            "Test",
+            TranscriptionEngine::Apple,
+            "SpeechAnalyzer",
+            &super::Conversation {
+                segments: &segments,
+                audio: &audio,
+            },
+        );
+        assert!(markdown
+            .contains("_Suppressed 2 likely duplicate mic segments caused by speaker bleed._"));
+        // The left-out line is shown with its time and words, and without a
+        // speaker label, so it is not taken for a line of the conversation.
+        assert!(markdown.contains("_Left out 1 mic line with no speech under them."));
+        assert!(markdown.contains("\n- [00:00.500 - 00:03.000] you.\n"));
+        assert!(!markdown.contains("**mic:** you."));
+        assert_eq!(
+            crate::citations::timed_lines(&markdown)
+                .iter()
+                .filter(|line| line.text == "you.")
+                .count(),
+            0
+        );
+        assert!(audio.debug_section(&segments).contains("dropped as bleed"));
+
+        // A session where every line was left out still shows them.
+        let only_made_up = vec![mic_line(500, 3_000, "you.")];
+        let markdown = super::transcript_markdown(
+            "Test",
+            TranscriptionEngine::Apple,
+            "SpeechAnalyzer",
+            &super::Conversation {
+                segments: &only_made_up,
+                audio: &audio,
+            },
+        );
+        assert!(markdown.contains("_No conversation lines remain._"));
+        assert!(markdown.contains("\n- [00:00.500 - 00:03.000] you.\n"));
+    }
+
+    #[test]
+    fn a_line_from_before_the_call_track_started_is_not_compared_against_it() {
+        use super::{AudioVerdict, MicAudio, TimelinePlan};
+        use crate::loudness::Loudness;
+        use crate::timeline::TrackPlacement;
+        // The call recorder started 2 s after the mic. Both tracks carry the
+        // same steady pattern, so any line that is compared would look like bleed.
+        let pattern: Vec<f32> = (0..1_000)
+            .map(|i| if i % 9 < 5 { 0.05 } else { 0.002 })
+            .collect();
+        let mic = Loudness::from_frames(pattern.clone());
+        let call = Loudness::from_frames(pattern[200..].to_vec());
+        let timeline = TimelinePlan {
+            call: TrackPlacement {
+                offset_ms: 2_000,
+                gaps: Vec::new(),
+            },
+            mic: TrackPlacement::default(),
+            fallback: None,
+            mic_part_spans: vec![(0, 10_000)],
+        };
+        let segments = vec![
+            mic_line(200, 1_800, "said before the call track began"),
+            mic_line(1_000, 4_000, "began before the call track did"),
+            mic_line(4_000, 7_000, "wholly inside the call track"),
+        ];
+        // Cancelling explained everything, so only the alignment is in question.
+        let cancelled = Loudness::from_frames(vec![0.002; 1_000]);
+        let audio = MicAudio::measure(
+            &segments,
+            &timeline,
+            Some(&mic),
+            Some(&call),
+            Some(&cancelled),
+        );
+
+        assert_eq!(audio.verdict(&segments[0]), AudioVerdict::CallSilent);
+        assert_eq!(audio.verdict(&segments[1]), AudioVerdict::Unsure);
+        assert_eq!(audio.verdict(&segments[2]), AudioVerdict::Bleed);
+    }
+
+    #[test]
+    fn part_spans_leave_room_for_the_silence_kept_between_parts() {
+        assert_eq!(
+            super::part_spans(&[19_820, 95_910, 5_160], &[1_499, 819]),
+            [(0, 19_820), (21_319, 117_229), (118_048, 123_208)]
+        );
+        assert_eq!(
+            super::part_spans(&[5_000, 2_000], &[]),
+            [(0, 5_000), (5_000, 7_000)]
+        );
+        assert!(super::part_spans(&[], &[100]).is_empty());
+    }
+
+    #[test]
     fn apple_fallback_note_reports_the_helper_reason() {
         let reason = apple_fallback_reason(
             "error: build failed\n  Rebuild capture-helper with Xcode 26 or later for Apple SpeechAnalyzer\n",
@@ -3132,7 +3835,11 @@ Hello <b>there.</b>\n";
             },
         ];
 
-        let (clean, suppressed_count) = clean_conversation_segments(&segments);
+        let super::CleanConversation {
+            kept: clean,
+            bleed: suppressed_count,
+            ..
+        } = clean_conversation_segments(&segments, &super::MicAudio::default());
 
         assert_eq!(suppressed_count, 1);
         assert_eq!(clean.len(), 1);
@@ -3156,7 +3863,11 @@ Hello <b>there.</b>\n";
             },
         ];
 
-        let (clean, suppressed_count) = clean_conversation_segments(&segments);
+        let super::CleanConversation {
+            kept: clean,
+            bleed: suppressed_count,
+            ..
+        } = clean_conversation_segments(&segments, &super::MicAudio::default());
 
         assert_eq!(suppressed_count, 0);
         assert_eq!(clean.len(), 2);
@@ -3189,7 +3900,11 @@ Hello <b>there.</b>\n";
             },
         ];
 
-        let (clean, suppressed_count) = clean_conversation_segments(&segments);
+        let super::CleanConversation {
+            kept: clean,
+            bleed: suppressed_count,
+            ..
+        } = clean_conversation_segments(&segments, &super::MicAudio::default());
 
         assert_eq!(suppressed_count, 1);
         assert_eq!(clean.len(), 2);
@@ -3214,7 +3929,11 @@ Hello <b>there.</b>\n";
             },
         ];
 
-        let (clean, suppressed_count) = clean_conversation_segments(&segments);
+        let super::CleanConversation {
+            kept: clean,
+            bleed: suppressed_count,
+            ..
+        } = clean_conversation_segments(&segments, &super::MicAudio::default());
 
         assert_eq!(suppressed_count, 0);
         assert_eq!(clean.len(), 2);
@@ -3244,7 +3963,11 @@ Hello <b>there.</b>\n";
             },
         ];
 
-        let (clean, suppressed_count) = clean_conversation_segments(&segments);
+        let super::CleanConversation {
+            kept: clean,
+            bleed: suppressed_count,
+            ..
+        } = clean_conversation_segments(&segments, &super::MicAudio::default());
 
         assert_eq!(suppressed_count, 1);
         assert_eq!(clean.len(), 2);
@@ -3269,7 +3992,11 @@ Hello <b>there.</b>\n";
             },
         ];
 
-        let (clean, suppressed_count) = clean_conversation_segments(&segments);
+        let super::CleanConversation {
+            kept: clean,
+            bleed: suppressed_count,
+            ..
+        } = clean_conversation_segments(&segments, &super::MicAudio::default());
 
         assert_eq!(suppressed_count, 1);
         assert_eq!(clean.len(), 1);
@@ -3289,7 +4016,10 @@ Hello <b>there.</b>\n";
             "Test",
             TranscriptionEngine::Whisper,
             "models/test.bin",
-            &segments,
+            &super::Conversation {
+                segments: &segments,
+                audio: &super::MicAudio::default(),
+            },
         );
 
         assert!(markdown.contains("## Clean Conversation"));
@@ -3315,7 +4045,10 @@ Hello <b>there.</b>\n";
             "Test",
             TranscriptionEngine::Parakeet,
             DEFAULT_PARAKEET_MODEL,
-            &segments,
+            &super::Conversation {
+                segments: &segments,
+                audio: &super::MicAudio::default(),
+            },
         );
 
         assert!(markdown.contains("Engine: `parakeet`"));
@@ -3336,7 +4069,10 @@ Hello <b>there.</b>\n";
             "Test",
             TranscriptionEngine::Parakeet,
             "acme/custom-asr",
-            &segments,
+            &super::Conversation {
+                segments: &segments,
+                audio: &super::MicAudio::default(),
+            },
         );
 
         assert!(!markdown.contains("CC-BY-4.0"));
@@ -3356,7 +4092,10 @@ Hello <b>there.</b>\n";
             "Test",
             TranscriptionEngine::Apple,
             APPLE_SPEECH_MODEL_LABEL,
-            &segments,
+            &super::Conversation {
+                segments: &segments,
+                audio: &super::MicAudio::default(),
+            },
         );
 
         assert!(markdown.contains("Engine: `apple`"));

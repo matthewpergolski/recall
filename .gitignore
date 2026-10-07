@@ -27,7 +27,8 @@ capture-helper/.build/
 .env
 .env.*
 
-/.DS_Store
+# Finder writes these in any folder it shows. One of them blocks `recall update`.
+.DS_Store
 /.idea/
 /.vscode/
 *.log
