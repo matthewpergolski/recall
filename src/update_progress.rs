@@ -1,9 +1,10 @@
-use std::env;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+use crate::terminal;
 
 const BAR_WIDTH: usize = 32;
 const MIN_BAR_WIDTH: usize = 8;
@@ -43,12 +44,7 @@ struct BarState {
 
 impl UpdateProgress {
     pub fn detect() -> Self {
-        let dumb = env::var("TERM").ok().as_deref() == Some("dumb");
-        let interactive = io::stdout().is_terminal() && !dumb;
-        Self::with_mode(
-            interactive,
-            interactive && env::var_os("NO_COLOR").is_none(),
-        )
+        Self::with_mode(terminal::stdout_is_live(), terminal::stdout_takes_style())
     }
 
     #[cfg(test)]

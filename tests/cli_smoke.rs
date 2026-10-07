@@ -86,6 +86,51 @@ fn resume_missing_session_id_errors_clearly() {
 }
 
 #[test]
+fn resume_finds_a_session_by_part_of_its_name_and_reports_ambiguity() {
+    let storage = unique_storage("partial-name");
+    let folders = [
+        "797394737678-2026-05-26_1921-et-design-sync",
+        "797394737600-2026-05-26_2039-et-design-review",
+    ];
+    for folder in folders {
+        let session = storage.join(folder);
+        fs::create_dir_all(session.join(".recall/state")).unwrap();
+        fs::write(
+            session.join(".recall/metadata.json"),
+            r#"{"created_at_unix": 1, "title": "Design", "consent": {"mode": "noted"}}"#,
+        )
+        .unwrap();
+        // An unfinished take makes resume stop before the TUI, after the lookup.
+        fs::write(
+            session.join(".recall/state/capture.json"),
+            r#"{"take_count": 1, "completed_take": 0, "elapsed_ms": 1000}"#,
+        )
+        .unwrap();
+    }
+    let resume = |target: &str| {
+        let output = recall()
+            .arg("--storage")
+            .arg(&storage)
+            .arg("--resume")
+            .arg(target)
+            .output()
+            .expect("failed to run recall --resume by partial name");
+        assert!(!output.status.success(), "{}", output_text(&output));
+        output_text(&output)
+    };
+
+    for target in ["2026-05-26_1921-et-design-sync", "design-sync", "review"] {
+        let text = resume(target);
+        assert!(text.contains("unfinished take"), "{target}: {text}");
+    }
+    let text = resume("design");
+    assert!(text.contains("matches 2 Recall sessions"), "{text}");
+    assert!(text.contains("2026-05-26_1921-et-design-sync"), "{text}");
+    assert!(text.contains("2026-05-26_2039-et-design-review"), "{text}");
+    let _ = fs::remove_dir_all(storage);
+}
+
+#[test]
 fn resume_refuses_an_unfinished_take_from_the_cli() {
     let storage = unique_storage("unfinished");
     let session = storage.join("2026-05-26_1921-et-unfinished");
