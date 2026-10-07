@@ -12,6 +12,7 @@ what each command does and what going back does not undo.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -60,6 +61,8 @@ def installed_version() -> str | None:
 
 def commands(root: Path, entry: dict[str, str]) -> str:
     short = entry["commit"][:7]
+    # Quoted, so a checkout path with a space still pastes as one argument.
+    root = shlex.quote(str(root))
     return f"""To go back to {entry['version']} on this Mac:
 
     cd {root}
