@@ -131,6 +131,41 @@ fn resume_finds_a_session_by_part_of_its_name_and_reports_ambiguity() {
 }
 
 #[test]
+fn export_finds_a_session_by_part_of_its_name() {
+    let storage = unique_storage("export-by-name");
+    let folder = "797394737678-2026-05-26_1921-et-design-sync";
+    let session = storage.join(folder);
+    fs::create_dir_all(session.join(".recall")).unwrap();
+    fs::write(
+        session.join(".recall/metadata.json"),
+        r#"{"created_at_unix": 1, "title": "Design"}"#,
+    )
+    .unwrap();
+    let export = |target: &str| {
+        let output = recall()
+            .args(["export", target, "--storage"])
+            .arg(&storage)
+            .output()
+            .expect("failed to run recall export by name");
+        assert!(!output.status.success(), "{}", output_text(&output));
+        output_text(&output)
+    };
+
+    // No meeting document yet, so export stops after the lookup and names the folder it found.
+    for target in ["2026-05-26_1921-et-design-sync", "design-sync"] {
+        let text = export(target);
+        assert!(
+            text.contains("Missing meeting document"),
+            "{target}: {text}"
+        );
+        assert!(text.contains(folder), "{target}: {text}");
+    }
+    let text = export("standup");
+    assert!(text.contains("No Recall session matching"), "{text}");
+    let _ = fs::remove_dir_all(storage);
+}
+
+#[test]
 fn resume_refuses_an_unfinished_take_from_the_cli() {
     let storage = unique_storage("unfinished");
     let session = storage.join("2026-05-26_1921-et-unfinished");

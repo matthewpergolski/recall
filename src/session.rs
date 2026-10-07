@@ -723,6 +723,21 @@ pub fn resolve_session_target(storage_dir: &Path, target: &str) -> io::Result<Pa
     }
 }
 
+/// A command's session argument. An existing path is used as given; anything
+/// else is looked up by name in storage, the way `--resume` does.
+pub fn session_from_arg(storage_dir: Option<&Path>, target: &Path) -> io::Result<PathBuf> {
+    if target.exists() {
+        return Ok(target.to_path_buf());
+    }
+    let Some(name) = target.to_str() else {
+        return Ok(target.to_path_buf());
+    };
+    match storage_dir {
+        Some(storage_dir) => resolve_session_target(storage_dir, name),
+        None => resolve_session_target(&default_storage_dir()?, name),
+    }
+}
+
 const AMBIGUOUS_SESSIONS_SHOWN: usize = 5;
 
 /// Sessions a partial name could mean, newest first. A folder whose name
@@ -1142,8 +1157,9 @@ mod tests {
         editor_invocation, escape_json, export_session, faded_text, format_session_note_bullet,
         linkify_note_caption, list_sessions, mark_transcript_ready, next_note_image_relative_path,
         pasted_image_path, read_session_consent, readable_session_stamp_for,
-        resolve_session_target, resolve_timezone, resume_hint, session_entries, short_session_id,
-        slugify, start_session, zone_token, ConsentMode, StartOptions, FALLBACK_TIMEZONE,
+        resolve_session_target, resolve_timezone, resume_hint, session_entries, session_from_arg,
+        short_session_id, slugify, start_session, zone_token, ConsentMode, StartOptions,
+        FALLBACK_TIMEZONE,
     };
     use jiff::{civil::date, tz::TimeZone};
     use std::fs;
@@ -1573,6 +1589,30 @@ mod tests {
             .to_string()
             .contains("No Recall session matching"));
         assert!(resolve("nested/lunch")
+            .unwrap_err()
+            .to_string()
+            .contains("No Recall session matching"));
+
+        let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn a_session_argument_is_a_path_when_it_exists_and_a_name_otherwise() {
+        let lunch = "797394730000-2026-05-27_1200-et-lunch";
+        let storage_dir = storage_with_sessions("session-arg", &[lunch]);
+        let session = storage_dir.join(lunch);
+
+        // An existing path is returned untouched, session folder or not.
+        assert_eq!(session_from_arg(None, &session).unwrap(), session);
+        assert_eq!(
+            session_from_arg(Some(&storage_dir), &storage_dir).unwrap(),
+            storage_dir
+        );
+        assert_eq!(
+            session_from_arg(Some(&storage_dir), Path::new("lunch")).unwrap(),
+            session
+        );
+        assert!(session_from_arg(Some(&storage_dir), Path::new("dinner"))
             .unwrap_err()
             .to_string()
             .contains("No Recall session matching"));

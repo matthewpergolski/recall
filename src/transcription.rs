@@ -16,7 +16,7 @@ use crate::audio::{
 };
 use crate::session::{
     default_storage_dir, list_sessions, mark_transcript_ready, read_session_title,
-    transcription_dir, transcription_work_dir,
+    session_from_arg, transcription_dir, transcription_work_dir,
 };
 
 pub const TRANSCRIPTION_CHUNK_SECONDS: u64 = 600;
@@ -344,7 +344,8 @@ impl AsrEngine {
 
     fn transcribe_chunk(&self, wav: &Path, output_base: &Path) -> io::Result<()> {
         match self {
-            Self::Apple { helper } => run_apple_transcribe(helper, wav, output_base),
+            Self::Apple { helper } => run_apple_transcribe(helper, wav, output_base)
+                .map_err(|error| io::Error::other(AppleTranscribeFailed(error.to_string()))),
             Self::Whisper { bin, model, .. } => run_whisper(bin, model, wav, output_base),
             Self::Parakeet {
                 bin,
@@ -427,6 +428,52 @@ pub fn transcribe_with_progress<F>(
 where
     F: FnMut(TranscriptionProgress),
 {
+    // Resolve once, so a retry cannot pick up a newer `latest` session.
+    let options = &TranscribeOptions {
+        target: TranscribeTarget::Session(resolve_session_path(options)?),
+        ..options.clone()
+    };
+    match transcribe_with_engine(options, None, &mut progress) {
+        // The default engine passed its readiness check and then failed on
+        // real audio. Run again on the fallback instead of losing the transcript.
+        Err(error) if apple_failure_can_fall_back(options, &error) => {
+            let reason = apple_fallback_reason(&format!("It failed while transcribing: {error}"));
+            match resolve_parakeet_engine(options, Some(reason)) {
+                Ok(fallback) => transcribe_with_engine(options, Some(fallback), &mut progress),
+                Err(_) => Err(error),
+            }
+        }
+        result => result,
+    }
+}
+
+/// An Apple engine failure while transcribing, as opposed to at the readiness check.
+#[derive(Debug)]
+struct AppleTranscribeFailed(String);
+
+impl std::fmt::Display for AppleTranscribeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AppleTranscribeFailed {}
+
+fn apple_failure_can_fall_back(options: &TranscribeOptions, error: &io::Error) -> bool {
+    !options.require_apple
+        && error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<AppleTranscribeFailed>())
+}
+
+fn transcribe_with_engine<F>(
+    options: &TranscribeOptions,
+    forced_engine: Option<AsrEngine>,
+    progress: &mut F,
+) -> io::Result<TranscribeResult>
+where
+    F: FnMut(TranscriptionProgress),
+{
     let started = Instant::now();
     let mut stages: Vec<(String, Duration)> = Vec::new();
     let mut stage_started = started;
@@ -446,7 +493,10 @@ where
         return Ok(stale_transcribe_result(&session_path));
     }
     let ffmpeg = resolve_ffmpeg_binary(options)?;
-    let engine = resolve_asr_engine(options)?;
+    let engine = match forced_engine {
+        Some(engine) => engine,
+        None => resolve_asr_engine(options)?,
+    };
     let title = read_session_title(&session_path)?;
     let work_dir = transcription_work_dir(&session_path);
     fs::create_dir_all(&work_dir)?;
@@ -769,7 +819,7 @@ fn refresh_published_aliases(session_path: &Path, tracks: &[TrackResult]) -> io:
 
 fn resolve_session_path(options: &TranscribeOptions) -> io::Result<PathBuf> {
     match &options.target {
-        TranscribeTarget::Session(path) => Ok(path.clone()),
+        TranscribeTarget::Session(path) => session_from_arg(options.storage_dir.as_deref(), path),
         TranscribeTarget::Latest => {
             let storage_dir = match &options.storage_dir {
                 Some(path) => path.clone(),
@@ -963,6 +1013,8 @@ struct AppleTranscribeStatus {
     locale: Option<String>,
     #[serde(rename = "installedLocales", default)]
     installed_locales: Vec<String>,
+    #[serde(rename = "installRequestPending", default)]
+    install_request_pending: Option<bool>,
     message: Option<String>,
 }
 
@@ -976,6 +1028,9 @@ pub struct AppleSpeechDoctorStatus {
     pub available: bool,
     pub locale: Option<String>,
     pub installed_locales: Vec<String>,
+    /// Whether macOS reports a speech-asset install request for the locale.
+    /// `None` when the helper could not tell.
+    pub install_request_pending: Option<bool>,
     pub message: Option<String>,
     pub helper_path: Option<PathBuf>,
 }
@@ -987,6 +1042,7 @@ pub fn probe_apple_speech_status() -> AppleSpeechDoctorStatus {
                 available: status.available,
                 locale: status.locale,
                 installed_locales: status.installed_locales,
+                install_request_pending: status.install_request_pending,
                 message: status.message,
                 helper_path: Some(helper),
             },
@@ -994,6 +1050,7 @@ pub fn probe_apple_speech_status() -> AppleSpeechDoctorStatus {
                 available: false,
                 locale: None,
                 installed_locales: Vec::new(),
+                install_request_pending: None,
                 message: Some(error.to_string()),
                 helper_path: Some(helper),
             },
@@ -1002,6 +1059,7 @@ pub fn probe_apple_speech_status() -> AppleSpeechDoctorStatus {
             available: false,
             locale: None,
             installed_locales: Vec::new(),
+            install_request_pending: None,
             message: Some(format!(
                 "Missing recall-capture helper for Apple SpeechAnalyzer. {APPLE_SPEECH_HINT}"
             )),
@@ -2642,6 +2700,59 @@ mod tests {
     };
     use std::path::Path;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_default_run_falls_back_when_apple_fails_on_audio() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("recall-apple-chunk-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Stands in for the helper: passes nothing back and exits non-zero.
+        let helper = dir.join("recall-capture");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\necho 'speech assets unusable' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let engine = super::AsrEngine::Apple { helper };
+        let error = engine
+            .transcribe_chunk(&dir.join("chunk.wav"), &dir.join("out/chunk"))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "speech assets unusable");
+
+        let mut options = super::TranscribeOptions {
+            target: super::TranscribeTarget::Latest,
+            track: TrackSelection::Both,
+            storage_dir: None,
+            engine: TranscriptionEngine::Apple,
+            ffmpeg_bin: None,
+            model_path: None,
+            whisper_bin: None,
+            parakeet_bin: None,
+            parakeet_model: None,
+            parakeet_cache_dir: None,
+            chunk_seconds: 600,
+            keep_wav: false,
+            require_parakeet: false,
+            require_apple: false,
+            generation: None,
+            keep_audio: true,
+        };
+        assert!(super::apple_failure_can_fall_back(&options, &error));
+        // `--engine apple` asked for Apple and nothing else.
+        options.require_apple = true;
+        assert!(!super::apple_failure_can_fall_back(&options, &error));
+        // Other failures, such as a missing ffmpeg, are not a reason to switch engines.
+        options.require_apple = false;
+        let unrelated = std::io::Error::other("ffmpeg failed");
+        assert!(!super::apple_failure_can_fall_back(&options, &unrelated));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn apple_fallback_note_reports_the_helper_reason() {

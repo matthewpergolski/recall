@@ -144,7 +144,7 @@ export RECALL_WHISPER_MODEL="$PWD/models/ggml-base.en.bin"
 
 The model can come from Hugging Face. The `whisper-cli` and `ffmpeg` binaries should come from source builds, release artifacts, or internal binaries approved by your organization.
 
-Default Apple SpeechAnalyzer uses the on-device macOS speech model. If SpeechAnalyzer is unavailable, Recall falls back to Parakeet unless you passed `--engine apple`. Parakeet install (does not happen during `recall update`):
+Default Apple SpeechAnalyzer uses the on-device macOS speech model. If SpeechAnalyzer is unavailable, or fails while transcribing, Recall falls back to Parakeet unless you passed `--engine apple`. The fallback note gives the reason. Parakeet install (does not happen during `recall update`):
 
 ```sh
 uv tool install parakeet-mlx
@@ -175,7 +175,7 @@ recall --title "Project sync"
 
 When you press Enter to end a recording, Recall finalizes audio and starts local transcription automatically. The TUI shows transcript progress and the output path when ready. The header `next:` indicator (toggle with `s`, like consent) chooses what the next Enter does after ENDED: append another take in this folder, or start a new session.
 
-Quitting (`q` / Ctrl+C) leaves transcription and analysis running in the background, then prints a copy-paste resume command. Plain `recall` starts a new session; `recall --resume` reopens the latest folder, and `recall --resume <session-id>` reopens that meeting so Enter can append another take. The session id can be the folder name, the name without its leading 12-digit key, or any part of the name that matches one session.
+Quitting (`q` / Ctrl+C) leaves transcription and analysis running in the background, then prints a copy-paste resume command. Plain `recall` starts a new session; `recall --resume` reopens the latest folder, and `recall --resume <session-id>` reopens that meeting so Enter can append another take. The session id can be the folder name, the name without its leading 12-digit key, or any part of the name that matches one session. `recall transcribe`, `analyze`, `open`, and `export` take the same ids in place of `latest`.
 
 ```sh
 recall --resume

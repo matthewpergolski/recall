@@ -6,6 +6,7 @@ Current command:
 
 ```sh
 recall transcribe latest
+recall transcribe design-sync
 recall transcribe latest --track call
 recall transcribe latest --track mic
 recall transcribe /path/to/session --track both
@@ -43,7 +44,7 @@ The clean conversation timeline is not full speaker diarization. It starts from 
 
 ## Multi-Hour Calls
 
-Recall chunks each audio track with `ffmpeg` before sending it to the selected ASR engine. The default engine on Apple Silicon macOS 26+ is Apple SpeechAnalyzer. `--engine parakeet` uses `parakeet-mlx`. `--engine whisper` uses `whisper-cli`. The default chunk size is 600 seconds, or 10 minutes. If Apple is the default and SpeechAnalyzer is unavailable, Recall falls back to Parakeet. Passing `--engine apple` or config `engine = "apple"` errors instead of falling back.
+Recall chunks each audio track with `ffmpeg` before sending it to the selected ASR engine. The default engine on Apple Silicon macOS 26+ is Apple SpeechAnalyzer. `--engine parakeet` uses `parakeet-mlx`. `--engine whisper` uses `whisper-cli`. The default chunk size is 600 seconds, or 10 minutes. If Apple is the default and SpeechAnalyzer is unavailable, Recall falls back to Parakeet. If SpeechAnalyzer passes its check and then fails on the audio, Recall runs the transcription again on the fallback. The fallback note gives the reason in both cases. Passing `--engine apple` or config `engine = "apple"` errors instead of falling back.
 
 That means a 2-hour call with both `call.m4a` and `mic.m4a` becomes roughly:
 
@@ -139,7 +140,7 @@ recall transcribe latest --engine parakeet
 recall transcribe latest --engine whisper
 ```
 
-`--engine whisper` and `--engine parakeet` are always valid. Apple SpeechAnalyzer needs macOS 26+ and an on-device speech model already installed; Recall does not auto-download Apple speech assets or use cloud recognition. The Parakeet path needs `parakeet-mlx` on PATH (or `RECALL_PARAKEET_BIN`) and may download `mlx-community/parakeet-tdt-0.6b-v3` on first Parakeet run. `recall update` does not install that CLI. Parakeet weights are NVIDIA **CC-BY-4.0**; credit NVIDIA / the model in user-facing docs only when that engine ran. The `parakeet-mlx` runtime is Apache-2.0. Do not commit model weights.
+`--engine whisper` and `--engine parakeet` are always valid. Apple SpeechAnalyzer needs macOS 26+ and an on-device speech model already installed; Recall does not auto-download Apple speech assets or use cloud recognition. `recall doctor` lists the installed locales and says whether macOS reports a pending install request. A pending request for a locale that is already installed does not block Apple Speech. The Parakeet path needs `parakeet-mlx` on PATH (or `RECALL_PARAKEET_BIN`) and may download `mlx-community/parakeet-tdt-0.6b-v3` on first Parakeet run. `recall update` does not install that CLI. Parakeet weights are NVIDIA **CC-BY-4.0**; credit NVIDIA / the model in user-facing docs only when that engine ran. The `parakeet-mlx` runtime is Apache-2.0. Do not commit model weights.
 
 If the Parakeet binary is missing, the error includes an install hint. Whisper still works with `--engine whisper`.
 
