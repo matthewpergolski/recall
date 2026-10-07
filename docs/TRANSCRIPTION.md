@@ -42,6 +42,20 @@ The debug files include:
 
 The clean conversation timeline is not full speaker diarization. It starts from the combined timestamped segments, suppresses likely duplicate mic segments, and trims obvious call-audio phrases from mixed mic segments. The raw combined timeline is kept in `.recall/transcription/` for audit/debugging. Dedupe thresholds were tuned on Whisper segment sizes; Parakeet sentence cues can be longer or shorter, so speaker-bleed output should be checked on a real dual-track call.
 
+## One Timeline for Both Tracks
+
+The microphone and the call audio are recorded by two recorders that start a moment apart, and a track can roll into a new part when the microphone changes format in a call. While recording, each recorder writes the start time of each audio part, on the Mac's own clock, to `.recall/timeline/<file>.json`. The record holds times only, no audio.
+
+At transcription, Recall places each part at its start time:
+
+- Each track is shifted so that both count from the take's first sample.
+- Time lost between two parts of a track is kept as silence in the work copy. The files in `audio/` are not changed.
+- A session with several takes gives each take its own base; takes follow one another.
+
+A time in `transcript.md` then means the same moment on both tracks, so lines are in true order and the bleed rules compare the right lines.
+
+Recall joins the parts back to back, as older versions did, when the start times cannot be used: a session recorded before this existed, the ScreenCaptureKit fallback recorder, a part with no record, or a start time that cannot be right. `.recall/transcription/full-debug-transcript.md` has a `## Timeline` paragraph that says which happened, how much silence was kept, and how many mic lines the bleed rules suppressed with and without the placement.
+
 ## Multi-Hour Calls
 
 Recall chunks each audio track with `ffmpeg` before sending it to the selected ASR engine. The default engine on Apple Silicon macOS 26+ is Apple SpeechAnalyzer. `--engine parakeet` uses `parakeet-mlx`. `--engine whisper` uses `whisper-cli`. The default chunk size is 600 seconds, or 10 minutes. If Apple is the default and SpeechAnalyzer is unavailable, Recall falls back to Parakeet. If SpeechAnalyzer passes its check and then fails on the audio, Recall runs the transcription again on the fallback. The fallback note gives the reason in both cases. Passing `--engine apple` or config `engine = "apple"` errors instead of falling back.

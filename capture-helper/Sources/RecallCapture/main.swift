@@ -988,11 +988,15 @@ final class MicTapRecorder: @unchecked Sendable {
     private var writeError: Error?
     private var muted = false
     private var currentInputDevice: DefaultInputDevice?
+    private var bufferClock = BufferClock()
     private let liveFeed: LiveTranscriptFeed?
 
     init(outputURL: URL, muteFile: URL?, liveTranscript: Bool) {
         self.outputURL = outputURL
         self.archive = MicArchive(outputURL: outputURL)
+        self.archive.onPartStarted = { partURL, hostTimeNs in
+            PartTimeline.record(audioURL: partURL, source: "mic", hostTimeNs: hostTimeNs)
+        }
         self.muteFile = muteFile
         self.liveFeed = liveTranscript
             ? LiveTranscriptFeed(source: "mic", startedAt: startedAt)
@@ -1152,6 +1156,7 @@ final class MicTapRecorder: @unchecked Sendable {
                                                copiedBuffer: copiedBuffer, muted: muted,
                                                elapsed: Date().timeIntervalSince(startedAt))
         let queuedAt = ProcessInfo.processInfo.systemUptime
+        let hostTimeNs = PartTimeline.hostTimeNs(inputTime)
         guard let buffer = copiedBuffer else {
             if let diagnostic {
                 writerQueue.async { diagnostic.log(writerDelay: ProcessInfo.processInfo.systemUptime - queuedAt, fileFrames: nil) }
@@ -1162,13 +1167,24 @@ final class MicTapRecorder: @unchecked Sendable {
         writerQueue.async { [weak self] in
             guard let self else { return }
             do {
+                if let lostNs = self.bufferClock.advance(
+                    hostTimeNs: hostTimeNs, frames: buffer.frameLength,
+                    sampleRate: buffer.format.sampleRate)
+                {
+                    // Time was lost with no format change. A new part gets its
+                    // own start time, so the gap is kept at transcription.
+                    logMic(String(
+                        format: "clock jumped %.0f ms at %.1fs; starting a new part",
+                        Double(lostNs) / 1_000_000, Date().timeIntervalSince(self.startedAt)))
+                    self.archive.rollIfStarted()
+                }
                 if muted {
                     if let silent = silentBuffer(matching: buffer) {
-                        try self.archive.write(silent)
+                        try self.archive.write(silent, hostTimeNs: hostTimeNs)
                     }
                     self.maybeEmitLevel(Self.mutedLevelDb, device: device)
                 } else {
-                    try self.archive.write(buffer)
+                    try self.archive.write(buffer, hostTimeNs: hostTimeNs)
                     self.maybeEmitLevel(level ?? Self.mutedLevelDb, device: device)
                     if self.liveFeed != nil, let speech = MicPCM.speechBuffer(buffer) {
                         self.liveFeed?.enqueue(speech)
@@ -1255,6 +1271,8 @@ final class CoreAudioTapRecorder: @unchecked Sendable {
     private var audioFile: AVAudioFile?
     private var lastLevelEventAt = Date.distantPast
     private var writeError: Error?
+    private var startRecorded = false
+    private var bufferClock = BufferClock()
     private let liveFeed: LiveTranscriptFeed?
 
     init(outputURL: URL, liveTranscript: Bool) throws {
@@ -1405,17 +1423,37 @@ final class CoreAudioTapRecorder: @unchecked Sendable {
         }
     }
 
-    fileprivate func handleInput(_ inputData: UnsafePointer<AudioBufferList>?) -> OSStatus {
+    fileprivate func handleInput(
+        _ inputData: UnsafePointer<AudioBufferList>?,
+        inputTime: UnsafePointer<AudioTimeStamp>?
+    ) -> OSStatus {
         guard let inputData,
               let inputFormat,
               let buffer = makePCMBuffer(from: inputData, format: inputFormat)
         else {
             return noErr
         }
+        let hostTimeNs = PartTimeline.hostTimeNs(inputTime)
 
         writerQueue.async {
             do {
-                try self.audioFile?.write(from: buffer)
+                if let lostNs = self.bufferClock.advance(
+                    hostTimeNs: hostTimeNs, frames: buffer.frameLength,
+                    sampleRate: buffer.format.sampleRate)
+                {
+                    // Logged only: the call track is one file and is not split.
+                    fputs(String(
+                        format: "call: clock jumped %.0f ms at %.1fs\n",
+                        Double(lostNs) / 1_000_000, Date().timeIntervalSince(self.startedAt)), stderr)
+                }
+                if let audioFile = self.audioFile {
+                    if !self.startRecorded {
+                        self.startRecorded = true
+                        PartTimeline.record(
+                            audioURL: self.outputURL, source: "call", hostTimeNs: hostTimeNs)
+                    }
+                    try audioFile.write(from: buffer)
+                }
                 self.maybeEmitLevel(buffer)
             } catch {
                 self.writeError = error
@@ -1489,7 +1527,7 @@ final class CoreAudioTapRecorder: @unchecked Sendable {
 
 @available(macOS 14.2, *)
 private let coreAudioTapIOProc: AudioDeviceIOProc = {
-    _, _, inputData, _, _, _, clientData in
+    _, _, inputData, inputTime, _, _, clientData in
     guard let clientData else {
         return noErr
     }
@@ -1497,7 +1535,7 @@ private let coreAudioTapIOProc: AudioDeviceIOProc = {
     let recorder = Unmanaged<CoreAudioTapRecorder>
         .fromOpaque(clientData)
         .takeUnretainedValue()
-    return recorder.handleInput(inputData)
+    return recorder.handleInput(inputData, inputTime: inputTime)
 }
 
 private let micHALIOProc: AudioDeviceIOProc = {

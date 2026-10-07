@@ -551,8 +551,75 @@ fn audio_segment_is_readable(ffmpeg: &Path, path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub fn concat_audio_segments(ffmpeg: &Path, segments: &[PathBuf], output: &Path) -> io::Result<()> {
+/// Length of an audio file in milliseconds, as its container states it.
+pub fn audio_duration_ms(ffmpeg: &Path, path: &Path) -> Option<u64> {
+    let output = Command::new(ffmpeg)
+        .args(["-nostdin", "-hide_banner", "-i"])
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    parse_ffmpeg_duration_ms(&String::from_utf8_lossy(&output.stderr))
+}
+
+/// Reads `Duration: 00:05:13.40, start: ...` from ffmpeg's description of a file.
+fn parse_ffmpeg_duration_ms(description: &str) -> Option<u64> {
+    let stamp = description.split("Duration: ").nth(1)?.split(',').next()?;
+    let mut fields = stamp.trim().split(':');
+    let hours: u64 = fields.next()?.parse().ok()?;
+    let minutes: u64 = fields.next()?.parse().ok()?;
+    let seconds: f64 = fields.next()?.parse().ok()?;
+    Some(hours * 3_600_000 + minutes * 60_000 + (seconds * 1000.0).round() as u64)
+}
+
+/// The longest silence written as one file. Longer gaps repeat this block.
+const SILENCE_BLOCK_MS: u64 = 60_000;
+
+/// Silence in the format the parts are normalized to: mono 48 kHz float.
+/// `duration_ms` is at most one block, so the sizes fit a WAV header.
+fn write_silence_wav(path: &Path, duration_ms: u64) -> io::Result<()> {
+    const SAMPLE_RATE: u32 = 48_000;
+    const BYTES_PER_FRAME: u32 = 4;
+    let data_len = (duration_ms * u64::from(SAMPLE_RATE) / 1000) as u32 * BYTES_PER_FRAME;
+    let mut file = io::BufWriter::new(fs::File::create(path)?);
+    file.write_all(b"RIFF")?;
+    file.write_all(&(36 + data_len).to_le_bytes())?;
+    file.write_all(b"WAVEfmt ")?;
+    file.write_all(&16u32.to_le_bytes())?;
+    file.write_all(&3u16.to_le_bytes())?; // IEEE float
+    file.write_all(&1u16.to_le_bytes())?; // mono
+    file.write_all(&SAMPLE_RATE.to_le_bytes())?;
+    file.write_all(&(SAMPLE_RATE * BYTES_PER_FRAME).to_le_bytes())?;
+    file.write_all(&(BYTES_PER_FRAME as u16).to_le_bytes())?;
+    file.write_all(&32u16.to_le_bytes())?;
+    file.write_all(b"data")?;
+    file.write_all(&data_len.to_le_bytes())?;
+    let zeros = [0u8; 8192];
+    let mut left = data_len as usize;
+    while left > 0 {
+        let count = left.min(zeros.len());
+        file.write_all(&zeros[..count])?;
+        left -= count;
+    }
+    file.flush()
+}
+
+/// Joins the readable parts in order. `gaps_ms[i]` is the silence that belongs
+/// before the readable part `i + 1`: time the recorder lost between two parts.
+/// Gaps that do not number one fewer than the readable parts are ignored.
+pub fn concat_audio_segments_with_gaps(
+    ffmpeg: &Path,
+    segments: &[PathBuf],
+    gaps_ms: &[u64],
+    output: &Path,
+) -> io::Result<()> {
     let segments = usable_audio_segments(ffmpeg, segments);
+    let gaps_ms = if gaps_ms.len() + 1 == segments.len() {
+        gaps_ms
+    } else {
+        &[]
+    };
     if segments.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -597,6 +664,27 @@ pub fn concat_audio_segments(ffmpeg: &Path, segments: &[PathBuf], output: &Path)
                     "ffmpeg failed to normalize {}",
                     segment.display()
                 )));
+            }
+            let gap_ms = index
+                .checked_sub(1)
+                .and_then(|before| gaps_ms.get(before))
+                .copied()
+                .unwrap_or(0);
+            // A long gap is one short block listed many times, so a track that
+            // sat out a whole take costs seconds of disk, not hours.
+            let blocks = gap_ms / SILENCE_BLOCK_MS;
+            if blocks > 0 {
+                let block = work.join("silence-block.wav");
+                if !block.exists() {
+                    write_silence_wav(&block, SILENCE_BLOCK_MS)?;
+                }
+                normalized.extend((0..blocks).map(|_| block.clone()));
+            }
+            let rest_ms = gap_ms % SILENCE_BLOCK_MS;
+            if rest_ms > 0 {
+                let silence = work.join(format!("{index:05}-gap.wav"));
+                write_silence_wav(&silence, rest_ms)?;
+                normalized.push(silence);
             }
             normalized.push(path);
         }
@@ -725,7 +813,7 @@ fn discover_numbered_segments(
     segments
 }
 
-fn segment_take_index(path: &Path) -> Option<u32> {
+pub fn segment_take_index(path: &Path) -> Option<u32> {
     segment_ref(path).map(|segment| segment.take)
 }
 
@@ -1026,10 +1114,71 @@ mod tests {
         write_silent_m4a(&ffmpeg, &first, 1);
         write_silent_m4a(&ffmpeg, &second, 1);
         let output = session.join("mic-concat.m4a");
-        super::concat_audio_segments(&ffmpeg, &[first, second], &output).unwrap();
+        super::concat_audio_segments_with_gaps(&ffmpeg, &[first, second], &[], &output).unwrap();
         assert!(output.exists());
         assert!(fs::metadata(&output).unwrap().len() > 0);
         let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn concat_keeps_a_gap_between_two_parts_as_silence() {
+        let Some(ffmpeg) = find_ffmpeg() else {
+            return;
+        };
+        let session = unique_session_dir("concat-gap");
+        let audio = session.join("audio");
+        fs::create_dir_all(&audio).unwrap();
+        let first = audio.join("mic-001.m4a");
+        let second = audio.join("mic-001-part-02.m4a");
+        write_silent_m4a(&ffmpeg, &first, 1);
+        write_silent_m4a(&ffmpeg, &second, 1);
+        let parts = [first, second];
+        let duration = |gaps: &[u64]| {
+            let output = session.join(format!("joined-{}.m4a", gaps.len()));
+            super::concat_audio_segments_with_gaps(&ffmpeg, &parts, gaps, &output).unwrap();
+            super::audio_duration_ms(&ffmpeg, &output).unwrap()
+        };
+
+        let back_to_back = duration(&[]);
+        let with_gap = duration(&[1_500]);
+        assert!(back_to_back.abs_diff(2_000) < 150, "{back_to_back}");
+        assert!(with_gap.abs_diff(back_to_back + 1_500) < 50, "{with_gap}");
+
+        // A gap longer than one block of silence keeps its full length.
+        let long = session.join("joined-long.m4a");
+        super::concat_audio_segments_with_gaps(&ffmpeg, &parts, &[125_000], &long).unwrap();
+        let long_ms = super::audio_duration_ms(&ffmpeg, &long).unwrap();
+        assert!(long_ms.abs_diff(back_to_back + 125_000) < 100, "{long_ms}");
+
+        // A part that cannot be read drops out; the gap between the two that
+        // remain is still kept.
+        let broken = audio.join("mic-001-part-03.m4a");
+        fs::write(&broken, vec![0u8; 256]).unwrap();
+        let with_broken = [parts[0].clone(), broken, parts[1].clone()];
+        let output = session.join("joined-broken.m4a");
+        super::concat_audio_segments_with_gaps(&ffmpeg, &with_broken, &[1_500], &output).unwrap();
+        let recovered = super::audio_duration_ms(&ffmpeg, &output).unwrap();
+        assert!(recovered.abs_diff(with_gap) < 50, "{recovered}");
+        let _ = fs::remove_dir_all(session);
+    }
+
+    #[test]
+    fn reads_a_duration_from_ffmpeg_and_nothing_from_a_stream_without_one() {
+        assert_eq!(
+            super::parse_ffmpeg_duration_ms(
+                "  Duration: 00:05:13.40, start: 0.000000, bitrate: 64 kb/s"
+            ),
+            Some(313_400)
+        );
+        assert_eq!(
+            super::parse_ffmpeg_duration_ms("  Duration: 01:00:00.05, bitrate"),
+            Some(3_600_050)
+        );
+        assert_eq!(
+            super::parse_ffmpeg_duration_ms("  Duration: N/A, bitrate: N/A"),
+            None
+        );
+        assert_eq!(super::parse_ffmpeg_duration_ms("no such file"), None);
     }
 
     #[test]
@@ -1061,7 +1210,7 @@ mod tests {
             assert!(status.success());
         }
         let joined = session.join("joined.m4a");
-        super::concat_audio_segments(&ffmpeg, &[first, second], &joined).unwrap();
+        super::concat_audio_segments_with_gaps(&ffmpeg, &[first, second], &[], &joined).unwrap();
         let decoded = std::process::Command::new(&ffmpeg)
             .args(["-v", "error", "-i"])
             .arg(&joined)

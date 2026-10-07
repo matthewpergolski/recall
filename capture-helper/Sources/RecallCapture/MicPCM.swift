@@ -98,6 +98,10 @@ final class MicArchive {
     private var file: AVAudioFile?
     private var format: AVAudioFormat?
     private var part = 1
+    private var currentURL: URL?
+    private var awaitingFirstBuffer = false
+    /// Called once for each part, with its file and the host time of its first buffer.
+    var onPartStarted: ((URL, UInt64?) -> Void)?
     var length: AVAudioFramePosition? { file?.length }
 
     init(outputURL: URL) {
@@ -135,11 +139,28 @@ final class MicArchive {
         file = try AVAudioFile(forWriting: path, settings: settings,
                               commonFormat: format.commonFormat, interleaved: format.isInterleaved)
         self.format = format
+        currentURL = path
+        awaitingFirstBuffer = true
     }
 
-    func write(_ buffer: AVAudioPCMBuffer) throws {
+    /// `hostTimeNs` is the host time of this buffer's first frame, when known.
+    func write(_ buffer: AVAudioPCMBuffer, hostTimeNs: UInt64? = nil) throws {
         try prepare(buffer.format)
+        if awaitingFirstBuffer, let currentURL {
+            // A part can be opened before its first buffer arrives; its start
+            // is the time of the audio, not the time the file was made.
+            awaitingFirstBuffer = false
+            onPartStarted?(currentURL, hostTimeNs)
+        }
         try file!.write(from: buffer)
+    }
+
+    /// Ends the current part, so the next buffer opens a new one with its own
+    /// start time. Does nothing for a part that has no audio yet.
+    func rollIfStarted() {
+        guard file != nil, !awaitingFirstBuffer else { return }
+        file = nil
+        part += 1
     }
 
     func finish() { file = nil }
