@@ -175,6 +175,11 @@ A quote found in exactly one other line moves the citation to that line. A follo
 
 The mark says where to look. It does not say the item is right. Recall checks that a time is on a line and that quoted words were said; it cannot tell whether the agent read the line correctly. An open question carries no quote, so only its time is checked. Recall never drops an item and never invents a time. A transcript with no timed lines is not checked, and the notes say so.
 
+What the agent is told about doubtful lines:
+
+- The list of mic lines left out for having no speech under them stays in `transcript.md` for a person to read. Recall cuts it from the copy the agent is sent, so a made-up line cannot become a decision or an action item.
+- The prompt warns that the conversation itself can still hold lines nobody said, with examples: a short stray mic line during silence or while a call connects, a long rambling mic line that fits nothing around it, and a mic line that repeats the call line beside it with odd words. The agent is told not to base an item on such a line alone, and to use the call line when the mic echoes it.
+
 `meeting.md` is the primary human-facing result. `transcript.md` is the clean source of truth and remains separate so long meetings do not make the meeting record unwieldy. Agents are instructed not to use `.recall/transcription/` unless explicitly asked.
 
 ## JSON Contract

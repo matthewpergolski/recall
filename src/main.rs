@@ -3,6 +3,7 @@ mod audio;
 mod capture_sources;
 mod citations;
 mod config;
+mod loudness;
 mod mic_recorder;
 mod session;
 mod system_recorder;

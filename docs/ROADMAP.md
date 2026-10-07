@@ -40,7 +40,7 @@ Implemented:
 
 Not implemented yet:
 
-- Fully tuned transcript dedupe across varied speaker-mode recordings
+- Bleed cleanup checked beyond one far voice: other rooms, speakers, and several far voices
 - Real-agent output validation and prompt tuning
 
 ## v0: Product Shell
