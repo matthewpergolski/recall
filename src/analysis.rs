@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::audio::{generation_is_current, lock_session_publish, session_folder_is_sticky};
+use crate::citations::{format_time, timed_lines, trace, Quote, Source, TranscriptLine};
 use crate::session::{
     analysis_dir, default_storage_dir, list_sessions, markers_path, metadata_path, notes_path,
     read_session_title, session_entries, session_from_arg,
@@ -89,6 +90,8 @@ struct Question {
 struct Followup {
     item: String,
     reason: Option<String>,
+    #[serde(default)]
+    timestamp: Option<String>,
 }
 
 pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
@@ -342,7 +345,7 @@ Use this schema:
   "decisions": [
     {{
       "decision": "What was decided",
-      "evidence": "Short transcript reference or quote",
+      "evidence": "Exact words copied from one transcript line",
       "timestamp": "00:12.300"
     }}
   ],
@@ -351,7 +354,7 @@ Use this schema:
       "task": "What needs to happen",
       "owner": "Name or unknown",
       "due": "Date or null",
-      "evidence": "Short transcript reference",
+      "evidence": "Exact words copied from one transcript line",
       "timestamp": "00:34.100"
     }}
   ],
@@ -365,12 +368,14 @@ Use this schema:
   "followups": [
     {{
       "item": "Follow-up item",
-      "reason": "Why it should be followed up"
+      "reason": "Why it should be followed up",
+      "timestamp": "02:10.000"
     }}
   ]
 }}
 
 If a field has no items, return an empty array. Use null when owner, due, evidence, or timestamp is unknown.
+For each timestamp, copy the start time of the transcript line that supports the item. For evidence, copy words exactly from that line. Do not paraphrase.
 If the transcript title is generic, such as Quick Capture, infer a specific useful title from the conversation.
 "#,
         transcript_path = transcript_path.display(),
@@ -773,17 +778,23 @@ fn meeting_markdown(
 ) -> io::Result<String> {
     let notes = session_entries(&notes_path(session_path))?;
     let markers = session_entries(&markers_path(session_path))?;
+    let mut sources = Sources::from_session(session_path);
+    let items = [
+        decisions_markdown(&result.decisions, &mut sources),
+        actions_markdown(&result.action_items, &mut sources),
+        questions_markdown(&result.questions, &mut sources),
+        followups_markdown(&result.followups, &mut sources),
+    ]
+    .concat();
     let mut markdown = format!(
-        "# {title}\n\n> Analysis generated from the [clean transcript](transcript.md).\n\n## Summary\n\n{}\n\n",
+        "# {title}\n\n> Analysis generated from the [clean transcript](transcript.md).{}\n\n## Summary\n\n{}\n\n",
+        sources.note(),
         result
             .summary
             .as_deref()
             .unwrap_or("_No summary returned._")
     );
-    markdown.push_str(&decisions_markdown(&result.decisions));
-    markdown.push_str(&actions_markdown(&result.action_items));
-    markdown.push_str(&questions_markdown(&result.questions));
-    markdown.push_str(&followups_markdown(&result.followups));
+    markdown.push_str(&items);
     markdown.push_str("## Notes and Markers\n\n");
     append_captured_entries(&mut markdown, "Notes", &notes);
     append_captured_entries(&mut markdown, "Markers", &markers);
@@ -803,7 +814,95 @@ fn append_captured_entries(markdown: &mut String, heading: &str, entries: &[Stri
     }
 }
 
-fn actions_markdown(items: &[ActionItem]) -> String {
+/// Looks each citation of the notes up in the transcript, and counts.
+struct Sources {
+    lines: Vec<TranscriptLine>,
+    cited: usize,
+    traced: usize,
+    quotes_missing: usize,
+}
+
+impl Sources {
+    fn from_session(session_path: &Path) -> Self {
+        let transcript = fs::read_to_string(session_path.join("transcript.md")).unwrap_or_default();
+        Self {
+            lines: timed_lines(&transcript),
+            cited: 0,
+            traced: 0,
+            quotes_missing: 0,
+        }
+    }
+
+    /// Says where an item came from. A `required` item with no time is marked;
+    /// an optional one, such as a follow-up, is left alone.
+    fn append(
+        &mut self,
+        markdown: &mut String,
+        timestamp: Option<&str>,
+        quote: Option<&str>,
+        required: bool,
+    ) {
+        if self.lines.is_empty() {
+            // Nothing to check against: show the time as the agent gave it.
+            let cites_a_time =
+                timestamp.is_some_and(|value| !value.trim().is_empty() && value != "null");
+            if required || cites_a_time {
+                self.cited += 1;
+            }
+            append_detail(markdown, "Timestamp", timestamp);
+            return;
+        }
+        match trace(&self.lines, timestamp, quote) {
+            Source::Traced {
+                start_ms,
+                speaker,
+                quote,
+            } => {
+                self.cited += 1;
+                self.traced += 1;
+                let time = format_time(start_ms);
+                if quote == Quote::Missing {
+                    self.quotes_missing += 1;
+                    markdown.push_str(&format!(" ({time}, {speaker}; quote not found there)"));
+                } else {
+                    markdown.push_str(&format!(" ({time}, {speaker})"));
+                }
+            }
+            Source::NotFound => {
+                self.cited += 1;
+                markdown.push_str(" (not found in transcript)");
+            }
+            Source::NoneGiven if required => {
+                self.cited += 1;
+                markdown.push_str(" (no source given)");
+            }
+            Source::NoneGiven => {}
+        }
+    }
+
+    /// One sentence for the top of the notes, or nothing when no item cites a source.
+    fn note(&self) -> String {
+        if self.cited == 0 {
+            String::new()
+        } else if self.lines.is_empty() {
+            " Sources not checked: the transcript has no timed lines.".to_string()
+        } else {
+            let verb = if self.traced == 1 { "cites" } else { "cite" };
+            let mut note = format!(
+                " {} of {} items {verb} a line of the transcript.",
+                self.traced, self.cited
+            );
+            match self.quotes_missing {
+                0 => {}
+                1 => note.push_str(" 1 quote was not found where cited."),
+                count => note.push_str(&format!(" {count} quotes were not found where cited.")),
+            }
+            note
+        }
+    }
+}
+
+fn actions_markdown(items: &[ActionItem], sources: &mut Sources) -> String {
     let mut markdown = "## Action Items\n\n".to_string();
     if items.is_empty() {
         markdown.push_str("_No action items identified._\n\n");
@@ -814,7 +913,12 @@ fn actions_markdown(items: &[ActionItem]) -> String {
         markdown.push_str(&format!("- [ ] {}", item.task));
         append_detail(&mut markdown, "Owner", item.owner.as_deref());
         append_detail(&mut markdown, "Due", item.due.as_deref());
-        append_detail(&mut markdown, "Timestamp", item.timestamp.as_deref());
+        sources.append(
+            &mut markdown,
+            item.timestamp.as_deref(),
+            item.evidence.as_deref(),
+            true,
+        );
         append_detail(&mut markdown, "Evidence", item.evidence.as_deref());
         markdown.push('\n');
     }
@@ -822,7 +926,7 @@ fn actions_markdown(items: &[ActionItem]) -> String {
     markdown
 }
 
-fn decisions_markdown(items: &[Decision]) -> String {
+fn decisions_markdown(items: &[Decision], sources: &mut Sources) -> String {
     let mut markdown = "## Decisions\n\n".to_string();
     if items.is_empty() {
         markdown.push_str("_No decisions identified._\n\n");
@@ -831,7 +935,12 @@ fn decisions_markdown(items: &[Decision]) -> String {
 
     for item in items {
         markdown.push_str(&format!("- {}", item.decision));
-        append_detail(&mut markdown, "Timestamp", item.timestamp.as_deref());
+        sources.append(
+            &mut markdown,
+            item.timestamp.as_deref(),
+            item.evidence.as_deref(),
+            true,
+        );
         append_detail(&mut markdown, "Evidence", item.evidence.as_deref());
         markdown.push('\n');
     }
@@ -839,7 +948,7 @@ fn decisions_markdown(items: &[Decision]) -> String {
     markdown
 }
 
-fn questions_markdown(items: &[Question]) -> String {
+fn questions_markdown(items: &[Question], sources: &mut Sources) -> String {
     let mut markdown = "## Open Questions\n\n".to_string();
     if items.is_empty() {
         markdown.push_str("_No open questions identified._\n\n");
@@ -848,7 +957,7 @@ fn questions_markdown(items: &[Question]) -> String {
 
     for item in items {
         markdown.push_str(&format!("- {}", item.question));
-        append_detail(&mut markdown, "Timestamp", item.timestamp.as_deref());
+        sources.append(&mut markdown, item.timestamp.as_deref(), None, true);
         append_detail(&mut markdown, "Context", item.context.as_deref());
         markdown.push('\n');
     }
@@ -856,7 +965,7 @@ fn questions_markdown(items: &[Question]) -> String {
     markdown
 }
 
-fn followups_markdown(items: &[Followup]) -> String {
+fn followups_markdown(items: &[Followup], sources: &mut Sources) -> String {
     let mut markdown = "## Follow-ups\n\n".to_string();
     if items.is_empty() {
         markdown.push_str("_No follow-ups identified._\n\n");
@@ -865,6 +974,7 @@ fn followups_markdown(items: &[Followup]) -> String {
 
     for item in items {
         markdown.push_str(&format!("- {}", item.item));
+        sources.append(&mut markdown, item.timestamp.as_deref(), None, false);
         append_detail(&mut markdown, "Reason", item.reason.as_deref());
         markdown.push('\n');
     }
@@ -887,7 +997,7 @@ mod tests {
     use super::{
         analysis_work_dir, extract_agent_result_json, known_agents,
         maybe_rename_session_dir_for_title, meeting_markdown, session_timestamp_prefix, title_slug,
-        write_analysis_markdown, ActionItem, AgentMeetingResult, Decision,
+        write_analysis_markdown, ActionItem, AgentMeetingResult, Decision, Followup, Question,
     };
     use crate::audio::{write_capture_progress, CaptureProgress};
     use std::fs;
@@ -1025,6 +1135,166 @@ mod tests {
         assert!(markdown.contains("Publish the checklist"));
         assert!(markdown.contains("Check the budget"));
         assert!(markdown.contains("[Transcript](transcript.md)"));
+
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    fn session_with_transcript(label: &str, transcript: &str) -> std::path::PathBuf {
+        let session_dir =
+            std::env::temp_dir().join(format!("recall-cited-notes-{label}-{}", std::process::id()));
+        fs::create_dir_all(session_dir.join(".recall")).unwrap();
+        fs::write(session_dir.join("transcript.md"), transcript).unwrap();
+        session_dir
+    }
+
+    #[test]
+    fn notes_trace_each_citation_to_the_transcript_and_mark_the_rest() {
+        let session_dir = session_with_transcript(
+            "checked",
+            "# Sync\n\n## Clean Conversation\n\n\
+- [00:02.400 - 00:04.260] **call:** Please bring the budget numbers with you.\n\
+- [01:10.000 - 01:14.500] **call:** We agreed to launch the beta on Friday morning.\n\
+- [01:20.000 - 01:22.000] **mic:** Who owns the release checklist?\n",
+        );
+        let result = AgentMeetingResult {
+            summary: Some("Launch plan.".to_string()),
+            decisions: vec![
+                Decision {
+                    decision: "Launch the beta Friday".to_string(),
+                    evidence: None,
+                    timestamp: Some("01:10.000".to_string()),
+                },
+                // The agent cites a time with no line; its quote picks the line.
+                Decision {
+                    decision: "Bring budget numbers".to_string(),
+                    evidence: Some("bring the budget numbers with you".to_string()),
+                    timestamp: Some("09:00.000".to_string()),
+                },
+                // A time with no line and a quote nobody said.
+                Decision {
+                    decision: "Hire three engineers".to_string(),
+                    evidence: Some("we will hire three more engineers".to_string()),
+                    timestamp: Some("12:00.000".to_string()),
+                },
+                // A time that lands on a real line, with a quote nobody said:
+                // an invented item with a plausible time.
+                Decision {
+                    decision: "Move the launch to June".to_string(),
+                    evidence: Some("we decided to move the launch to June".to_string()),
+                    timestamp: Some("01:20.000".to_string()),
+                },
+            ],
+            action_items: vec![ActionItem {
+                task: "Publish the checklist".to_string(),
+                owner: Some("Sam".to_string()),
+                due: None,
+                evidence: None,
+                timestamp: None,
+            }],
+            questions: vec![Question {
+                question: "Who owns the checklist?".to_string(),
+                context: None,
+                timestamp: Some("01:20".to_string()),
+            }],
+            followups: vec![
+                Followup {
+                    item: "Send the notes".to_string(),
+                    reason: None,
+                    timestamp: None,
+                },
+                Followup {
+                    item: "Confirm the date".to_string(),
+                    reason: None,
+                    timestamp: Some("01:11.000".to_string()),
+                },
+            ],
+            ..AgentMeetingResult::default()
+        };
+
+        let markdown = meeting_markdown(&session_dir, "Sync", &result).unwrap();
+        assert!(
+            markdown.contains("- Launch the beta Friday (01:10, call)\n"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- Bring budget numbers (00:02, call) (Evidence:"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- Hire three engineers (not found in transcript) (Evidence:"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- [ ] Publish the checklist (Owner: Sam) (no source given)\n"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- Who owns the checklist? (01:20, mic)\n"),
+            "{markdown}"
+        );
+        // A follow-up may have no source; one that cites a time is checked.
+        assert!(markdown.contains("- Send the notes\n"), "{markdown}");
+        assert!(
+            markdown.contains("- Confirm the date (01:10, call)\n"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "- Move the launch to June (01:20, mic; quote not found there) (Evidence:"
+            ),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "(transcript.md). 5 of 7 items cite a line of the transcript. 1 quote was not found where cited.\n"
+            ),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("Timestamp:"), "{markdown}");
+
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn notes_say_when_the_transcript_has_no_timed_lines() {
+        let session_dir =
+            session_with_transcript("unchecked", "# Sync\n\n## Microphone\n\nJust text.\n");
+        let result = AgentMeetingResult {
+            decisions: vec![Decision {
+                decision: "Launch Friday".to_string(),
+                evidence: None,
+                timestamp: Some("00:30".to_string()),
+            }],
+            ..AgentMeetingResult::default()
+        };
+
+        let markdown = meeting_markdown(&session_dir, "Sync", &result).unwrap();
+        assert!(
+            markdown.contains("- Launch Friday (Timestamp: 00:30)\n"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("Sources not checked: the transcript has no timed lines."),
+            "{markdown}"
+        );
+
+        // An agent given an untimed transcript returns no times at all.
+        let untimed = AgentMeetingResult {
+            action_items: vec![ActionItem {
+                task: "Publish the checklist".to_string(),
+                owner: None,
+                due: None,
+                evidence: None,
+                timestamp: None,
+            }],
+            ..AgentMeetingResult::default()
+        };
+        let markdown = meeting_markdown(&session_dir, "Sync", &untimed).unwrap();
+        assert!(markdown.contains("Sources not checked"), "{markdown}");
+
+        let empty = meeting_markdown(&session_dir, "Sync", &AgentMeetingResult::default()).unwrap();
+        assert!(!empty.contains("Sources not checked"), "{empty}");
+        assert!(!empty.contains("traced to the transcript"), "{empty}");
 
         let _ = fs::remove_dir_all(session_dir);
     }

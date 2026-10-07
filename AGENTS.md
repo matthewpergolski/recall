@@ -61,6 +61,7 @@ Read only the docs relevant to the task:
 - Transcription behavior and limits: `docs/TRANSCRIPTION.md`
 - Headless agent summaries/actions: `docs/AGENT_ANALYSIS.md`
 - Moving the repo or installed binary: `docs/PORTABILITY.md`
+- Going back to an earlier version: `docs/ROLLBACK.md` and `uv run scripts/versions.py`
 - First real-call validation: `docs/FIRST_SESSION_TEST.md`
 - Current roadmap: `docs/ROADMAP.md`
 

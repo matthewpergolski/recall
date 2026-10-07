@@ -73,7 +73,8 @@ Flow:
 3. Recall finalizes audio.
 4. Recall transcribes locally.
 5. Recall runs the selected agent.
-6. Recall writes `meeting.md` with the summary, decisions, actions, questions, follow-ups, notes, and markers.
+6. Recall checks each time the agent cited against the lines of `transcript.md`.
+7. Recall writes `meeting.md` with the summary, decisions, actions, questions, follow-ups, notes, and markers.
 
 If another recording starts before analysis finishes, the previous session keeps processing in the background. Agent results are written back to that session folder and do not retarget the active recording.
 
@@ -162,6 +163,17 @@ meeting.md
   agent-raw-output.json or agent-raw-output.jsonl
   agent-result.json
 ```
+
+Each decision, action item, and question in `meeting.md` says where it came from:
+
+- `(00:34, call)`: the cited time falls on that line of the transcript. If the agent also quoted words, they are in that line or the lines beside it. The time and speaker shown are the line's own.
+- `(00:34, call; quote not found there)`: the time falls on a line, but the words the agent quoted are not there, and no single other line holds them.
+- `(not found in transcript)`: the agent cited a time that no line holds, and its quote did not pick out exactly one line.
+- `(no source given)`: the agent cited no time.
+
+A quote found in exactly one other line moves the citation to that line. A follow-up may have no source; one that cites a time is checked the same way. The line under the title counts the result, for example "7 of 9 items cite a line of the transcript. 1 quote was not found where cited."
+
+The mark says where to look. It does not say the item is right. Recall checks that a time is on a line and that quoted words were said; it cannot tell whether the agent read the line correctly. An open question carries no quote, so only its time is checked. Recall never drops an item and never invents a time. A transcript with no timed lines is not checked, and the notes say so.
 
 `meeting.md` is the primary human-facing result. `transcript.md` is the clean source of truth and remains separate so long meetings do not make the meeting record unwieldy. Agents are instructed not to use `.recall/transcription/` unless explicitly asked.
 

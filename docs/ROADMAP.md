@@ -36,12 +36,12 @@ Implemented:
 - `recall update` with safe checkout discovery and fast-forward-only Git updates
 - continue the same TUI session after Enter with numbered audio takes and a full re-transcribe
 - relaunch resume with `recall --resume` / `recall --resume <session-id>` into the same folder
+- meeting notes that trace each decision, action item, and question to a transcript line, and mark the ones that do not
 
 Not implemented yet:
 
 - Fully tuned transcript dedupe across varied speaker-mode recordings
 - Real-agent output validation and prompt tuning
-- Traceability from generated action/decision files back to transcript timestamps
 
 ## v0: Product Shell
 
