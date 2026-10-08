@@ -39,11 +39,10 @@ use crate::capture_sources::{
 use crate::mic_recorder::{clear_mute_mic, set_mute_mic, stop_mic_path, MicRecorder};
 use crate::session::{
     append_session_marker, append_session_note, append_session_note_with_images,
-    copy_image_into_session, default_storage_dir, discard_unused_note_images,
+    copy_image_into_session, default_storage_dir, discard_unused_note_images, find_session_target,
     format_session_note_bullet, internal_dir, next_note_image_relative_path, open_path,
     pasted_image_path, primary_document_path, read_session_consent, read_session_title,
-    remove_empty_images_dir, resolve_session_target, resolve_timezone, start_session, ConsentMode,
-    StartOptions,
+    remove_empty_images_dir, resolve_timezone, start_session, ConsentMode, StartOptions,
 };
 use crate::system_recorder::{stop_system_path, SystemRecorder};
 use crate::transcription::{
@@ -141,6 +140,8 @@ impl Default for TuiOptions {
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedResume {
     path: PathBuf,
+    /// The place the session was found in, when it is not the current one.
+    found_in: Option<PathBuf>,
     title: String,
     consent_noted: bool,
     progress: CaptureProgress,
@@ -151,7 +152,8 @@ pub(crate) fn prepare_resume(
     target: &ResumeTarget,
     cli_consent_noted: bool,
 ) -> io::Result<PreparedResume> {
-    let path = resolve_session_target(storage_dir, target.lookup())?;
+    let found = find_session_target(storage_dir, target.lookup(), &crate::places::known_places())?;
+    let path = found.path;
     if let Some(reason) = resume_block_reason(&path) {
         return Err(io::Error::other(reason));
     }
@@ -168,6 +170,7 @@ pub(crate) fn prepare_resume(
     let stored_consent = read_session_consent(&path);
     Ok(PreparedResume {
         path: path.clone(),
+        found_in: found.elsewhere,
         title: read_session_title(&path).unwrap_or_else(|_| "Recall Session".to_string()),
         consent_noted: cli_consent_noted
             || stored_consent.is_some_and(|consent| !matches!(consent, ConsentMode::NotYet)),
@@ -1554,6 +1557,10 @@ impl App {
         if earlier_takes_are_transcript_only(&resume.path) {
             self.toast.push_str(" Earlier takes are transcript-only.");
         }
+        if let Some(place) = &resume.found_in {
+            self.toast
+                .push_str(&format!(" Found in {}.", place.display()));
+        }
         self.live_notes = vec![
             format!("Resumed {}", resume.path.display()),
             format!(
@@ -2267,6 +2274,10 @@ impl App {
             timezone: self.timezone.clone(),
         };
         let session = start_session(&options)?;
+        // On the list of places from the first moment, so another Recall can
+        // find this session while this one runs. Leaving the dashboard tries
+        // again and reports a failure there.
+        let _ = crate::places::try_remember(&options.storage_dir);
 
         self.session_path = Some(session.path.clone());
         self.started_at = Some(Instant::now());
@@ -5429,6 +5440,7 @@ mod tests {
         let mut app = test_app(PathBuf::from("/tmp/recall-resume-notes"));
         app.apply_resume(PreparedResume {
             path: PathBuf::from("/tmp/recall-resume-notes"),
+            found_in: None,
             title: "Grill supper".to_string(),
             consent_noted: true,
             progress: CaptureProgress {

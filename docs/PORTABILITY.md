@@ -159,6 +159,28 @@ Example stable storage config:
 storage_dir = "~/Documents/Recall/sessions"
 ```
 
+If iCloud syncs your Desktop and Documents folders, a sessions folder inside them is uploaded with everything else. `recall doctor` warns when a sessions folder is in such a place. Pick a folder outside them to keep recordings on this Mac only.
+
+## Every Place That Holds Sessions
+
+Recall keeps one list of every sessions folder it has used on this Mac:
+
+```text
+~/.config/recall/session-places.txt
+```
+
+It is one folder path per line. It holds no titles and no transcript text, and Recall never sends it anywhere. A folder is added when Recall creates a session in it, or when you run `recall list` or open Recall in a folder that already holds sessions. Folders under the system temp directory are never added.
+
+```sh
+recall list --all            # sessions in every folder, this folder first
+recall places                # each folder with its session count, or "missing"
+recall places forget <path>  # drop one folder from the list; deletes no session
+```
+
+`--resume <name>`, `recall open <name>`, and the other commands that take a session name look in the current folder first. When the name is not there, they look in the other folders and print where the session was found. `latest` always means the current folder.
+
+After you move a sessions folder, run `recall list` in its new location, then `recall places forget <old path>`.
+
 Session IDs use a 12-digit inverted UTC key, then a local `YYYY-MM-DD_HHMM` stamp, then a zone token, then a slug, for example `797390917984-2026-09-08_1515-ct-mute-check`. The key is `999999999999` minus the UTC `YYYYMMDDHHMM`, so VS Code Explorer, Finder, and `ls` A-Z list newest first. Set `timezone` in `~/.config/recall/config.toml` to an IANA name; otherwise Recall detects the Mac zone and falls back to US Eastern (`et`) only if detection fails. Older ISO `YYYY-MM-DD_HHMM-et-…` and `MM-DD-YYYY_H-MMapm` folders remain valid session IDs. If agent analysis returns a useful title, Recall can rename a generic folder such as `797394737678-2026-05-26_1921-et-quick-capture` to a topic-based name such as `797394737678-2026-05-26_1921-et-rain-birthdays-and-jersey-mikes-chat`, keeping the existing zone token.
 
 ## Current Caveat
