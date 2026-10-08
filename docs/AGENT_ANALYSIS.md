@@ -4,6 +4,8 @@ Recall can pass the clean `transcript.md` to a headless CLI agent and write one 
 
 This is optional. Recording and local transcription still work without an agent.
 
+What is sent to the agent: the transcript, and the text of the notes and markers you made during the session, each with its time. A picture pasted into a note is sent as its file name only; the picture itself is not sent. Nothing else in the session folder is sent. With no agent selected and auto-analyze off, nothing is sent at all.
+
 ## Supported Agents
 
 Built-in profiles:
@@ -169,11 +171,20 @@ Each decision, action item, and question in `meeting.md` says where it came from
 - `(00:34, call)`: the cited time falls on that line of the transcript. If the agent also quoted words, they are in that line or the lines beside it. The time and speaker shown are the line's own.
 - `(00:34, call; quote not found there)`: the time falls on a line, but the words the agent quoted are not there, and no single other line holds them.
 - `(not found in transcript)`: the agent cited a time that no line holds, and its quote did not pick out exactly one line.
+- `(note 12:10)`: no transcript line holds the quoted words, and a note of yours does. The time is the note's.
 - `(no source given)`: the agent cited no time.
 
 A quote found in exactly one other line moves the citation to that line. A follow-up may have no source; one that cites a time is checked the same way. The line under the title counts the result, for example "7 of 9 items cite a line of the transcript. 1 quote was not found where cited."
 
 The mark says where to look. It does not say the item is right. Recall checks that a time is on a line and that quoted words were said; it cannot tell whether the agent read the line correctly. An open question carries no quote, so only its time is checked. Recall never drops an item and never invents a time. A transcript with no timed lines is not checked, and the notes say so.
+
+What the agent is told about your notes:
+
+- They are extra material beside the transcript. It uses a note when it helps, for example to get a name, an owner, or a date right, or to add a fact nobody said aloud, and ignores one that adds nothing.
+- For a name, a spelling, an owner, or a date, a note wins over the transcript, because speech recognition mishears names. A disagreement about what was decided goes under open questions.
+- The summary does not mention the notes or repeat them. They still appear under "Notes and Markers" in `meeting.md`, as before.
+- A marker has no words; it flags a moment, and the lines near it may matter.
+- A session with no notes and no markers gets the same prompt as before.
 
 What the agent is told about doubtful lines:
 
