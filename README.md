@@ -364,6 +364,8 @@ recall --title "Project sync"
 recall --resume
 recall --resume latest
 recall list
+recall list --all
+recall places
 recall show latest
 recall open latest
 recall open latest --dir
@@ -383,6 +385,8 @@ recall agents doctor
 recall update
 recall doctor
 ```
+
+A session stays in the `sessions/` folder of the directory where you ran Recall. Recall also keeps a list of every such folder it has used, in `~/.config/recall/session-places.txt`. `recall list --all` shows the sessions in all of them, and `recall places` shows the folders with a session count. `--resume <name>` and commands that take a session name look in this folder first, then in the others, and say where the session was found. The list holds folder paths only and never leaves the Mac.
 
 Development commands:
 

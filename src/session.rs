@@ -125,6 +125,13 @@ pub fn default_storage_dir() -> io::Result<PathBuf> {
     Ok(env::current_dir()?.join("sessions"))
 }
 
+/// True when the folder holds at least one session.
+pub fn holds_sessions(storage_dir: &Path) -> bool {
+    fs::read_dir(storage_dir)
+        .map(|entries| entries.flatten().any(|entry| is_session_dir(&entry.path())))
+        .unwrap_or(false)
+}
+
 pub fn append_session_marker(session_path: &Path, elapsed: &str) -> io::Result<()> {
     append_session_entry(&markers_path(session_path), elapsed, "Marker")?;
     refresh_meeting_capture_context(session_path)
@@ -723,8 +730,84 @@ pub fn resolve_session_target(storage_dir: &Path, target: &str) -> io::Result<Pa
     }
 }
 
+/// A session found by name. `elsewhere` is the place it was found in, when
+/// that is not the place that was asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundSession {
+    pub path: PathBuf,
+    pub elsewhere: Option<PathBuf>,
+}
+
+/// Looks a session up the way `resolve_session_target` does. When the name is
+/// not in `storage_dir`, it looks in `other_places` too. A match in
+/// `storage_dir` always wins, and `latest` and paths never leave it.
+pub fn find_session_target(
+    storage_dir: &Path,
+    target: &str,
+    other_places: &[PathBuf],
+) -> io::Result<FoundSession> {
+    let not_here = match resolve_session_target(storage_dir, target) {
+        Ok(path) => {
+            return Ok(FoundSession {
+                path,
+                elsewhere: None,
+            })
+        }
+        Err(error) => error,
+    };
+    let name = target.trim();
+    if not_here.kind() != io::ErrorKind::NotFound
+        || name.is_empty()
+        || name == "latest"
+        || name.contains('/')
+        || name.contains('\\')
+    {
+        return Err(not_here);
+    }
+
+    let here = storage_dir.canonicalize().ok();
+    let mut found: Vec<PathBuf> = Vec::new();
+    for place in other_places {
+        if place == storage_dir || Some(place) == here.as_ref() || !place.is_dir() {
+            continue;
+        }
+        let stored = place.join(name);
+        if is_session_dir(&stored) {
+            found.push(stored);
+            continue;
+        }
+        // A place that cannot be read is skipped, not an error.
+        found.extend(sessions_matching(place, name).unwrap_or_default());
+    }
+    match found.len() {
+        0 => Err(not_here),
+        1 => {
+            let path = found.remove(0);
+            let elsewhere = path.parent().map(Path::to_path_buf);
+            Ok(FoundSession { path, elsewhere })
+        }
+        count => {
+            let shown: Vec<String> = found
+                .iter()
+                .take(AMBIGUOUS_SESSIONS_SHOWN)
+                .map(|path| format!("  {}", path.display()))
+                .collect();
+            let more = if count > shown.len() { "\n  ..." } else { "" };
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "'{name}' is not in {}. It matches {count} Recall sessions in other places:\n{}{more}\nPass more of the name, or the session path.",
+                    storage_dir.display(),
+                    shown.join("\n")
+                ),
+            ))
+        }
+    }
+}
+
 /// A command's session argument. An existing path is used as given; anything
-/// else is looked up by name in storage, the way `--resume` does.
+/// else is looked up by name in storage, the way `--resume` does, and then in
+/// the other places Recall has used.
 pub fn session_from_arg(storage_dir: Option<&Path>, target: &Path) -> io::Result<PathBuf> {
     if target.exists() {
         return Ok(target.to_path_buf());
@@ -732,10 +815,15 @@ pub fn session_from_arg(storage_dir: Option<&Path>, target: &Path) -> io::Result
     let Some(name) = target.to_str() else {
         return Ok(target.to_path_buf());
     };
-    match storage_dir {
-        Some(storage_dir) => resolve_session_target(storage_dir, name),
-        None => resolve_session_target(&default_storage_dir()?, name),
+    let storage_dir = match storage_dir {
+        Some(storage_dir) => storage_dir.to_path_buf(),
+        None => default_storage_dir()?,
+    };
+    let found = find_session_target(&storage_dir, name, &crate::places::known_places())?;
+    if let Some(place) = &found.elsewhere {
+        eprintln!("Found in {}", place.display());
     }
+    Ok(found.path)
 }
 
 const AMBIGUOUS_SESSIONS_SHOWN: usize = 5;
@@ -1154,15 +1242,16 @@ mod tests {
     use super::{
         append_session_marker, append_session_note, append_session_note_with_images,
         copy_image_into_session, detect_system_iana_timezone, discard_unused_note_images,
-        editor_invocation, escape_json, export_session, faded_text, format_session_note_bullet,
-        linkify_note_caption, list_sessions, mark_transcript_ready, next_note_image_relative_path,
-        pasted_image_path, read_session_consent, readable_session_stamp_for,
-        resolve_session_target, resolve_timezone, resume_hint, session_entries, session_from_arg,
-        short_session_id, slugify, start_session, zone_token, ConsentMode, StartOptions,
-        FALLBACK_TIMEZONE,
+        editor_invocation, escape_json, export_session, faded_text, find_session_target,
+        format_session_note_bullet, holds_sessions, linkify_note_caption, list_sessions,
+        mark_transcript_ready, next_note_image_relative_path, pasted_image_path,
+        read_session_consent, readable_session_stamp_for, resolve_session_target, resolve_timezone,
+        resume_hint, session_entries, session_from_arg, short_session_id, slugify, start_session,
+        zone_token, ConsentMode, StartOptions, FALLBACK_TIMEZONE,
     };
     use jiff::{civil::date, tz::TimeZone};
     use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -1507,6 +1596,80 @@ mod tests {
             .contains("No Recall session matching"));
 
         let _ = fs::remove_dir_all(storage_dir);
+    }
+
+    #[test]
+    fn a_name_missing_here_is_found_in_another_place() {
+        let here = storage_with_sessions("find-here", &["2026-05-26_1921-et-design-sync"]);
+        let home = storage_with_sessions(
+            "find-home",
+            &[
+                "2026-06-01_0900-et-lunch-plans",
+                "2026-06-02_0900-et-budget",
+            ],
+        );
+        let work = storage_with_sessions("find-work", &["2026-06-03_0900-et-budget-review"]);
+        let gone = here.with_file_name("recall-find-gone-never-made");
+        let others = vec![here.clone(), gone, home.clone(), work.clone()];
+
+        // The current place wins, and says nothing about another place.
+        let found = find_session_target(&here, "design", &others).unwrap();
+        assert_eq!(found.path, here.join("2026-05-26_1921-et-design-sync"));
+        assert_eq!(found.elsewhere, None);
+
+        // Not here: one match in another place is used, and that place is named.
+        let found = find_session_target(&here, "lunch", &others).unwrap();
+        assert_eq!(found.path, home.join("2026-06-01_0900-et-lunch-plans"));
+        assert_eq!(found.elsewhere, Some(home.clone()));
+        // A whole folder name works too.
+        let found = find_session_target(&here, "2026-06-02_0900-et-budget", &others).unwrap();
+        assert_eq!(found.elsewhere, Some(home.clone()));
+
+        // Two places match: no guess. Both full paths are shown.
+        let error = find_session_target(&here, "budget", &others).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let message = error.to_string();
+        assert!(message.contains("matches 2 Recall sessions in other places"));
+        assert!(message.contains(&home.join("2026-06-02_0900-et-budget").display().to_string()));
+        assert!(message.contains(
+            &work
+                .join("2026-06-03_0900-et-budget-review")
+                .display()
+                .to_string()
+        ));
+
+        // In no place at all: the plain "not here" error.
+        let error = find_session_target(&here, "dinner", &others).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("No Recall session matching"));
+        // With no other places it is the same as before.
+        assert!(find_session_target(&here, "lunch", &[]).is_err());
+
+        for dir in [here, home, work] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn latest_and_paths_never_leave_the_current_place() {
+        let empty = storage_with_sessions("stay-empty", &[]);
+        fs::create_dir_all(&empty).unwrap();
+        let other = storage_with_sessions("stay-other", &["2026-06-01_0900-et-lunch"]);
+        let others = vec![other.clone()];
+
+        let error = find_session_target(&empty, "latest", &others).unwrap_err();
+        assert!(error.to_string().contains("No Recall sessions found in"));
+        assert!(find_session_target(&empty, "", &others).is_err());
+        assert!(find_session_target(&empty, "nested/lunch", &others).is_err());
+        // The name alone is found, to show the place itself is searchable.
+        assert!(find_session_target(&empty, "lunch", &others).is_ok());
+
+        assert!(holds_sessions(&other));
+        assert!(!holds_sessions(&empty));
+        assert!(!holds_sessions(&empty.join("never-made")));
+        for dir in [empty, other] {
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod citations;
 mod config;
 mod loudness;
 mod mic_recorder;
+mod places;
 mod session;
 mod system_recorder;
 mod terminal;
@@ -21,9 +22,9 @@ use analysis::{analyze, known_agents, AnalyzeOptions, AnalyzeTarget};
 use capture_sources::{detect_sources, probe_audio_tap};
 use config::{config_path, RecallConfig};
 use session::{
-    default_storage_dir, export_session, faded_text, latest_session, list_sessions, open_path,
-    primary_document_path, resolve_timezone, resume_hint, session_from_arg, start_session,
-    ConsentMode, StartOptions,
+    default_storage_dir, export_session, faded_text, holds_sessions, latest_session, list_sessions,
+    open_path, primary_document_path, resolve_timezone, resume_hint, session_from_arg,
+    start_session, ConsentMode, StartOptions,
 };
 use transcription::{
     find_parakeet_binary, format_bytes, format_model_download_label, parakeet_binary_doctor_level,
@@ -54,6 +55,7 @@ fn main() {
     match command.as_deref() {
         Some("start") => run_start(args.collect(), &tui_defaults),
         Some("list") => run_list(args.collect(), &tui_defaults),
+        Some("places") => run_places(args.collect()),
         Some("show") => run_show(args.collect(), &tui_defaults),
         Some("open") => run_open(args.collect(), &tui_defaults),
         Some("export") => run_export(args.collect(), &tui_defaults),
@@ -92,7 +94,10 @@ USAGE:
     recall --resume <session-id>          Resume a session by folder name or a unique part of it
     recall resume latest                  Same as --resume latest
     recall start --title "Design Sync"    Create a local session folder
-    recall list                           List local sessions
+    recall list                           List the sessions in this folder
+    recall list --all                     List the sessions in every folder Recall has used
+    recall places                         Show every sessions folder Recall has used
+    recall places forget <path>           Drop a folder from that list (deletes no session)
     recall show latest                    Show the latest session path
     recall open latest                    Open the latest meeting document
     recall open latest --dir              Open the latest session folder
@@ -193,6 +198,13 @@ fn run_update(args: Vec<String>) {
 
 fn run_tui_with_options(options: TuiOptions) {
     let resuming = options.resume.is_some();
+    if let Some(storage_dir) = options
+        .storage_dir
+        .clone()
+        .or_else(|| default_storage_dir().ok())
+    {
+        remember_place(&storage_dir);
+    }
     match tui::run_with_options(options) {
         Ok(exit) => {
             if !exit.detached_logs.is_empty() {
@@ -208,6 +220,9 @@ fn run_tui_with_options(options: TuiOptions) {
                 println!("{notice}");
             }
             if let Some(path) = exit.session_path {
+                if let Some(place) = path.parent() {
+                    remember_place(place);
+                }
                 if let Some(hint) = resume_hint(&path) {
                     println!();
                     println!("{}", faded_text(&hint, terminal::stdout_takes_style()));
@@ -341,6 +356,7 @@ fn run_start(args: Vec<String>, tui_defaults: &TuiOptions) {
 
     match start_session(&options) {
         Ok(session) => {
+            remember_place(&options.storage_dir);
             println!("Recall session initialized");
             println!("  Title: {}", session.title);
             println!("  Consent: {}", session.consent.as_str());
@@ -463,21 +479,35 @@ fn run_transcribe(args: Vec<String>, tui_defaults: &TuiOptions) {
     }
 }
 
+/// Puts a sessions folder on the list of places, once it holds a session.
+fn remember_place(storage_dir: &Path) {
+    if holds_sessions(storage_dir) {
+        places::remember(storage_dir);
+    }
+}
+
 fn run_list(args: Vec<String>, tui_defaults: &TuiOptions) {
-    let storage_dir = match parse_storage_arg(args, tui_defaults.storage_dir.clone()) {
-        Ok(Some(path)) => path,
-        Ok(None) => match default_storage_dir() {
+    let (storage_dir, all) = match parse_list_args(args, tui_defaults.storage_dir.clone()) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+    let storage_dir = match storage_dir {
+        Some(path) => path,
+        None => match default_storage_dir() {
             Ok(path) => path,
             Err(error) => {
                 eprintln!("Failed to resolve storage directory: {error}");
                 std::process::exit(1);
             }
         },
-        Err(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
-        }
     };
+    remember_place(&storage_dir);
+    if all {
+        return print_sessions_in_all_places(&storage_dir);
+    }
 
     match list_sessions(&storage_dir) {
         Ok(sessions) if sessions.is_empty() => {
@@ -1160,14 +1190,124 @@ fn parse_analyze_options(
     })
 }
 
-fn parse_storage_arg(
+fn parse_list_args(
     args: Vec<String>,
     configured_storage_dir: Option<PathBuf>,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<(Option<PathBuf>, bool), String> {
+    const USAGE: &str = "Usage: recall list [--all] [--storage <path>]";
+    let mut storage_dir = configured_storage_dir;
+    let mut all = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--all" => all = true,
+            "--storage" => {
+                storage_dir = Some(PathBuf::from(iter.next().ok_or(USAGE)?));
+            }
+            _ => return Err(USAGE.to_string()),
+        }
+    }
+    Ok((storage_dir, all))
+}
+
+/// The current place first, then every other place on the list.
+fn all_places(current: &Path) -> Vec<PathBuf> {
+    let mut all = vec![current
+        .canonicalize()
+        .unwrap_or_else(|_| current.to_path_buf())];
+    for place in places::known_places() {
+        if !all.contains(&place) {
+            all.push(place);
+        }
+    }
+    all
+}
+
+fn print_sessions_in_all_places(current: &Path) {
+    let mut shown = 0;
+    let mut missing = 0;
+    for (index, place) in all_places(current).into_iter().enumerate() {
+        if !place.is_dir() {
+            // The first is the current folder, which may have no sessions yet.
+            if index > 0 {
+                missing += 1;
+            }
+            continue;
+        }
+        let sessions = match list_sessions(&place) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                eprintln!("Could not read {}: {error}", place.display());
+                continue;
+            }
+        };
+        if sessions.is_empty() {
+            continue;
+        }
+        if shown > 0 {
+            println!();
+        }
+        shown += 1;
+        println!("Recall sessions in {}", place.display());
+        for session in sessions {
+            println!("  {}", session.display());
+        }
+    }
+    if shown == 0 {
+        println!("No Recall sessions found in any place Recall has used.");
+    }
+    if missing > 0 {
+        println!();
+        println!("{missing} place(s) on the list are missing. Run `recall places`.");
+    }
+}
+
+fn run_places(args: Vec<String>) {
+    const USAGE: &str = "Usage: recall places [forget <path>]";
     match args.as_slice() {
-        [] => Ok(configured_storage_dir),
-        [flag, path] if flag == "--storage" => Ok(Some(PathBuf::from(path))),
-        _ => Err("Usage: recall list [--storage <path>]".to_string()),
+        [] => print_places(),
+        [command, path] if command == "forget" => match places::forget(Path::new(path)) {
+            Ok(true) => println!("Forgot {path}. No session was deleted."),
+            Ok(false) => {
+                eprintln!("Not on the list: {path}");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("Could not update the list of session places: {error}");
+                std::process::exit(1);
+            }
+        },
+        _ => {
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn print_places() {
+    let known = places::known_places();
+    if known.is_empty() {
+        println!("No session places recorded yet.");
+        println!("Run `recall list` in a folder that holds sessions, or record a session.");
+        return;
+    }
+    println!("Recall session places");
+    for place in known {
+        let count = if place.is_dir() {
+            list_sessions(&place).ok().map(|sessions| sessions.len())
+        } else {
+            None
+        };
+        let label = match count {
+            Some(1) => "1 session".to_string(),
+            Some(count) => format!("{count} sessions"),
+            None => "missing".to_string(),
+        };
+        println!("  {label:>12}  {}", place.display());
+    }
+    if let Some(list) = places::places_path() {
+        println!();
+        println!("List: {}", list.display());
     }
 }
 
@@ -1242,13 +1382,34 @@ fn print_doctor() {
     );
     println!();
     println!("Storage:");
-    if let Some(path) = storage_dir {
+    if let Some(path) = &storage_dir {
         println!("  - sessions: {}", path.display());
     } else {
         println!("  - sessions: unresolved");
     }
     if let Some(path) = config_path() {
         println!("  - config: {}", path.display());
+    }
+    let known_places = places::known_places();
+    println!(
+        "  - session places: {} on the list (`recall places`)",
+        known_places.len()
+    );
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        let mut checked: Vec<PathBuf> = Vec::new();
+        for place in storage_dir.into_iter().chain(known_places) {
+            if checked.contains(&place) {
+                continue;
+            }
+            if let Some(synced) = places::icloud_synced_folder(&place, &home) {
+                println!(
+                    "  warn sessions folder is inside a folder iCloud syncs: {} (under {})",
+                    place.display(),
+                    synced.display()
+                );
+            }
+            checked.push(place);
+        }
     }
     println!();
     println!("Agents:");
@@ -1394,6 +1555,36 @@ fn print_parakeet_doctor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_takes_all_and_storage_in_any_order() {
+        let storage = Some(PathBuf::from("/from/config"));
+        assert_eq!(
+            parse_list_args(vec![], storage.clone()),
+            Ok((storage.clone(), false))
+        );
+        assert_eq!(
+            parse_list_args(vec!["--all".into()], None),
+            Ok((None, true))
+        );
+        let asked = Ok((Some(PathBuf::from("/asked")), true));
+        assert_eq!(
+            parse_list_args(
+                vec!["--storage".into(), "/asked".into(), "--all".into()],
+                storage.clone()
+            ),
+            asked
+        );
+        assert_eq!(
+            parse_list_args(
+                vec!["--all".into(), "--storage".into(), "/asked".into()],
+                storage
+            ),
+            asked
+        );
+        assert!(parse_list_args(vec!["--storage".into()], None).is_err());
+        assert!(parse_list_args(vec!["latest".into()], None).is_err());
+    }
 
     #[test]
     fn transcribe_defaults_to_platform_engine() {
