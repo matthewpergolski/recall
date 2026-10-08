@@ -484,3 +484,54 @@ fn export_finds_a_name_in_another_place_and_says_where() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn a_dry_run_writes_a_prompt_that_holds_the_notes() {
+    let storage = unique_storage("notes-prompt");
+    let folder = "2026-06-01_0900-et-standup";
+    make_session(&storage, folder, 300);
+    let session = storage.join(folder);
+    fs::write(
+        session.join("transcript.md"),
+        "# Standup\n\n- [00:01.000 - 00:03.000] **mic:** We should send the deck this week.\n",
+    )
+    .unwrap();
+    let dry_run = || {
+        let output = recall()
+            .args([
+                "analyze",
+                "standup",
+                "--agent",
+                "grok",
+                "--dry-run",
+                "--storage",
+            ])
+            .arg(&storage)
+            .output()
+            .expect("failed to run recall analyze --dry-run");
+        assert!(output.status.success(), "{}", output_text(&output));
+        fs::read_to_string(session.join(".recall/analysis/prompt.md")).unwrap()
+    };
+
+    let without = dry_run();
+    assert!(without.contains("send the deck this week"));
+    assert!(!without.contains("--- notes and markers ---"), "{without}");
+
+    fs::write(
+        session.join(".recall/notes.md"),
+        "# Notes: Standup\n\n- `00:02` Priya sends it by Thursday\n",
+    )
+    .unwrap();
+    let with = dry_run();
+    assert!(with.contains("--- notes and markers ---"), "{with}");
+    assert!(
+        with.contains("- `00:02` Priya sends it by Thursday"),
+        "{with}"
+    );
+    assert!(
+        with.contains("Do not mention the notes in the summary"),
+        "{with}"
+    );
+
+    let _ = fs::remove_dir_all(storage);
+}

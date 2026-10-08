@@ -14,6 +14,8 @@ const TIME_TOLERANCE_MS: u64 = 2_000;
 const MIN_QUOTE_TOKENS: usize = 4;
 /// The share of a quote's words a line must hold. Agents tidy quotes.
 const QUOTE_MATCH: f64 = 0.8;
+/// A note's time is kept to the second, and an agent copies it as written.
+const NOTE_TIME_TOLERANCE_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscriptLine {
@@ -46,6 +48,54 @@ pub enum Source {
     NotFound,
     /// No usable time was given.
     NoneGiven,
+}
+
+/// A note the user typed during the session, at its time on the session clock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NoteLine {
+    pub at_ms: u64,
+    pub text: String,
+}
+
+/// The notes of a session: `- \`12:10\` text`, as `session_entries` returns them.
+pub fn note_lines(entries: &[String]) -> Vec<NoteLine> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let (time, text) = entry.strip_prefix("- `")?.split_once('`')?;
+            Some(NoteLine {
+                at_ms: parse_time(time)?,
+                text: text.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The time of the note a citation points at, if it points at one. The
+/// quoted words must be in the note. Then either the cited time is that
+/// note's time, or the quote is long enough to compare and no other note
+/// holds it.
+pub fn trace_note(notes: &[NoteLine], timestamp: Option<&str>, quote: Option<&str>) -> Option<u64> {
+    let quote_tokens = quote
+        .map(normalized_tokens)
+        .filter(|tokens| !tokens.is_empty())?;
+    let holding: Vec<&NoteLine> = notes
+        .iter()
+        .filter(|note| holds_quote(&normalized_tokens(&note.text), &quote_tokens))
+        .collect();
+    if let Some(cited_ms) = timestamp.and_then(parse_time) {
+        let at_time = holding
+            .iter()
+            .filter(|note| note.at_ms.abs_diff(cited_ms) <= NOTE_TIME_TOLERANCE_MS)
+            .min_by_key(|note| note.at_ms.abs_diff(cited_ms));
+        if let Some(note) = at_time {
+            return Some(note.at_ms);
+        }
+    }
+    match holding.as_slice() {
+        [only] if quote_tokens.len() >= MIN_QUOTE_TOKENS => Some(only.at_ms),
+        _ => None,
+    }
 }
 
 /// The timed lines of a transcript: `- [00:00.000 - 00:02.400] **mic:** text`.
@@ -183,7 +233,9 @@ pub fn format_time(ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_time, parse_time, timed_lines, trace, Quote, Source};
+    use super::{
+        format_time, note_lines, parse_time, timed_lines, trace, trace_note, Quote, Source,
+    };
 
     const TRANSCRIPT: &str = "# Sync\n\n## Clean Conversation\n\n\
 - [00:00.000 - 00:02.400] **mic:** The quarterly review is on Thursday at ten.\n\
@@ -202,6 +254,62 @@ not a timed line\n";
             speaker: speaker.to_string(),
             quote,
         }
+    }
+
+    #[test]
+    fn a_citation_of_a_note_needs_the_notes_words_and_its_time_or_a_long_quote() {
+        let notes = note_lines(&[
+            "- `00:10` Sam owns the budget".to_string(),
+            "- `05:30` Email Priya the revised deck before Friday\n  and copy legal".to_string(),
+            "- `07:00` Sam owns the hiring plan".to_string(),
+            "not an entry".to_string(),
+        ]);
+        assert_eq!(notes.len(), 3);
+        assert_eq!(notes[1].at_ms, 330_000);
+        assert!(notes[1].text.contains("copy legal"));
+
+        // The note's time and words from it, also a short quote.
+        assert_eq!(
+            trace_note(&notes, Some("00:10"), Some("Sam owns the budget")),
+            Some(10_000)
+        );
+        assert_eq!(
+            trace_note(&notes, Some("00:11.000"), Some("Sam owns")),
+            Some(10_000)
+        );
+        // A wrong time, and a quote only one note holds.
+        assert_eq!(
+            trace_note(&notes, Some("09:00"), Some("email Priya the revised deck")),
+            Some(330_000)
+        );
+        assert_eq!(
+            trace_note(
+                &notes,
+                None,
+                Some("Email Priya the revised deck before Friday")
+            ),
+            Some(330_000)
+        );
+        // A wrong time and a short quote two notes hold: no guess.
+        assert_eq!(trace_note(&notes, Some("09:00"), Some("Sam owns")), None);
+        assert_eq!(trace_note(&notes, None, Some("Sam owns the")), None);
+        // Long enough, and only one note holds nearly all of it.
+        assert_eq!(
+            trace_note(&notes, Some("09:00"), Some("Sam owns the plan")),
+            Some(420_000)
+        );
+        // The right time and words the note does not hold.
+        assert_eq!(
+            trace_note(&notes, Some("00:10"), Some("we will hire three engineers")),
+            None
+        );
+        // A time alone says nothing about a note.
+        assert_eq!(trace_note(&notes, Some("00:10"), None), None);
+        assert_eq!(trace_note(&notes, Some("00:10"), Some("  ")), None);
+        assert_eq!(
+            trace_note(&[], Some("00:10"), Some("Sam owns the budget")),
+            None
+        );
     }
 
     #[test]
