@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use crate::config::expand_path;
 use crate::update_progress::{plan_total, UpdateProgress};
@@ -15,11 +16,14 @@ const BUILD_COMMIT: &str = env!("RECALL_BUILD_COMMIT");
 pub struct UpdateOptions {
     pub repo: Option<PathBuf>,
     pub configured_repo: Option<PathBuf>,
+    /// Show each step's command, its output, and how long it took.
+    pub verbose: bool,
 }
 
 impl UpdateOptions {
     pub fn parse(args: Vec<String>, configured_repo: Option<PathBuf>) -> Result<Self, String> {
         let mut repo = None;
+        let mut verbose = false;
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -33,6 +37,7 @@ impl UpdateOptions {
                             .ok_or_else(|| "--repo requires a path".to_string())?,
                     ));
                 }
+                "--verbose" => verbose = true,
                 value => return Err(format!("Unknown update option: {value}")),
             }
         }
@@ -40,6 +45,7 @@ impl UpdateOptions {
         Ok(Self {
             repo,
             configured_repo,
+            verbose,
         })
     }
 }
@@ -51,8 +57,23 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     ensure_update_branch(&checkout)?;
 
     let previous_commit = git_output(&checkout, &["rev-parse", "HEAD"])?;
-    let mut progress = UpdateProgress::detect();
+    // --verbose prints plain lines and each command's own output, with no bar.
+    let mut times = options.verbose.then(StepTimes::start);
+    let mut progress = if options.verbose {
+        UpdateProgress::plain()
+    } else {
+        UpdateProgress::detect()
+    };
+    if options.verbose {
+        println!("Checkout: {}", checkout.display());
+        println!(
+            "Installed: {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            short_commit(BUILD_COMMIT)
+        );
+    }
     progress.arm_ephemeral("Checking origin/main");
+    let fetch_started = Instant::now();
     let fetched = run_quiet_command(
         Command::new("git").arg("-C").arg(&checkout).args([
             "fetch",
@@ -70,6 +91,16 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
         return Err(error);
     }
     let remote_commit = git_output(&checkout, &["rev-parse", "refs/remotes/origin/main"])?;
+    if let Some(times) = times.as_mut() {
+        let elapsed = fetch_started.elapsed();
+        println!(
+            "Checked origin/main in {}: checkout {}, origin/main {}",
+            seconds(elapsed),
+            short_commit(&previous_commit),
+            short_commit(&remote_commit)
+        );
+        times.add("Check", elapsed);
+    }
 
     if previous_commit == remote_commit && build_matches(&previous_commit, BUILD_COMMIT) {
         progress.rest();
@@ -106,8 +137,9 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
                 short_commit(&remote_commit)
             );
         }
-        run_quiet_step(
+        run_step(
             &mut progress,
+            times.as_mut(),
             "Fast-forward",
             Command::new("git").arg("-C").arg(&checkout).args([
                 "merge",
@@ -123,8 +155,9 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
 
     let current_commit = git_output(&checkout, &["rev-parse", "HEAD"])?;
 
-    run_quiet_step(
+    run_step(
         &mut progress,
+        times.as_mut(),
         "Tests",
         Command::new("cargo")
             .arg("test")
@@ -132,8 +165,9 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             .arg("--manifest-path")
             .arg(checkout.join("Cargo.toml")),
     )?;
-    run_quiet_step(
+    run_step(
         &mut progress,
+        times.as_mut(),
         "Capture helper",
         Command::new("swift")
             .arg("build")
@@ -142,8 +176,9 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     )?;
     ensure_clean(&checkout)?;
     ensure_at_origin_main(&checkout)?;
-    run_quiet_step(
+    run_step(
         &mut progress,
+        times.as_mut(),
         "Install",
         Command::new("cargo")
             .arg("install")
@@ -172,6 +207,9 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             "Recall updated to {crate_version} ({}).",
             short_commit(&current_commit)
         );
+    }
+    if let Some(times) = times {
+        println!("{}", times.summary());
     }
 
     Ok(())
@@ -418,6 +456,85 @@ fn run_quiet_step(
     }
 }
 
+/// How long each step of a `recall update --verbose` took.
+struct StepTimes {
+    started: Instant,
+    steps: Vec<(String, Duration)>,
+}
+
+impl StepTimes {
+    fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            steps: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, label: &str, elapsed: Duration) {
+        self.steps.push((label.to_string(), elapsed));
+    }
+
+    fn summary(&self) -> String {
+        times_summary(self.started.elapsed(), &self.steps)
+    }
+}
+
+fn times_summary(total: Duration, steps: &[(String, Duration)]) -> String {
+    let steps = steps
+        .iter()
+        .map(|(label, elapsed)| format!("{} {}", label.to_lowercase(), seconds(*elapsed)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if steps.is_empty() {
+        format!("Took {}.", seconds(total))
+    } else {
+        format!("Took {}: {steps}.", seconds(total))
+    }
+}
+
+fn seconds(elapsed: Duration) -> String {
+    format!("{:.1}s", elapsed.as_secs_f64())
+}
+
+fn command_line(command: &Command) -> String {
+    std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn run_step(
+    progress: &mut UpdateProgress,
+    times: Option<&mut StepTimes>,
+    label: &str,
+    command: &mut Command,
+) -> io::Result<()> {
+    match times {
+        Some(times) => run_shown_step(times, label, command),
+        None => run_quiet_step(progress, label, command),
+    }
+}
+
+/// Runs one step with its output on the terminal, and notes how long it took.
+fn run_shown_step(times: &mut StepTimes, label: &str, command: &mut Command) -> io::Result<()> {
+    println!("\n{label}: {}", command_line(command));
+    let started = Instant::now();
+    let status = command
+        .status()
+        .map_err(|error| io::Error::new(error.kind(), format!("Failed to {label}: {error}")))?;
+    let elapsed = started.elapsed();
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "{label} failed after {} ({status}). Its output is above.",
+            seconds(elapsed)
+        )));
+    }
+    println!("{label} took {}.", seconds(elapsed));
+    times.add(label, elapsed);
+    Ok(())
+}
+
 fn build_matches(source_commit: &str, build_commit: &str) -> bool {
     build_commit != "unknown" && source_commit == build_commit
 }
@@ -490,13 +607,15 @@ fn normalized_remote(remote: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_matches, deduplicate_paths, ensure_at_origin_main, ensure_clean, normalized_remote,
-        short_commit, validate_checkout, version_from_metadata, UpdateOptions, RECALL_REMOTE,
+        build_matches, command_line, deduplicate_paths, ensure_at_origin_main, ensure_clean,
+        normalized_remote, run_shown_step, short_commit, times_summary, validate_checkout,
+        version_from_metadata, StepTimes, UpdateOptions, RECALL_REMOTE,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -562,13 +681,19 @@ mod tests {
     }
 
     fn run_git(path: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        // Collected, so git's chatter stays out of the test output.
+        let output = Command::new("git")
             .arg("-C")
             .arg(path)
             .args(args)
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "git {} failed", args.join(" "));
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -578,6 +703,54 @@ mod tests {
                 .unwrap();
 
         assert_eq!(options.repo, Some(PathBuf::from("/tmp/recall")));
+    }
+
+    #[test]
+    fn verbose_is_off_unless_asked_for() {
+        assert!(!UpdateOptions::parse(Vec::new(), None).unwrap().verbose);
+        assert!(
+            UpdateOptions::parse(vec!["--verbose".to_string()], None)
+                .unwrap()
+                .verbose
+        );
+    }
+
+    #[test]
+    fn a_shown_step_notes_its_time_and_a_failed_one_says_where_to_look() {
+        let mut times = StepTimes::start();
+
+        run_shown_step(&mut times, "Tests", &mut Command::new("true")).unwrap();
+        assert_eq!(times.steps.len(), 1);
+        assert_eq!(times.steps[0].0, "Tests");
+
+        let error = run_shown_step(&mut times, "Install", &mut Command::new("false"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("Install failed after "), "{error}");
+        assert!(error.ends_with("Its output is above."), "{error}");
+        assert_eq!(times.steps.len(), 1);
+    }
+
+    #[test]
+    fn the_summary_names_the_total_and_each_step() {
+        let steps = vec![
+            ("Check".to_string(), Duration::from_millis(420)),
+            ("Capture helper".to_string(), Duration::from_millis(2040)),
+        ];
+
+        assert_eq!(
+            times_summary(Duration::from_millis(14_260), &steps),
+            "Took 14.3s: check 0.4s, capture helper 2.0s."
+        );
+        assert_eq!(times_summary(Duration::from_secs(1), &[]), "Took 1.0s.");
+    }
+
+    #[test]
+    fn a_command_is_shown_as_it_would_be_typed() {
+        let mut command = Command::new("cargo");
+        command.arg("test").arg("--locked");
+
+        assert_eq!(command_line(&command), "cargo test --locked");
     }
 
     #[test]
