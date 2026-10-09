@@ -2196,6 +2196,11 @@ impl App {
     }
 
     fn set_note_mouse_capture(enable: bool) {
+        // A test has no dashboard on screen; the codes would reach the
+        // terminal that runs the tests.
+        if cfg!(test) {
+            return;
+        }
         if enable {
             let _ = execute!(io::stdout(), EnableMouseCapture);
         } else {

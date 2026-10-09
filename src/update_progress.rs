@@ -47,7 +47,7 @@ impl UpdateProgress {
         Self::with_mode(terminal::stdout_is_live(), terminal::stdout_takes_style())
     }
 
-    #[cfg(test)]
+    /// Plain lines and no bar, whatever the output is.
     pub fn plain() -> Self {
         Self::with_mode(false, false)
     }

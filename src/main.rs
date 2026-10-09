@@ -174,8 +174,9 @@ EXPORT OPTIONS:
     --storage <path>                      Storage directory for latest lookup
 
 UPDATE OPTIONS:
-    recall update [--repo <path>]
-    --repo <path>                         Explicit Recall source checkout"#
+    recall update [--repo <path>] [--verbose]
+    --repo <path>                         Explicit Recall source checkout
+    --verbose                             Show each step's command, output, and time"#
     );
 }
 
@@ -185,7 +186,7 @@ fn run_update(args: Vec<String>) {
         Ok(options) => options,
         Err(message) => {
             eprintln!("{message}");
-            eprintln!("Usage: recall update [--repo <path>]");
+            eprintln!("Usage: recall update [--repo <path>] [--verbose]");
             std::process::exit(2);
         }
     };
