@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Opt-in: enable with `git config core.hooksPath .githooks`
+# Reject commit messages that advertise agent/AI co-authorship.
+set -euo pipefail
+
+msg_file="${1:-}"
+if [[ -z "${msg_file}" || ! -f "${msg_file}" ]]; then
+  echo "commit-msg: missing commit message file" >&2
+  exit 1
+fi
+
+if grep -Eqi 'Generated with' "${msg_file}"; then
+  echo "commit-msg: reject message containing 'Generated with' (neutral attribution only)." >&2
+  exit 1
+fi
+
+# Agent / product denylist on Co-Authored-By trailers (case-insensitive).
+# Includes aliases: "Cursor Agent", bare "Cursor", and "cursoragent".
+if grep -Eqi '^[[:space:]]*Co-Authored-By:.*(Claude|Anthropic|Cursor Agent|cursoragent|\bCursor\b|Codex|ChatGPT|Gemini|Copilot|Aider|Devin)' "${msg_file}"; then
+  echo "commit-msg: reject agent Co-Authored-By trailer (neutral attribution only)." >&2
+  exit 1
+fi
+
+exit 0

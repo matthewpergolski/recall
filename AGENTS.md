@@ -87,11 +87,12 @@ Maintain four core files:
 Specs live in `specs/`; "Features and Specs" above says when to write one and
 when it is frozen.
 
-Run `uv run scripts/check_memory.py` at the start and at the end of a session
-and fix what it reports. It finds the signs of a stale note: too long, no date,
-another commit, a file that is gone, a subject missing from the index, a secret.
-It cannot tell whether a note is true; that is still your job. Meet a limit by
-cutting, not by packing more into a line.
+If cairnkit is set up for this checkout (see `memory status`), run
+`cairnkit check` at the start and at the end of a session and fix what it
+reports. `./scripts/check.sh` runs that only when `cairnkit` is on PATH and
+`memory status` succeeds; otherwise it skips silently. Legacy in-repo
+`memory-bank/` alone is not cairnkit setup. Meet a limit by cutting, not by
+packing more into a line.
 
 Before non-trivial work, read activeContext and projectbrief if present, then
 only relevant decisions, the subject files you need, and indexed specs.
@@ -129,14 +130,23 @@ explicitly record pending handoffs.
 
 ## Verification
 
-For Rust changes, run:
+For Rust (and agent-facing) changes, run the one check entry point:
 
 ```sh
-cargo fmt --check
-cargo check
-cargo test
-cargo clippy -- -D warnings
+./scripts/check.sh
 ```
+
+That runs, in order, and fails fast: `cargo fmt --check`, `cargo check`, `cargo test`, `cargo clippy -- -D warnings`, then optional `cairnkit check` only when cairnkit is on PATH and `memory status` shows a memory folder for this checkout (otherwise skipped silently; legacy `memory-bank/` alone does not trigger it), then a warning-only crate-version freshness reminder, then self-checks for `.githooks/commit-msg` and the cairnkit gate. Prefer this over scattering the cargo bullets. macOS CI (GitHub Actions on `macos-*`) is an optional future and is not implemented here — runner minutes are the cost.
+
+`scripts/check_version_freshness.sh` only prints a warning (exit 0) when `src/` or `capture-helper/` changed since the latest `v*` tag but `Cargo.toml` version did not. It does not rewrite `recall --version`; installed freshness already uses `RECALL_BUILD_COMMIT`. With no `v*` tags yet, it skips gracefully.
+
+Opt-in repo-local hooks (not a forced install):
+
+```sh
+git config core.hooksPath .githooks
+```
+
+`.githooks/pre-push` runs `scripts/check.sh`. `.githooks/commit-msg` rejects messages containing `Generated with` or agent `Co-Authored-By` trailers (Claude/Anthropic/Cursor Agent/cursoragent/bare Cursor/Codex and similar).
 
 `cargo test` already runs unit tests and `tests/cli_smoke.rs`, which invokes the compiled `recall` binary. Use that (or `cargo run -- <args>`) to verify CLI behavior from this checkout. Do not ask the user to `cargo install` or start a live meeting just to prove flag parsing, resume errors, or other non-TUI paths.
 

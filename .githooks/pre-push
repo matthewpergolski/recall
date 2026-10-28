@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Opt-in: enable with `git config core.hooksPath .githooks`
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+exec bash "${root}/scripts/check.sh"
