@@ -24,7 +24,8 @@ use ratatui::{DefaultTerminal, Frame};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::analysis::{
-    analyze, known_agents, maybe_rename_session_dir_for_title, AnalyzeOptions, AnalyzeTarget,
+    analyze, known_agents, maybe_rename_session_dir_for_title, AnalysisOverview, AnalyzeOptions,
+    AnalyzeTarget,
 };
 use crate::audio::{
     acquire_capture_lock, copy_take1_aliases, earlier_takes_are_transcript_only,
@@ -718,6 +719,7 @@ struct AnalysisStatus {
     percent: u16,
     result_path: Option<PathBuf>,
     failed: bool,
+    overview: Option<AnalysisOverview>,
 }
 
 struct AnalysisJob {
@@ -734,6 +736,7 @@ enum AnalysisUiEvent {
         generation: u32,
         meeting_path: PathBuf,
         generated_title: Option<String>,
+        overview: Option<AnalysisOverview>,
         published: bool,
     },
     Failed {
@@ -3285,6 +3288,7 @@ impl App {
                         generation,
                         meeting_path,
                         generated_title: result.generated_title,
+                        overview: result.overview,
                         published: result.published,
                     });
                 }
@@ -3318,6 +3322,7 @@ impl App {
                     generation,
                     meeting_path,
                     generated_title,
+                    overview,
                     published,
                 } => {
                     let apply = published
@@ -3351,6 +3356,7 @@ impl App {
                         self.analysis_status.percent = 100;
                         self.analysis_status.result_path = Some(meeting_path.clone());
                         self.analysis_status.failed = false;
+                        self.analysis_status.overview = overview;
                         self.toast = "Meeting notes ready.".to_string();
                         self.live_notes
                             .push(format!("Meeting ready: {}", meeting_path.display()));
@@ -4257,7 +4263,27 @@ impl App {
         ])
     }
 
+    /// The analysis result for the panels, once it is done and still current.
+    fn analysis_overview(&self) -> Option<&AnalysisOverview> {
+        let status = &self.analysis_status;
+        if matches!(self.state, CaptureState::Ended) && !status.failed && status.percent >= 100 {
+            status.overview.as_ref()
+        } else {
+            None
+        }
+    }
+
     fn render_decisions(&self, frame: &mut Frame, area: Rect) {
+        if let Some(overview) = self.analysis_overview() {
+            let lines = analysis_summary_lines(&self.title, overview);
+            frame.render_widget(
+                Paragraph::new(lines.join("\n"))
+                    .wrap(Wrap { trim: true })
+                    .block(Block::default().title(" TL;DR ").borders(Borders::ALL)),
+                area,
+            );
+            return;
+        }
         let items = match self.state {
             CaptureState::Ready => vec![
                 "No session yet".to_string(),
@@ -4305,6 +4331,23 @@ impl App {
     }
 
     fn render_actions(&self, frame: &mut Frame, area: Rect) {
+        if let Some(overview) = self.analysis_overview() {
+            frame.render_widget(
+                List::new(
+                    analysis_action_lines(overview)
+                        .into_iter()
+                        .map(ListItem::new)
+                        .collect::<Vec<_>>(),
+                )
+                .block(
+                    Block::default()
+                        .title(" Action Items ")
+                        .borders(Borders::ALL),
+                ),
+                area,
+            );
+            return;
+        }
         let mut items = vec![
             "Review Clean Conversation for remaining mic bleed".to_string(),
             "Use typed notes for important context during calls".to_string(),
@@ -4628,6 +4671,7 @@ impl AnalysisStatus {
             percent: 0,
             result_path: None,
             failed: false,
+            overview: None,
         }
     }
 
@@ -4637,8 +4681,70 @@ impl AnalysisStatus {
             percent: 10,
             result_path: None,
             failed: false,
+            overview: None,
         }
     }
+}
+
+const TLDR_CHARS: usize = 400;
+const ACTION_CHARS: usize = 120;
+
+/// One line of text: runs of whitespace become one space, and a long text is
+/// cut on a character boundary with an ellipsis.
+fn one_line(text: &str, max_chars: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    let mut cut: String = flat.chars().take(max_chars).collect();
+    cut.truncate(cut.trim_end().len());
+    cut.push('…');
+    cut
+}
+
+fn count_label(count: usize, noun: &str) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {noun}{plural}")
+}
+
+/// The left panel once analysis is done: title, counts, then the TL;DR, so a
+/// short panel cuts the TL;DR last.
+fn analysis_summary_lines(title: &str, overview: &AnalysisOverview) -> Vec<String> {
+    let mut lines = vec![
+        one_line(title, 80),
+        format!(
+            "{}, {}, {}",
+            count_label(overview.decisions, "decision"),
+            count_label(overview.actions, "action"),
+            count_label(overview.insights, "insight"),
+        ),
+    ];
+    if let Some(tldr) = &overview.tldr {
+        lines.push(format!("TL;DR: {}", one_line(tldr, TLDR_CHARS)));
+    }
+    lines
+}
+
+/// The right panel once analysis is done: the first action items and where
+/// the rest are.
+fn analysis_action_lines(overview: &AnalysisOverview) -> Vec<String> {
+    let mut lines: Vec<String> = overview
+        .first_actions
+        .iter()
+        .map(|task| format!("- {}", one_line(task, ACTION_CHARS)))
+        .collect();
+    if lines.is_empty() {
+        lines.push("No action items identified".to_string());
+    }
+    let more = overview
+        .actions
+        .saturating_sub(overview.first_actions.len());
+    lines.push(if more == 0 {
+        "Full list in meeting.md".to_string()
+    } else {
+        format!("Full list in meeting.md (+{more} more)")
+    });
+    lines
 }
 
 fn signal_gauge(label: &'static str, percent: u16, color: Color) -> Gauge<'static> {
@@ -5001,6 +5107,7 @@ mod tests {
                 session_path: renamed_previous,
                 generation: 1,
                 generated_title: Some("Previous Generated Title".to_string()),
+                overview: None,
                 published: true,
             })
             .unwrap();
@@ -5196,6 +5303,7 @@ mod tests {
                 generation: 1,
                 meeting_path: PathBuf::from("/tmp/stale-meeting.md"),
                 generated_title: Some("Stale Title".to_string()),
+                overview: None,
                 published: true,
             })
             .unwrap();
@@ -6532,5 +6640,106 @@ mod tests {
         app.mic_muted = true;
         app.mic_level_percent = 88;
         assert_eq!(app.mic_signal_value(), 0);
+    }
+    fn overview(tldr: Option<&str>, actions: &[&str]) -> AnalysisOverview {
+        AnalysisOverview {
+            tldr: tldr.map(str::to_string),
+            decisions: 3,
+            actions: actions.len(),
+            insights: 2,
+            first_actions: actions
+                .iter()
+                .take(3)
+                .map(|task| task.to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_summary_panel_leads_with_title_and_counts_then_the_tldr() {
+        let lines = analysis_summary_lines(
+            "Launch Sync",
+            &overview(Some("Launch Friday.\n- Sam sends the checklist"), &["a"; 5]),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Launch Sync".to_string(),
+                "3 decisions, 5 actions, 2 insights".to_string(),
+                "TL;DR: Launch Friday. - Sam sends the checklist".to_string(),
+            ]
+        );
+        let one = AnalysisOverview {
+            decisions: 1,
+            actions: 1,
+            insights: 1,
+            ..overview(None, &["a"])
+        };
+        let lines = analysis_summary_lines("T", &one);
+        assert_eq!(lines[1], "1 decision, 1 action, 1 insight");
+        assert_eq!(lines.len(), 2, "no TL;DR line when none was returned");
+    }
+
+    #[test]
+    fn long_summary_text_is_cut_on_a_character_boundary() {
+        let long = "é".repeat(2000);
+        let lines = analysis_summary_lines("T", &overview(Some(&long), &[]));
+        let tldr = lines.last().unwrap();
+        assert!(tldr.ends_with('…'));
+        assert!(tldr.chars().count() <= "TL;DR: ".len() + TLDR_CHARS + 1);
+    }
+
+    #[test]
+    fn the_actions_panel_lists_the_first_few_and_points_at_meeting_md() {
+        let lines = analysis_action_lines(&overview(None, &["a", "b", "c", "d", "e"]));
+        assert_eq!(
+            lines,
+            vec![
+                "- a".to_string(),
+                "- b".to_string(),
+                "- c".to_string(),
+                "Full list in meeting.md (+2 more)".to_string(),
+            ]
+        );
+        let lines = analysis_action_lines(&overview(None, &["a"]));
+        assert_eq!(lines, vec!["- a", "Full list in meeting.md"]);
+        let lines = analysis_action_lines(&overview(None, &[]));
+        assert_eq!(
+            lines,
+            vec!["No action items identified", "Full list in meeting.md"]
+        );
+    }
+
+    #[test]
+    fn a_finished_analysis_fills_the_panels_and_a_new_one_clears_them() {
+        let session = PathBuf::from("/tmp/recall-overview");
+        let (sender, receiver) = mpsc::channel();
+        let mut app = test_app(session.clone());
+        app.analysis_jobs.push(AnalysisJob {
+            session_path: session.clone(),
+            generation: 1,
+            receiver,
+        });
+        assert!(app.analysis_overview().is_none());
+
+        sender
+            .send(AnalysisUiEvent::Complete {
+                original_session_path: session.clone(),
+                session_path: session.clone(),
+                generation: 1,
+                meeting_path: session.join("meeting.md"),
+                generated_title: None,
+                overview: Some(overview(Some("Launch Friday."), &["a"])),
+                published: true,
+            })
+            .unwrap();
+        app.process_analysis_events();
+        assert_eq!(
+            app.analysis_overview().and_then(|o| o.tldr.as_deref()),
+            Some("Launch Friday.")
+        );
+
+        app.analysis_status = AnalysisStatus::running("grok");
+        assert!(app.analysis_overview().is_none());
     }
 }
