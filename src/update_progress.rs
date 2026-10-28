@@ -528,7 +528,7 @@ const SIG_DFL: usize = 0;
 unsafe extern "C" fn restore_cursor(sig: i32) {
     const SHOW: &[u8] = b"\r\x1b[?25h\n";
     unsafe {
-        let _ = write(1, SHOW.as_ptr(), SHOW.len());
+        let _ = write(1, SHOW.as_ptr().cast(), SHOW.len());
         signal(sig, SIG_DFL);
         raise(sig);
     }
@@ -536,7 +536,7 @@ unsafe extern "C" fn restore_cursor(sig: i32) {
 
 #[cfg(unix)]
 unsafe extern "C" {
-    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
     fn signal(sig: i32, handler: usize) -> usize;
     fn raise(sig: i32) -> i32;
 }

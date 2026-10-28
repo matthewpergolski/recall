@@ -113,9 +113,11 @@ impl Loudness {
         // read_exact leaves a last partial frame out, which is under 10 ms.
         while stdout.read_exact(&mut bytes).is_ok() {
             let sum: f32 = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|sample| {
-                    let value = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+                    let value = f32::from_le_bytes(*sample);
                     value * value
                 })
                 .sum();
