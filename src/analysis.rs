@@ -41,8 +41,23 @@ pub struct AnalyzeResult {
     pub result_path: Option<PathBuf>,
     pub written_files: Vec<PathBuf>,
     pub generated_title: Option<String>,
+    /// What the TUI shows once analysis is done. Built from the same parsed
+    /// result as `meeting.md`; `None` for a dry run or a stale take.
+    pub overview: Option<AnalysisOverview>,
     pub dry_run: bool,
     pub published: bool,
+}
+
+/// How many action items the overview carries for the TUI.
+pub const OVERVIEW_ACTIONS: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisOverview {
+    pub tldr: Option<String>,
+    pub decisions: usize,
+    pub actions: usize,
+    pub insights: usize,
+    pub first_actions: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +73,11 @@ struct AgentMeetingResult {
     title: Option<String>,
     summary: Option<String>,
     #[serde(default)]
+    tldr: Option<String>,
+    #[serde(default)]
     decisions: Vec<Decision>,
+    #[serde(default)]
+    insights: Vec<Insight>,
     #[serde(default, alias = "actionItems")]
     action_items: Vec<ActionItem>,
     #[serde(default)]
@@ -70,6 +89,13 @@ struct AgentMeetingResult {
 #[derive(Debug, Deserialize)]
 struct Decision {
     decision: String,
+    evidence: Option<String>,
+    timestamp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Insight {
+    insight: String,
     evidence: Option<String>,
     timestamp: Option<String>,
 }
@@ -102,6 +128,28 @@ struct Followup {
     evidence: Option<String>,
     #[serde(default)]
     timestamp: Option<String>,
+}
+
+impl AgentMeetingResult {
+    fn overview(&self) -> AnalysisOverview {
+        AnalysisOverview {
+            tldr: self
+                .tldr
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string),
+            decisions: self.decisions.len(),
+            actions: self.action_items.len(),
+            insights: self.insights.len(),
+            first_actions: self
+                .action_items
+                .iter()
+                .take(OVERVIEW_ACTIONS)
+                .map(|item| item.task.clone())
+                .collect(),
+        }
+    }
 }
 
 pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
@@ -147,6 +195,7 @@ pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
             result_path: None,
             written_files: Vec::new(),
             generated_title: None,
+            overview: None,
             dry_run: true,
             published: true,
         });
@@ -210,6 +259,7 @@ pub fn analyze(options: &AnalyzeOptions) -> io::Result<AnalyzeResult> {
         result_path: Some(result_path),
         written_files,
         generated_title,
+        overview: Some(result.overview()),
         dry_run: false,
         published: true,
     })
@@ -237,6 +287,7 @@ fn stale_analyze_result(session_path: &Path) -> AnalyzeResult {
         result_path: None,
         written_files: Vec::new(),
         generated_title: None,
+        overview: None,
         dry_run: false,
         published: false,
     }
@@ -460,7 +511,7 @@ Preset: {preset}
 
 Use {sources}. Do not browse the filesystem, edit files, or call tools unless required to return the JSON. Return exactly one JSON object and no prose outside JSON.
 
-The transcript comes from speech recognition and can hold lines nobody said. Treat these with doubt, and do not base a decision, action item, or question on one alone:
+The transcript comes from speech recognition and can hold lines nobody said. Treat these with doubt, and do not base a decision, action item, insight, or question on one alone:
 - A short stray mic line while nobody is speaking, often at the very start or end, or while a call is connecting. Examples: "you.", "cheese.", a lone ".".
 - A long rambling mic line during silence that fits nothing around it. Example: "Sorry, ding, ding, ding, ding."
 - A mic line at the same moment as a call line that says nearly the same thing with odd words. That is the far side heard through the speakers. Use the call line. Examples: mic "Big plan." beside call "Big plans."; mic "On Tong nights" beside call "On calm nights".
@@ -475,11 +526,19 @@ Use this schema:
 {{
   "summary": "Concise meeting summary.",
   "title": "Concise meeting title, 3 to 8 words, no date.",
+  "tldr": "Two or three sentences, or at most three short bullets: the outcome and what is needed next.",
   "decisions": [
     {{
       "decision": "What was decided",
       "evidence": "Exact words copied from one transcript line",
       "timestamp": "00:12.300"
+    }}
+  ],
+  "insights": [
+    {{
+      "insight": "One claim: a pattern, a risk, a disagreement, or an assumption nobody said aloud",
+      "evidence": "Exact words copied from one transcript line",
+      "timestamp": "00:20.700"
     }}
   ],
   "action_items": [
@@ -510,6 +569,8 @@ Use this schema:
 If a field has no items, return an empty array. Use null when owner, due, evidence, or timestamp is unknown.
 For each timestamp, copy the start time of the transcript line that supports the item. For evidence, copy words exactly from that line. Do not paraphrase.{note_exception}
 If the transcript title is generic, such as Quick Capture, infer a specific useful title from the conversation.
+The tldr comes before the summary and must not repeat the summary. Say what came out of the meeting and what is needed next.
+Give an insight only when the meeting supports it. Return an empty insights array when nothing genuine stands out. Do not pad it.
 "#,
         transcript_path = transcript_path.display(),
         transcript = transcript,
@@ -924,14 +985,20 @@ fn meeting_markdown(
     };
     let items = [
         decisions_markdown(&result.decisions, &mut sources),
+        insights_markdown(&result.insights, &mut sources),
         actions_markdown(&result.action_items, &mut sources),
         questions_markdown(&result.questions, &mut sources),
         followups_markdown(&result.followups, &mut sources),
     ]
     .concat();
     let mut markdown = format!(
-        "# {title}\n\n> Analysis generated from {read}.{}\n\n## Summary\n\n{}\n\n",
+        "# {title}\n\n> Analysis generated from {read}.{}\n\n## TL;DR\n\n{}\n\n## Summary\n\n{}\n\n",
         sources.note(),
+        result
+            .tldr
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or("_No TL;DR returned._"),
         result
             .summary
             .as_deref()
@@ -1132,6 +1199,28 @@ fn decisions_markdown(items: &[Decision], sources: &mut Sources) -> String {
     markdown
 }
 
+fn insights_markdown(items: &[Insight], sources: &mut Sources) -> String {
+    let mut markdown = "## Insights\n\n".to_string();
+    if items.is_empty() {
+        markdown.push_str("_No insights identified._\n\n");
+        return markdown;
+    }
+
+    for item in items {
+        markdown.push_str(&format!("- {}", item.insight));
+        sources.append(
+            &mut markdown,
+            item.timestamp.as_deref(),
+            item.evidence.as_deref(),
+            true,
+        );
+        append_detail(&mut markdown, "Evidence", item.evidence.as_deref());
+        markdown.push('\n');
+    }
+    markdown.push('\n');
+    markdown
+}
+
 fn questions_markdown(items: &[Question], sources: &mut Sources) -> String {
     let mut markdown = "## Open Questions\n\n".to_string();
     if items.is_empty() {
@@ -1193,7 +1282,8 @@ mod tests {
     use super::{
         analysis_work_dir, extract_agent_result_json, known_agents,
         maybe_rename_session_dir_for_title, meeting_markdown, session_timestamp_prefix, title_slug,
-        write_analysis_markdown, ActionItem, AgentMeetingResult, Decision, Followup, Question,
+        write_analysis_markdown, ActionItem, AgentMeetingResult, Decision, Followup, Insight,
+        Question,
     };
     use crate::audio::{write_capture_progress, CaptureProgress};
     use std::fs;
@@ -1870,5 +1960,218 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(storage);
+    }
+    #[test]
+    fn a_result_without_tldr_or_insights_still_parses() {
+        let old = serde_json::json!({
+            "summary": "Done",
+            "decisions": [],
+            "action_items": [],
+            "questions": [],
+            "followups": []
+        });
+        let result = serde_json::from_value::<AgentMeetingResult>(old).unwrap();
+        assert_eq!(result.tldr, None);
+        assert!(result.insights.is_empty());
+
+        let new = serde_json::json!({
+            "summary": "Done",
+            "tldr": "Shipping Friday. Sam sends the checklist.",
+            "insights": [
+                {"insight": "Nobody owns QA", "evidence": "who tests it", "timestamp": "01:20.000"},
+                {"insight": "Budget is assumed"}
+            ]
+        });
+        let result = serde_json::from_value::<AgentMeetingResult>(new).unwrap();
+        assert_eq!(
+            result.tldr.as_deref(),
+            Some("Shipping Friday. Sam sends the checklist.")
+        );
+        assert_eq!(result.insights.len(), 2);
+        assert_eq!(result.insights[0].insight, "Nobody owns QA");
+        assert_eq!(result.insights[1].timestamp, None);
+    }
+
+    #[test]
+    fn the_prompt_asks_for_a_tldr_and_cited_insights() {
+        let session_dir = session_with_transcript(
+            "prompt-tldr",
+            "# Sync\n\n- [00:01.000 - 00:02.000] **call:** Hello.\n",
+        );
+        let prompt =
+            super::analysis_prompt(&session_dir.join("transcript.md"), "", "general").unwrap();
+        assert!(prompt.contains("\"tldr\":"), "{prompt}");
+        assert!(prompt.contains("\"insights\": ["), "{prompt}");
+        assert!(prompt.contains("\"insight\":"), "{prompt}");
+        assert!(prompt.contains("empty insights array"), "{prompt}");
+        assert!(prompt.contains("must not repeat the summary"), "{prompt}");
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    fn position(text: &str, needle: &str) -> usize {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?} in {text}"))
+    }
+
+    #[test]
+    fn meeting_md_puts_the_tldr_before_the_summary_and_insights_after_decisions() {
+        let session_dir = session_with_transcript(
+            "order",
+            "# Sync\n\n- [01:10.000 - 01:14.500] **call:** We agreed to launch the beta on Friday morning.\n",
+        );
+        let result = AgentMeetingResult {
+            summary: Some("Launch plan.".to_string()),
+            tldr: Some("Launch Friday; Sam sends the checklist.".to_string()),
+            decisions: vec![Decision {
+                decision: "Launch Friday".to_string(),
+                evidence: None,
+                timestamp: Some("01:10.000".to_string()),
+            }],
+            insights: vec![Insight {
+                insight: "The launch date was set without checking QA".to_string(),
+                evidence: Some("launch the beta on Friday morning".to_string()),
+                timestamp: Some("01:10.000".to_string()),
+            }],
+            ..AgentMeetingResult::default()
+        };
+
+        let markdown = meeting_markdown(&session_dir, "Sync", &result).unwrap();
+        let tldr = position(
+            &markdown,
+            "## TL;DR\n\nLaunch Friday; Sam sends the checklist.\n",
+        );
+        let summary = position(&markdown, "## Summary");
+        let decisions = position(&markdown, "## Decisions");
+        let insights = position(&markdown, "## Insights");
+        let actions = position(&markdown, "## Action Items");
+        assert!(tldr < summary && summary < decisions, "{markdown}");
+        assert!(decisions < insights && insights < actions, "{markdown}");
+        assert!(
+            markdown.contains(
+                "- The launch date was set without checking QA (01:10, call) (Evidence: launch the beta on Friday morning)\n"
+            ),
+            "{markdown}"
+        );
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn meeting_md_says_so_when_there_is_no_tldr_or_insight() {
+        let session_dir = session_with_transcript("empty-insights", "# Sync\n");
+        let result = AgentMeetingResult {
+            summary: Some("Launch plan.".to_string()),
+            ..AgentMeetingResult::default()
+        };
+        let markdown = meeting_markdown(&session_dir, "Sync", &result).unwrap();
+        assert!(
+            markdown.contains("## TL;DR\n\n_No TL;DR returned._\n\n## Summary"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("## Insights\n\n_No insights identified._\n\n## Action Items"),
+            "{markdown}"
+        );
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn an_unsupported_insight_is_marked_like_any_other_item() {
+        let session_dir = session_with_transcript(
+            "insight-marks",
+            "# Sync\n\n- [01:10.000 - 01:14.500] **call:** We agreed to launch the beta on Friday morning.\n",
+        );
+        let result = AgentMeetingResult {
+            insights: vec![
+                // A time with no line and a quote nobody said.
+                Insight {
+                    insight: "Everyone fears the audit".to_string(),
+                    evidence: Some("we are all afraid of the audit".to_string()),
+                    timestamp: Some("09:00.000".to_string()),
+                },
+                // A real line, a quote that is not on it.
+                Insight {
+                    insight: "Budget is a risk".to_string(),
+                    evidence: Some("the budget will run out".to_string()),
+                    timestamp: Some("01:10.000".to_string()),
+                },
+                // No time at all.
+                Insight {
+                    insight: "Scope will creep".to_string(),
+                    evidence: None,
+                    timestamp: None,
+                },
+            ],
+            ..AgentMeetingResult::default()
+        };
+
+        let markdown = meeting_markdown(&session_dir, "Sync", &result).unwrap();
+        assert!(
+            markdown.contains("- Everyone fears the audit (not found in transcript) (Evidence:"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- Budget is a risk (01:10, call; quote not found there) (Evidence:"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- Scope will creep (no source given)\n"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "1 of 3 items cites a line of the transcript. 1 quote was not found where cited."
+            ),
+            "{markdown}"
+        );
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn an_insight_that_rests_on_a_note_cites_the_note() {
+        let session_dir = session_with_notes("insight-note");
+        let result = AgentMeetingResult {
+            insights: vec![Insight {
+                insight: "The budget stops at Q3".to_string(),
+                evidence: Some("budget = Q3 only".to_string()),
+                timestamp: Some("00:03".to_string()),
+            }],
+            ..AgentMeetingResult::default()
+        };
+        let markdown = meeting_markdown(&session_dir, "Sync", &result).unwrap();
+        assert!(
+            markdown.contains("- The budget stops at Q3 (note 00:03) (Evidence:"),
+            "{markdown}"
+        );
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn the_overview_counts_the_same_items_meeting_md_lists() {
+        let result = AgentMeetingResult {
+            tldr: Some("Launch Friday.".to_string()),
+            decisions: vec![Decision {
+                decision: "Launch Friday".to_string(),
+                evidence: None,
+                timestamp: None,
+            }],
+            action_items: ["a", "b", "c", "d", "e"]
+                .into_iter()
+                .map(|task| ActionItem {
+                    task: task.to_string(),
+                    owner: None,
+                    due: None,
+                    evidence: None,
+                    timestamp: None,
+                })
+                .collect(),
+            ..AgentMeetingResult::default()
+        };
+        let overview = result.overview();
+        assert_eq!(overview.tldr.as_deref(), Some("Launch Friday."));
+        assert_eq!(
+            (overview.decisions, overview.actions, overview.insights),
+            (1, 5, 0)
+        );
+        assert_eq!(overview.first_actions, vec!["a", "b", "c"]);
     }
 }

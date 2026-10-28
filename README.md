@@ -197,7 +197,7 @@ recall transcribe latest
 
 ## Agent Analysis
 
-Recall can hand the clean `transcript.md` to a headless coding agent and write one complete `meeting.md` containing the summary, decisions, action items, questions, follow-ups, notes, and markers.
+Recall can hand the clean `transcript.md` to a headless coding agent and write one complete `meeting.md` containing a TL;DR, the summary, decisions, insights, action items, questions, follow-ups, notes, and markers.
 
 See [docs/AGENT_ANALYSIS.md](docs/AGENT_ANALYSIS.md) for all setup modes: CLI flags, alias, and config defaults.
 
