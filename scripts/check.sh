@@ -35,4 +35,7 @@ bash scripts/test_commit_msg_hook.sh
 echo "==> scripts/test_cairnkit_check_gate.sh"
 bash scripts/test_cairnkit_check_gate.sh
 
+echo "==> python3 -m unittest discover (check_identity / check_pr_body)"
+python3 -m unittest discover -s tests -p 'test_check_*.py' -q
+
 echo "All checks passed."
