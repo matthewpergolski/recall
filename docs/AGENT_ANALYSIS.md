@@ -211,7 +211,7 @@ Recall asks agents to return one JSON object:
 }
 ```
 
-`tldr` is shown above the summary and does not repeat it. Each `insights` entry is one claim: a pattern, a risk, a disagreement, or an assumption nobody said aloud. It has `insight`, `evidence`, and `timestamp`, and follows the same rules as a decision: the evidence is copied from one transcript line, and an insight that only a note supports uses the note's time and words. The agent returns an empty array when nothing genuine stands out. `tldr` and `insights` may be left out; a result saved without them still parses, and `meeting.md` says no TL;DR or insights were returned.
+`tldr` is shown above the summary and does not repeat it. Each `insights` entry is one claim: a pattern, a risk, or a disagreement the transcript supports. It has `insight`, `evidence`, and `timestamp`, and follows the same evidence bar as a decision: the evidence is copied from one transcript line, and an insight that only a note supports uses the note's time and words. Do not invent an assumption that nobody said and that no line or note can cite. The agent returns an empty array when nothing genuine stands out. `tldr` and `insights` may be left out; a result saved without them still parses, and `meeting.md` says no TL;DR or insights were returned.
 
 Recall keeps control of file layout. It parses the agent response, saves raw and normalized output under `.recall/analysis/`, renames generic session folders such as `quick-capture` when the agent returns a useful title, updates session metadata/headings, and renders `meeting.md` from that normalized result.
 

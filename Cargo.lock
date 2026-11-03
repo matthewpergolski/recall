@@ -1107,7 +1107,7 @@ dependencies = [
 
 [[package]]
 name = "recall"
-version = "0.7.3"
+version = "0.8.0"
 dependencies = [
  "crossterm",
  "jiff",

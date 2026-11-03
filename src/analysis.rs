@@ -536,7 +536,7 @@ Use this schema:
   ],
   "insights": [
     {{
-      "insight": "One claim: a pattern, a risk, a disagreement, or an assumption nobody said aloud",
+      "insight": "One claim: a pattern, a risk, or a disagreement the transcript supports",
       "evidence": "Exact words copied from one transcript line",
       "timestamp": "00:20.700"
     }}
@@ -570,7 +570,7 @@ If a field has no items, return an empty array. Use null when owner, due, eviden
 For each timestamp, copy the start time of the transcript line that supports the item. For evidence, copy words exactly from that line. Do not paraphrase.{note_exception}
 If the transcript title is generic, such as Quick Capture, infer a specific useful title from the conversation.
 The tldr comes before the summary and must not repeat the summary. Say what came out of the meeting and what is needed next.
-Give an insight only when the meeting supports it. Return an empty insights array when nothing genuine stands out. Do not pad it.
+Hold insights to the same evidence bar as a decision: every insight needs a timestamp and evidence copied exactly from one transcript line (or from a note, using the note exception above). Name a pattern, risk, or disagreement that those words support. Do not invent an assumption that nobody said and that no line or note can cite. Return an empty insights array when nothing genuine stands out. Do not pad it.
 "#,
         transcript_path = transcript_path.display(),
         transcript = transcript,
@@ -2005,6 +2005,29 @@ mod tests {
         assert!(prompt.contains("\"insight\":"), "{prompt}");
         assert!(prompt.contains("empty insights array"), "{prompt}");
         assert!(prompt.contains("must not repeat the summary"), "{prompt}");
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn the_prompt_holds_insights_to_the_same_evidence_bar_as_decisions() {
+        let session_dir = session_with_transcript(
+            "prompt-insight-evidence",
+            "# Sync\n\n- [00:01.000 - 00:02.000] **call:** Hello.\n",
+        );
+        let prompt =
+            super::analysis_prompt(&session_dir.join("transcript.md"), "", "general").unwrap();
+        assert!(
+            !prompt.contains("assumption nobody said aloud"),
+            "insights must not invite unstated assumptions: {prompt}"
+        );
+        assert!(
+            prompt.contains("same evidence bar as a decision"),
+            "insights must match decisions on evidence: {prompt}"
+        );
+        assert!(
+            prompt.contains("Exact words copied from one transcript line"),
+            "{prompt}"
+        );
         let _ = fs::remove_dir_all(session_dir);
     }
 

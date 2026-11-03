@@ -2357,6 +2357,15 @@ impl App {
         Ok(())
     }
 
+    /// Drop a finished overview when a new take starts so the Option cannot
+    /// linger after percent is reset.
+    fn wait_analysis_for_this_take(&mut self) {
+        self.analysis_status.percent = 0;
+        self.analysis_status.failed = false;
+        self.analysis_status.overview = None;
+        self.analysis_status.label = "Analysis waits for this take".to_string();
+    }
+
     fn continue_capture(&mut self) -> io::Result<()> {
         if matches!(self.state, CaptureState::Recording) {
             self.toast = "Session is already active.".to_string();
@@ -2409,9 +2418,7 @@ impl App {
             );
             self.started_at = Some(Instant::now());
             self.state = CaptureState::Recording;
-            self.analysis_status.percent = 0;
-            self.analysis_status.failed = false;
-            self.analysis_status.label = "Analysis waits for this take".to_string();
+            self.wait_analysis_for_this_take();
             let mut toast = if self.has_background_jobs() {
                 "Continuing this session. Previous transcript still running in the background."
                     .to_string()
@@ -4275,7 +4282,8 @@ impl App {
 
     fn render_decisions(&self, frame: &mut Frame, area: Rect) {
         if let Some(overview) = self.analysis_overview() {
-            let lines = analysis_summary_lines(&self.title, overview);
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let lines = analysis_summary_lines(&self.title, overview, inner_width);
             frame.render_widget(
                 Paragraph::new(lines.join("\n"))
                     .wrap(Wrap { trim: true })
@@ -4707,11 +4715,41 @@ fn count_label(count: usize, noun: &str) -> String {
     format!("{count} {noun}{plural}")
 }
 
+/// Fit `text` into one terminal row of `width` columns. Wide glyphs count by
+/// display width; an overlong string is cut with an ellipsis that still fits.
+fn fit_one_row(text: &str, width: usize) -> String {
+    let width = width.max(1);
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if UnicodeWidthStr::width(flat.as_str()) <= width {
+        return flat;
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let budget = width - 1;
+    let mut cut = String::new();
+    let mut cols = 0;
+    for ch in flat.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cols + w > budget {
+            break;
+        }
+        cut.push(ch);
+        cols += w;
+    }
+    while cut.ends_with(char::is_whitespace) {
+        cut.pop();
+    }
+    cut.push('…');
+    cut
+}
+
 /// The left panel once analysis is done: title, counts, then the TL;DR, so a
-/// short panel cuts the TL;DR last.
-fn analysis_summary_lines(title: &str, overview: &AnalysisOverview) -> Vec<String> {
+/// short panel cuts the TL;DR last. `width` is the inner panel column count;
+/// the title is clipped to that width so it cannot wrap and steal the TL;DR row.
+fn analysis_summary_lines(title: &str, overview: &AnalysisOverview, width: usize) -> Vec<String> {
     let mut lines = vec![
-        one_line(title, 80),
+        fit_one_row(title, width),
         format!(
             "{}, {}, {}",
             count_label(overview.decisions, "decision"),
@@ -6660,6 +6698,7 @@ mod tests {
         let lines = analysis_summary_lines(
             "Launch Sync",
             &overview(Some("Launch Friday.\n- Sam sends the checklist"), &["a"; 5]),
+            80,
         );
         assert_eq!(
             lines,
@@ -6675,7 +6714,7 @@ mod tests {
             insights: 1,
             ..overview(None, &["a"])
         };
-        let lines = analysis_summary_lines("T", &one);
+        let lines = analysis_summary_lines("T", &one, 80);
         assert_eq!(lines[1], "1 decision, 1 action, 1 insight");
         assert_eq!(lines.len(), 2, "no TL;DR line when none was returned");
     }
@@ -6683,10 +6722,58 @@ mod tests {
     #[test]
     fn long_summary_text_is_cut_on_a_character_boundary() {
         let long = "é".repeat(2000);
-        let lines = analysis_summary_lines("T", &overview(Some(&long), &[]));
+        let lines = analysis_summary_lines("T", &overview(Some(&long), &[]), 80);
         let tldr = lines.last().unwrap();
         assert!(tldr.ends_with('…'));
         assert!(tldr.chars().count() <= "TL;DR: ".len() + TLDR_CHARS + 1);
+    }
+
+    #[test]
+    fn a_narrow_panel_keeps_the_title_to_one_row_so_the_tldr_stays() {
+        let title = "Weekly Launch Planning Sync With Design And Eng";
+        let lines = analysis_summary_lines(
+            title,
+            &overview(Some("Ship Friday. Sam owns the checklist."), &["a"]),
+            24,
+        );
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            UnicodeWidthStr::width(lines[0].as_str()) <= 24,
+            "title must fit one row at panel width: {}",
+            lines[0]
+        );
+        assert!(
+            lines[2].starts_with("TL;DR:"),
+            "TL;DR must remain a line of its own: {lines:?}"
+        );
+        assert_ne!(
+            lines[0], title,
+            "a long title must be clipped for a narrow pane"
+        );
+    }
+
+    #[test]
+    fn continuing_a_session_clears_the_finished_overview() {
+        let mut app = test_app(PathBuf::from("/tmp/recall-continue-clears-overview"));
+        app.state = CaptureState::Ended;
+        app.analysis_status.percent = 100;
+        app.analysis_status.overview = Some(overview(Some("Launch Friday."), &["a"]));
+        assert!(app.analysis_overview().is_some());
+
+        app.wait_analysis_for_this_take();
+
+        assert!(
+            app.analysis_status.overview.is_none(),
+            "continue must drop the finished overview, not leave a stale Option"
+        );
+        assert_eq!(app.analysis_status.percent, 0);
+        assert!(!app.analysis_status.failed);
+        assert!(
+            app.analysis_status.label.contains("waits for this take"),
+            "{}",
+            app.analysis_status.label
+        );
+        assert!(app.analysis_overview().is_none());
     }
 
     #[test]
