@@ -38,4 +38,16 @@ bash scripts/test_cairnkit_check_gate.sh
 echo "==> python3 -m unittest discover (check_identity / check_pr_body)"
 python3 -m unittest discover -s tests -p 'test_check_*.py' -q
 
+echo "==> python3 scripts/check_identity.py origin/main..HEAD"
+python3 scripts/check_identity.py origin/main..HEAD
+
+# Optional local/CI PR-body gate: pass a file path or the PR_BODY env var.
+if [[ -n "${PR_BODY_FILE:-}" ]]; then
+  echo "==> python3 scripts/check_pr_body.py ${PR_BODY_FILE}"
+  python3 scripts/check_pr_body.py "${PR_BODY_FILE}"
+elif [[ -n "${PR_BODY:-}" ]]; then
+  echo "==> python3 scripts/check_pr_body.py (PR_BODY env)"
+  python3 scripts/check_pr_body.py
+fi
+
 echo "All checks passed."

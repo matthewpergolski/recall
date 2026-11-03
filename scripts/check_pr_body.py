@@ -43,7 +43,9 @@ _HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.M)
 _MERMAID = re.compile(r"^```mermaid\s*$", re.M | re.I)
 
 # Versioned / dotted model ids. Bare Claude / Cursor / Codex are not matched.
-# Trailing file extensions are ignored so asset names are not treated as ids.
+# No bare cursor-... alternative: branch names like cursor-pr-template-...
+# must not false-positive as model ids. Trailing file extensions are ignored
+# so asset names are not treated as ids.
 _MODEL_ID = re.compile(
     r"(?i)\b(?:"
     r"gpt-[\w.\-]+|"
@@ -54,8 +56,7 @@ _MODEL_ID = re.compile(
     r"grok-[\w.\-]+|"
     r"llama-[\w.\-]+|"
     r"mistral-[\w.\-]+|"
-    r"codex-[\w.\-]+|"
-    r"cursor-[\w.\-]+"
+    r"codex-[\w.\-]+"
     r")\b"
 )
 _ASSET_SUFFIX = re.compile(

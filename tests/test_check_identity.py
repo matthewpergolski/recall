@@ -248,6 +248,65 @@ class CheckIdentityTests(unittest.TestCase):
             ).returncode
             self.assertEqual(code, 1)
 
+    def test_generated_with_in_commit_message_is_reported(self) -> None:
+        """F2: attribution-marker path rejects Generated with in the message."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = init_repo(Path(tmp) / "generated-with")
+            (repo / "a.txt").write_text("x\n")
+            git(repo, "add", "a.txt")
+            msg = "feat\n\nGenerated with an assistant\n"
+            git(repo, "commit", "-q", "-m", msg)
+            errors = self.mod.check_range(repo, "HEAD~1..HEAD")
+            self.assertTrue(errors)
+            self.assertTrue(any("Generated with" in e for e in errors))
+
+    def test_cursor_agent_trailer_is_reported(self) -> None:
+        """F3: bare Cursor Agent: trailer is forbidden."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = init_repo(Path(tmp) / "cursor-agent-trailer")
+            (repo / "a.txt").write_text("x\n")
+            git(repo, "add", "a.txt")
+            msg = "feat\n\nCursor Agent: did the edits\n"
+            git(repo, "commit", "-q", "-m", msg)
+            errors = self.mod.check_range(repo, "HEAD~1..HEAD")
+            self.assertTrue(any("cursor agent" in e.lower() for e in errors))
+
+    def test_assisted_by_trailer_is_reported(self) -> None:
+        """F3: Assisted-by: trailer is forbidden."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = init_repo(Path(tmp) / "assisted-by")
+            (repo / "a.txt").write_text("x\n")
+            git(repo, "add", "a.txt")
+            msg = "feat\n\nAssisted-by: Someone <someone@example.net>\n"
+            git(repo, "commit", "-q", "-m", msg)
+            errors = self.mod.check_range(repo, "HEAD~1..HEAD")
+            self.assertTrue(any("assisted-by" in e.lower() for e in errors))
+
+    def test_branch_like_cursor_token_is_not_a_model_id(self) -> None:
+        """F4: hyphenated cursor-... branch names must not trip model-id rules."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = init_repo(Path(tmp) / "branch-token")
+            (repo / "a.txt").write_text("x\n")
+            git(repo, "add", "a.txt")
+            git(
+                repo,
+                "commit",
+                "-q",
+                "-m",
+                "land cursor-pr-template-identity-3d92 checks",
+            )
+            errors = self.mod.check_range(repo, "HEAD~1..HEAD")
+            self.assertEqual(errors, [])
+            self.assertFalse(any("model id" in e for e in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

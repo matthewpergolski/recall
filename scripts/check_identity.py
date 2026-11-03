@@ -5,9 +5,11 @@ Allowed identity (author and committer):
 
   recall contributors <contributors@recall.invalid>
 
-Fails when a commit has a Co-Authored-By, Reviewed-by, or Claude trailer,
-or an AI model name/id in the author, committer, or message. Signed-off-by
-must use the neutral identity when present.
+Fails when a commit has a Co-Authored-By, Reviewed-by, Claude, Cursor Agent,
+or Assisted-by trailer, a "Generated with" attribution marker, or an AI model
+name/id in the author, committer, or message. Signed-off-by must use the
+neutral identity when present. Hyphenated branch-like `cursor-...` tokens are
+not treated as model ids.
 
 Also fails when a commit's added lines introduce a personal-looking email
 address other than that neutral address. Generic placeholders such as
@@ -46,7 +48,7 @@ _EMAIL = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
 
 # Trailers that must never appear (any value).
 _FORBIDDEN_TRAILER = re.compile(
-    r"^(Co-authored-by|Reviewed-by|Claude(?:-[A-Za-z0-9]+)?)\s*:",
+    r"^(Co-authored-by|Reviewed-by|Assisted-by|Cursor Agent|Claude(?:-[A-Za-z0-9]+)?)\s*:",
     re.I | re.M,
 )
 # Signed-off-by may exist only with the neutral identity.
@@ -57,6 +59,8 @@ _SIGNED_OFF = re.compile(
 _TRAILER_VALUE = re.compile(r"^(.+?)\s*<([^>]+)>\s*$")
 
 # Versioned / dotted model ids (same family as check_pr_body.py).
+# No bare cursor-... alternative: branch names like cursor-pr-template-...
+# must not false-positive as model ids.
 _MODEL_ID = re.compile(
     r"(?i)\b(?:"
     r"gpt-[\w.\-]+|"
@@ -67,8 +71,7 @@ _MODEL_ID = re.compile(
     r"grok-[\w.\-]+|"
     r"llama-[\w.\-]+|"
     r"mistral-[\w.\-]+|"
-    r"codex-[\w.\-]+|"
-    r"cursor-[\w.\-]+"
+    r"codex-[\w.\-]+"
     r")\b"
 )
 # AI product / model names that must not appear as author or committer.
@@ -145,7 +148,8 @@ def check_commit(
         kind = match.group(1)
         errors.append(
             f"{short}: forbidden trailer {kind} "
-            "(no Co-Authored-By, Reviewed-by, or Claude trailers)"
+            "(no Co-Authored-By, Reviewed-by, Assisted-by, "
+            "Cursor Agent, or Claude trailers)"
         )
 
     for match in _SIGNED_OFF.finditer(body):
@@ -253,7 +257,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {line}", file=sys.stderr)
     print(
         f"Fix: use {ALLOWED} for author and committer; "
-        "no Co-Authored-By, Reviewed-by, Claude trailers, or AI model names.",
+        "no Co-Authored-By, Reviewed-by, Assisted-by, Cursor Agent, "
+        "or Claude trailers, Generated with markers, or AI model names.",
         file=sys.stderr,
     )
     return 1

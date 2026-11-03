@@ -135,6 +135,16 @@ class CheckPrBodyTests(unittest.TestCase):
         )
         self.assertFalse(any("model id" in e for e in self.mod.check_body(body)))
 
+    def test_branch_like_cursor_token_is_not_a_model_id(self) -> None:
+        """F4: hyphenated cursor-... branch names must not trip model-id rules."""
+        body = good_body().replace(
+            "- none yet\n",
+            "- none yet\n\nBranch: cursor-pr-template-identity-3d92\n",
+        )
+        errors = self.mod.check_body(body)
+        self.assertEqual(errors, [])
+        self.assertFalse(any("model id" in e for e in errors))
+
     def test_missing_heading_is_reported(self) -> None:
         body = good_body().replace("## Review\n", "## Notes\n")
         errors = self.mod.check_body(body)
