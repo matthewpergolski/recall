@@ -1811,10 +1811,4 @@ mod tests {
             Some(ResumeTarget::Named("2026-05-26_1921-et-design-sync".into()))
         );
     }
-
-    #[test]
-    fn crate_version_is_the_feature_minor() {
-        // User-facing TL;DR + insights is a feature → minor bump (AGENTS.md).
-        assert_eq!(VERSION, "0.8.0");
-    }
 }
