@@ -46,8 +46,9 @@ Recall should feel polished and calm, with a Claude Code-style terminal interfac
 - Separate local/user track and call/system track where possible: `mic.m4a` and `call.m4a`
 - Manual transcription pipeline: `recall transcribe latest` (default Apple SpeechAnalyzer on Apple Silicon macOS 26+; `--engine parakeet` and `--engine whisper` remain)
 - Combined timestamped transcript timeline
-- Summary generation
+- TL;DR and summary generation
 - Decisions
+- Insights
 - Action items
 - Questions and follow-ups
 

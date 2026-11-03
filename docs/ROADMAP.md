@@ -107,8 +107,10 @@ v2 should include:
 - Debug transcript folder for raw combined/per-track text: done
 - Agent analysis command: initial implementation done
 - TUI auto-analysis after transcription: initial implementation done
+- TL;DR
 - Summary
 - Decisions
+- Insights
 - Action items
 - Questions
 - Follow-ups
