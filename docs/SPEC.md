@@ -97,6 +97,7 @@ sessions/
         prompt.md
         agent-raw-output.json or agent-raw-output.jsonl
         agent-result.json
+        overview.json
 ```
 
 `meeting.md` is the primary human-facing artifact. `transcript.md` remains separate because it may be very large. `.recall/` retains metadata, capture notes, structured agent results, and diagnostics. Older expanded session layouts remain readable for compatibility.

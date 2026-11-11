@@ -24,8 +24,8 @@ use ratatui::{DefaultTerminal, Frame};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::analysis::{
-    analyze, known_agents, maybe_rename_session_dir_for_title, AnalysisOverview, AnalyzeOptions,
-    AnalyzeTarget,
+    analyze, known_agents, maybe_rename_session_dir_for_title, saved_overview, AnalysisOverview,
+    AnalyzeOptions, AnalyzeTarget,
 };
 use crate::audio::{
     acquire_capture_lock, copy_take1_aliases, earlier_takes_are_transcript_only,
@@ -1582,6 +1582,10 @@ impl App {
             "Enter records another take in this session.".to_string(),
             "q leaves; next plain recall starts a new session.".to_string(),
         ];
+        if let Some(overview) = saved_overview(&resume.path) {
+            self.analysis_status =
+                AnalysisStatus::ready(resume.path.join("meeting.md"), Some(overview));
+        }
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<TuiExit> {
@@ -3359,11 +3363,8 @@ impl App {
                             self.transcription_status.transcript_path =
                                 Some(session_path.join("transcript.md"));
                         }
-                        self.analysis_status.label = "Meeting notes ready".to_string();
-                        self.analysis_status.percent = 100;
-                        self.analysis_status.result_path = Some(meeting_path.clone());
-                        self.analysis_status.failed = false;
-                        self.analysis_status.overview = overview;
+                        self.analysis_status =
+                            AnalysisStatus::ready(meeting_path.clone(), overview);
                         self.toast = "Meeting notes ready.".to_string();
                         self.live_notes
                             .push(format!("Meeting ready: {}", meeting_path.display()));
@@ -4690,6 +4691,16 @@ impl AnalysisStatus {
             result_path: None,
             failed: false,
             overview: None,
+        }
+    }
+
+    fn ready(meeting_path: PathBuf, overview: Option<AnalysisOverview>) -> Self {
+        Self {
+            label: "Meeting notes ready".to_string(),
+            percent: 100,
+            result_path: Some(meeting_path),
+            failed: false,
+            overview,
         }
     }
 }
@@ -6828,5 +6839,72 @@ mod tests {
 
         app.analysis_status = AnalysisStatus::running("grok");
         assert!(app.analysis_overview().is_none());
+    }
+
+    fn resumed_app_with_saved_notes(label: &str) -> (App, PathBuf) {
+        let storage = std::env::temp_dir().join(format!(
+            "recall-tui-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let session = start_session(&StartOptions {
+            title: "Design Sync".to_string(),
+            consent: ConsentMode::Noted,
+            storage_dir: storage.clone(),
+            timezone: crate::session::FALLBACK_TIMEZONE.to_string(),
+        })
+        .unwrap();
+        write_capture_progress(
+            &session.path,
+            CaptureProgress {
+                take_count: 1,
+                completed_take: 1,
+                elapsed_ms: 60_000,
+                transcribed_take: 1,
+            },
+        )
+        .unwrap();
+        crate::analysis::save_overview(
+            &session.path,
+            &overview(Some("Launch Friday."), &["Sam sends the checklist"]),
+            1,
+        )
+        .unwrap();
+
+        let prepared = prepare_resume(&storage, &ResumeTarget::Latest, false).unwrap();
+        let mut app = test_app(session.path.clone());
+        app.apply_resume(prepared);
+        (app, storage)
+    }
+
+    #[test]
+    fn resuming_a_session_with_finished_notes_shows_the_saved_overview() {
+        let (app, storage) = resumed_app_with_saved_notes("resume-overview");
+        let overview = app.analysis_overview();
+        assert_eq!(
+            overview.and_then(|o| o.tldr.as_deref()),
+            Some("Launch Friday.")
+        );
+        assert_eq!(
+            overview.map(|o| o.first_actions.clone()),
+            Some(vec!["Sam sends the checklist".to_string()])
+        );
+        assert_eq!(app.analysis_status.label, "Meeting notes ready");
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn continuing_a_resumed_session_clears_the_saved_overview() {
+        let (mut app, storage) = resumed_app_with_saved_notes("resume-continue");
+        assert!(app.analysis_overview().is_some());
+
+        app.wait_analysis_for_this_take();
+
+        assert!(app.analysis_status.overview.is_none());
+        assert!(app.analysis_overview().is_none());
+        let _ = fs::remove_dir_all(storage);
     }
 }

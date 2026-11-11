@@ -77,7 +77,7 @@ Flow:
 5. Recall runs the selected agent.
 6. Recall checks each time the agent cited against the lines of `transcript.md`.
 7. Recall writes `meeting.md` with the TL;DR, summary, decisions, insights, actions, questions, follow-ups, notes, and markers.
-8. The panels at the bottom of the screen show the result: the title, a count of decisions, actions, and insights, and the TL;DR on the left, and the first action items on the right with a pointer to `meeting.md` for the full list. Both read the same parsed result that `meeting.md` is written from.
+8. The panels at the bottom of the screen show the result: the title, a count of decisions, actions, and insights, and the TL;DR on the left, and the first action items on the right with a pointer to `meeting.md` for the full list. Both read the same parsed result that `meeting.md` is written from. Recall also saves that result in `.recall/analysis/overview.json` with its take number. When you resume the session, the panels show it again if no newer take has ended. Recording a new take clears them until its analysis finishes.
 
 If another recording starts before analysis finishes, the previous session keeps processing in the background. Agent results are written back to that session folder and do not retarget the active recording.
 
@@ -165,6 +165,7 @@ meeting.md
   prompt.md
   agent-raw-output.json or agent-raw-output.jsonl
   agent-result.json
+  overview.json
 ```
 
 Each decision, insight, action item, and question in `meeting.md` says where it came from:

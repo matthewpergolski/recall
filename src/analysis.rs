@@ -3,10 +3,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::audio::{generation_is_current, lock_session_publish, session_folder_is_sticky};
+use crate::audio::{
+    generation_is_current, lock_session_publish, read_capture_progress, session_folder_is_sticky,
+};
 use crate::citations::{
     format_time, note_lines, parse_time, timed_lines, trace, trace_note, NoteLine, Quote, Source,
     TranscriptLine,
@@ -51,7 +53,40 @@ pub struct AnalyzeResult {
 /// How many action items the overview carries for the TUI.
 pub const OVERVIEW_ACTIONS: usize = 3;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The overview of the published `meeting.md`, so a reopened session can show it.
+pub(crate) fn save_overview(
+    session_path: &Path,
+    overview: &AnalysisOverview,
+    take: u32,
+) -> io::Result<()> {
+    let dir = analysis_dir(session_path);
+    fs::create_dir_all(&dir)?;
+    let saved = SavedOverview {
+        take,
+        overview: overview.clone(),
+    };
+    fs::write(
+        dir.join(OVERVIEW_FILE),
+        serde_json::to_string_pretty(&saved)?,
+    )
+}
+
+/// The saved overview, when it belongs to the last finished take.
+pub(crate) fn saved_overview(session_path: &Path) -> Option<AnalysisOverview> {
+    let text = fs::read_to_string(analysis_dir(session_path).join(OVERVIEW_FILE)).ok()?;
+    let saved = serde_json::from_str::<SavedOverview>(&text).ok()?;
+    (saved.take == read_capture_progress(session_path).completed_take).then_some(saved.overview)
+}
+
+const OVERVIEW_FILE: &str = "overview.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedOverview {
+    take: u32,
+    overview: AnalysisOverview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisOverview {
     pub tldr: Option<String>,
     pub decisions: usize,
@@ -896,6 +931,9 @@ fn write_analysis_markdown(
     let path = session_path.join("meeting.md");
     fs::write(&path, meeting_markdown(session_path, &title, result)?)?;
     written.push(path);
+    // The caller holds the publish lock, so this take is still the current one.
+    let take = read_capture_progress(session_path).completed_take;
+    save_overview(session_path, &result.overview(), take)?;
 
     Ok(written)
 }
@@ -2196,5 +2234,60 @@ mod tests {
             (1, 5, 0)
         );
         assert_eq!(overview.first_actions, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn published_notes_leave_an_overview_that_a_reopened_session_can_read() {
+        let session_dir = session_with_transcript("saved-overview", "# Sync\n");
+        crate::audio::write_capture_progress(
+            &session_dir,
+            crate::audio::CaptureProgress {
+                take_count: 1,
+                completed_take: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(super::saved_overview(&session_dir), None);
+
+        let result = AgentMeetingResult {
+            tldr: Some("Launch Friday.".to_string()),
+            action_items: vec![ActionItem {
+                task: "Sam sends the checklist".to_string(),
+                owner: None,
+                due: None,
+                evidence: None,
+                timestamp: None,
+            }],
+            ..AgentMeetingResult::default()
+        };
+        write_analysis_markdown(&session_dir, &result, None).unwrap();
+        assert_eq!(super::saved_overview(&session_dir), Some(result.overview()));
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn a_saved_overview_is_not_shown_once_a_newer_take_is_done() {
+        let session_dir = session_with_transcript("stale-overview", "# Sync\n");
+        let progress = |completed_take| crate::audio::CaptureProgress {
+            take_count: completed_take,
+            completed_take,
+            ..Default::default()
+        };
+        crate::audio::write_capture_progress(&session_dir, progress(1)).unwrap();
+        let overview = AgentMeetingResult::default().overview();
+        super::save_overview(&session_dir, &overview, 1).unwrap();
+        assert_eq!(super::saved_overview(&session_dir), Some(overview));
+
+        crate::audio::write_capture_progress(&session_dir, progress(2)).unwrap();
+        assert_eq!(super::saved_overview(&session_dir), None);
+
+        fs::write(
+            crate::session::analysis_dir(&session_dir).join("overview.json"),
+            "not json",
+        )
+        .unwrap();
+        assert_eq!(super::saved_overview(&session_dir), None);
+        let _ = fs::remove_dir_all(session_dir);
     }
 }
