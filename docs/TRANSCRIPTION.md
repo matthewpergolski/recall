@@ -287,6 +287,7 @@ meeting.md
   prompt.md
   agent-raw-output.json or agent-raw-output.jsonl
   agent-result.json
+  overview.json
 ```
 
 Recall keeps control of file layout. The agent is asked to return one JSON object, including a concise title when possible. Recall uses that title to rename generic session folders, update metadata/headings, and render Markdown files from the normalized result.

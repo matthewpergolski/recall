@@ -76,7 +76,8 @@ Flow:
 4. Recall transcribes locally.
 5. Recall runs the selected agent.
 6. Recall checks each time the agent cited against the lines of `transcript.md`.
-7. Recall writes `meeting.md` with the summary, decisions, actions, questions, follow-ups, notes, and markers.
+7. Recall writes `meeting.md` with the TL;DR, summary, decisions, insights, actions, questions, follow-ups, notes, and markers.
+8. The panels at the bottom of the screen show the result: the title, a count of decisions, actions, and insights, and the TL;DR on the left, and the first action items on the right with a pointer to `meeting.md` for the full list. Both read the same parsed result that `meeting.md` is written from. Recall also saves that result in `.recall/analysis/overview.json` with its take number. When you resume the session, the panels show it again if no newer take has ended. Recording a new take clears them until its analysis finishes.
 
 If another recording starts before analysis finishes, the previous session keeps processing in the background. Agent results are written back to that session folder and do not retarget the active recording.
 
@@ -164,9 +165,10 @@ meeting.md
   prompt.md
   agent-raw-output.json or agent-raw-output.jsonl
   agent-result.json
+  overview.json
 ```
 
-Each decision, action item, and question in `meeting.md` says where it came from:
+Each decision, insight, action item, and question in `meeting.md` says where it came from:
 
 - `(00:34, call)`: the cited time falls on that line of the transcript. If the agent also quoted words, they are in that line or the lines beside it. The time and speaker shown are the line's own.
 - `(00:34, call; quote not found there)`: the time falls on a line, but the words the agent quoted are not there, and no single other line holds them.
@@ -201,12 +203,16 @@ Recall asks agents to return one JSON object:
 {
   "title": "Concise meeting title, no date.",
   "summary": "Concise meeting summary.",
+  "tldr": "Two or three sentences, or at most three short bullets: the outcome and what is needed next.",
   "decisions": [],
+  "insights": [],
   "action_items": [],
   "questions": [],
   "followups": []
 }
 ```
+
+`tldr` is shown above the summary and does not repeat it. Each `insights` entry is one claim: a pattern, a risk, or a disagreement the transcript supports. It has `insight`, `evidence`, and `timestamp`, and follows the same evidence bar as a decision: the evidence is copied from one transcript line, and an insight that only a note supports uses the note's time and words. Do not invent an assumption that nobody said and that no line or note can cite. The agent returns an empty array when nothing genuine stands out. `tldr` and `insights` may be left out; a result saved without them still parses, and `meeting.md` says no TL;DR or insights were returned.
 
 Recall keeps control of file layout. It parses the agent response, saves raw and normalized output under `.recall/analysis/`, renames generic session folders such as `quick-capture` when the agent returns a useful title, updates session metadata/headings, and renders `meeting.md` from that normalized result.
 

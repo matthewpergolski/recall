@@ -507,7 +507,7 @@ fn session_json(session: &Session) -> String {
 
 fn meeting_markdown(session: &Session) -> String {
     format!(
-        "# {}\n\n> Status: Awaiting capture and transcription  \n> Consent: {}\n\n## Summary\n\n_Pending transcription and analysis._\n\n## Decisions\n\n_None identified yet._\n\n## Action Items\n\n_None identified yet._\n\n## Open Questions\n\n_None identified yet._\n\n## Follow-ups\n\n_None identified yet._\n\n## Notes and Markers\n\n_No notes or markers captured yet._\n\n## Source Material\n\n- [Transcript](transcript.md)\n- [Microphone audio](audio/mic.m4a)\n- [System audio](audio/call.m4a)\n",
+        "# {}\n\n> Status: Awaiting capture and transcription  \n> Consent: {}\n\n## TL;DR\n\n_Pending transcription and analysis._\n\n## Summary\n\n_Pending transcription and analysis._\n\n## Decisions\n\n_None identified yet._\n\n## Insights\n\n_None identified yet._\n\n## Action Items\n\n_None identified yet._\n\n## Open Questions\n\n_None identified yet._\n\n## Follow-ups\n\n_None identified yet._\n\n## Notes and Markers\n\n_No notes or markers captured yet._\n\n## Source Material\n\n- [Transcript](transcript.md)\n- [Microphone audio](audio/mic.m4a)\n- [System audio](audio/call.m4a)\n",
         session.title,
         session.consent.as_str()
     )

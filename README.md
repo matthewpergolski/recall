@@ -197,7 +197,7 @@ recall transcribe latest
 
 ## Agent Analysis
 
-Recall can hand the clean `transcript.md` to a headless coding agent and write one complete `meeting.md` containing the summary, decisions, action items, questions, follow-ups, notes, and markers.
+Recall can hand the clean `transcript.md` to a headless coding agent and write one complete `meeting.md` containing a TL;DR, the summary, decisions, insights, action items, questions, follow-ups, notes, and markers.
 
 See [docs/AGENT_ANALYSIS.md](docs/AGENT_ANALYSIS.md) for all setup modes: CLI flags, alias, and config defaults.
 
@@ -242,6 +242,7 @@ meeting.md
   prompt.md
   agent-raw-output.json or agent-raw-output.jsonl
   agent-result.json
+  overview.json
 ```
 
 Optional personal alias:
@@ -348,6 +349,7 @@ sessions/
         prompt.md
         agent-raw-output.json or agent-raw-output.jsonl
         agent-result.json
+        overview.json
 ```
 
 New folders are `{inverted-utc-key}-{YYYY-MM-DD_HHMM}-{zone}-{slug}`. The 12-digit key is `999999999999` minus the UTC `YYYYMMDDHHMM`, so VS Code Explorer, Finder, and `ls` A-Z list newest first. The readable stamp is 24-hour local time in `timezone` from config, the Mac IANA zone if that is omitted, or US Eastern as a last resort. The zone token comes from that instant's abbreviation (`CST`/`CDT` → `ct`, `EST`/`EDT` → `et`, `UTC` → `utc`). Older ISO `YYYY-MM-DD_HHMM-et-…` and am/pm `MM-DD-YYYY_H-MMapm-et-…` folders remain valid session IDs.
