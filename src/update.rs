@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use crate::config::expand_path;
 use crate::update_progress::{plan_total, UpdateProgress};
 
+include!("../git_hook_env.rs");
+
 const RECALL_REMOTE: &str = "github.com/matthewpergolski/recall";
 const BUILD_COMMIT: &str = env!("RECALL_BUILD_COMMIT");
 
@@ -75,18 +77,12 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     progress.arm_ephemeral("Checking origin/main");
     let fetch_started = Instant::now();
     let fetched = run_quiet_command(
-        Command::new("git")
-            .arg("-C")
-            .arg(&checkout)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .args([
-                "fetch",
-                "--quiet",
-                "origin",
-                "refs/heads/main:refs/remotes/origin/main",
-            ]),
+        git_at(&checkout).args([
+            "fetch",
+            "--quiet",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ]),
         "fetch origin/main",
     );
     let check_shown = progress.disarm_ephemeral();
@@ -147,13 +143,7 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             &mut progress,
             times.as_mut(),
             "Fast-forward",
-            Command::new("git")
-                .arg("-C")
-                .arg(&checkout)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
-                .args(["merge", "--ff-only", "--quiet", "refs/remotes/origin/main"]),
+            git_at(&checkout).args(["merge", "--ff-only", "--quiet", "refs/remotes/origin/main"]),
         )?;
         validate_checkout(&checkout)?
     };
@@ -240,28 +230,58 @@ struct CheckoutSearch {
 fn discover_checkout(options: &UpdateOptions) -> io::Result<PathBuf> {
     let from_env =
         env::var_os("RECALL_REPO").map(|value| expand_path(value.to_string_lossy().into_owned()));
-    choose_checkout(&CheckoutSearch {
+    let found = choose_checkout(&CheckoutSearch {
         explicit: options.repo.clone(),
         from_env,
         configured: options.configured_repo.clone(),
         embedded: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         current_dir: env::current_dir().ok(),
         home: env::var_os("HOME").map(PathBuf::from),
-    })
+    })?;
+    if let Some(warning) = found.warning {
+        eprintln!("{warning}");
+    }
+    Ok(found.path)
 }
 
-fn choose_checkout(search: &CheckoutSearch) -> io::Result<PathBuf> {
+#[derive(Debug)]
+struct CheckoutFound {
+    path: PathBuf,
+    warning: Option<String>,
+}
+
+fn choose_checkout(search: &CheckoutSearch) -> io::Result<CheckoutFound> {
     if let Some(path) = &search.explicit {
-        return require_checkout(path, "--repo");
+        return found_checkout(require_checkout(path, "--repo")?);
     }
     if let Some(path) = &search.from_env {
-        return require_checkout(path, "RECALL_REPO");
+        return found_checkout(require_checkout(path, "RECALL_REPO")?);
     }
     if let Some(path) = &search.configured {
         if let Ok(found) = require_checkout(path, "source_dir in Recall config") {
-            return Ok(found);
+            return found_checkout(found);
         }
+        let chosen = choose_without_config(search)?;
+        return Ok(CheckoutFound {
+            warning: Some(format!(
+                "source_dir {} is not a Recall checkout; using {}.",
+                path.display(),
+                chosen.display()
+            )),
+            path: chosen,
+        });
     }
+    found_checkout(choose_without_config(search)?)
+}
+
+fn found_checkout(path: PathBuf) -> io::Result<CheckoutFound> {
+    Ok(CheckoutFound {
+        path,
+        warning: None,
+    })
+}
+
+fn choose_without_config(search: &CheckoutSearch) -> io::Result<PathBuf> {
     if validate_checkout(&search.embedded).is_ok() {
         return canonical_path(&search.embedded);
     }
@@ -459,12 +479,8 @@ fn ensure_at_origin_main(checkout: &Path) -> io::Result<()> {
 
 fn git_at(checkout: &Path) -> Command {
     let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(checkout)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE");
+    command.arg("-C").arg(checkout);
+    scrub_git_command(&mut command);
     command
 }
 
@@ -792,10 +808,11 @@ fn normalized_remote(remote: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         build_matches, change_pause, choose_checkout, command_line, commit_subjects,
-        deduplicate_paths, ensure_at_origin_main, ensure_clean, git_output, normalized_remote,
-        note_lines, run_quiet_step, run_shown_step, short_commit, subjects_from_log, times_summary,
-        unread_changes, validate_checkout, version_from_metadata, CheckoutSearch, StepTimes,
-        UpdateOptions, HISTORY_LOG_ARGS, NOTE_LIMIT, RECALL_REMOTE,
+        deduplicate_paths, ensure_at_origin_main, ensure_clean, git_at, git_output,
+        normalized_remote, note_lines, run_quiet_step, run_shown_step, scrub_git_command,
+        short_commit, subjects_from_log, times_summary, unread_changes, validate_checkout,
+        version_from_metadata, CheckoutSearch, StepTimes, UpdateOptions, HISTORY_LOG_ARGS,
+        NOTE_LIMIT, RECALL_REMOTE,
     };
     use crate::update_progress::UpdateProgress;
     use std::fs;
@@ -877,15 +894,7 @@ mod tests {
 
     fn run_git(path: &Path, args: &[&str]) {
         // Collected, so git's chatter stays out of the test output.
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(args)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
+        let output = git_at(path).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "git {} failed: {}",
@@ -1027,12 +1036,7 @@ mod tests {
                 "Signed subject",
             ],
         ] {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(&fixture.path)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
+            let output = git_at(&fixture.path)
                 .env("GNUPGHOME", &gpg_home)
                 .args(args)
                 .output()
@@ -1043,12 +1047,7 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        let noisy = Command::new("git")
-            .arg("-C")
-            .arg(&fixture.path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
+        let noisy = git_at(&fixture.path)
             .env("GNUPGHOME", &gpg_home)
             .args(["-c", "log.showSignature=true", "log", "-1", "--format=%s"])
             .output()
@@ -1296,7 +1295,57 @@ mod tests {
             None,
         ))
         .unwrap();
-        assert_eq!(found, fs::canonicalize(&embedded.path).unwrap());
+        let chosen = fs::canonicalize(&embedded.path).unwrap();
+        assert_eq!(found.path, chosen);
+        let warning = found.warning.expect("a skipped source_dir warns");
+        assert!(warning.contains("missing-source"), "{warning}");
+        assert!(
+            warning.contains(&format!("{}", chosen.display())),
+            "{warning}"
+        );
+        assert!(!warning.contains('\n'), "{warning}");
+    }
+
+    #[test]
+    fn git_at_drops_a_leaked_hook_environment() {
+        let home = TempHome::new("git-env");
+        let fixture = CheckoutFixture::at(home.path.join("repo"));
+        let leaked = Command::new("git")
+            .current_dir(&fixture.path)
+            .env("GIT_DIR", "/tmp/recall-not-a-git-dir")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.bare")
+            .env("GIT_CONFIG_VALUE_0", "true")
+            .args(["rev-parse", "--is-bare-repository"])
+            .output()
+            .unwrap();
+        assert!(
+            !leaked.status.success(),
+            "a leaked GIT_DIR must fail before the scrub"
+        );
+        let mut command = Command::new("git");
+        command
+            .current_dir(&fixture.path)
+            .env("GIT_DIR", "/tmp/recall-not-a-git-dir")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.bare")
+            .env("GIT_CONFIG_VALUE_0", "true");
+        scrub_git_command(&mut command);
+        let output = command
+            .args(["rev-parse", "--is-bare-repository"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "false");
+        let via_helper = git_at(&fixture.path)
+            .args(["rev-parse", "--is-bare-repository"])
+            .output()
+            .unwrap();
+        assert!(via_helper.status.success());
     }
 
     #[test]
@@ -1311,7 +1360,8 @@ mod tests {
             None,
         ))
         .unwrap();
-        assert_eq!(found, fs::canonicalize(&configured.path).unwrap());
+        assert_eq!(found.path, fs::canonicalize(&configured.path).unwrap());
+        assert!(found.warning.is_none());
     }
 
     #[test]
@@ -1371,6 +1421,7 @@ mod tests {
             None,
         ))
         .unwrap();
-        assert_eq!(found, fs::canonicalize(&projects.path).unwrap());
+        assert_eq!(found.path, fs::canonicalize(&projects.path).unwrap());
+        assert!(found.warning.is_none());
     }
 }

@@ -142,9 +142,9 @@ After the initial clone and install, run this from any directory:
 recall update
 ```
 
-The updater uses the checkout embedded in the installed binary, then falls back to `RECALL_REPO`, configured `source_dir`, the current directory, and common source-code locations. It verifies the official Git remote and requires a clean `main` branch tracking `origin/main`. An already-current checkout and executable produce one short message. An available update is fast-forwarded, tested, built, and installed. A terminal shows a one-row level meter while those steps run. A pipe, `NO_COLOR`, `TERM=dumb`, or CI stays on one plain line per step. After a successful update, Recall prints up to eight new commit subjects, one line each. Older subjects are counted on one line.
+`recall update` looks for the checkout in this order. `--repo` and `RECALL_REPO` must name a valid checkout, or the command stops. A `source_dir` in the config is used when that folder is a Recall checkout. When it is missing or not one, Recall prints one line naming that path and the checkout it used instead, then keeps looking. Next is the checkout compiled into the installed binary, then a checkout found by walking up from the current directory, then the usual source folders under the home directory. When more than one of those folders is a Recall checkout, `~/Projects/recall` is the one that is used. The command verifies the official Git remote and requires a clean `main` branch tracking `origin/main`. An already-current checkout and executable produce one short message. An available update is fast-forwarded, tested, built, and installed. A terminal shows a one-row level meter while those steps run. A pipe, `NO_COLOR`, `TERM=dumb`, or CI stays on one plain line per step. After a successful update, Recall prints up to eight new commit subjects, one line each. Older subjects are counted on one line.
 
-If the checkout moved or Recall finds more than one valid clone, identify it explicitly:
+If several common folders exist and none of them is `~/Projects/recall`, name the one you want:
 
 ```sh
 recall update --repo ~/Projects/recall
