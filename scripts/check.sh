@@ -12,6 +12,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 
 echo "==> scripts/install-git-hooks.sh"
 bash scripts/install-git-hooks.sh
