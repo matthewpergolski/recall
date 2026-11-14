@@ -142,7 +142,7 @@ After the initial clone and install, run this from any directory:
 recall update
 ```
 
-The updater uses the checkout embedded in the installed binary, then falls back to `RECALL_REPO`, configured `source_dir`, the current directory, and common source-code locations. It verifies the official Git remote and requires a clean `main` branch tracking `origin/main`. An already-current checkout and executable produce one short message; an available update is fast-forwarded, tested, built, and installed. A terminal shows a progress bar for those steps; piped output stays one plain line per step.
+The updater uses the checkout embedded in the installed binary, then falls back to `RECALL_REPO`, configured `source_dir`, the current directory, and common source-code locations. It verifies the official Git remote and requires a clean `main` branch tracking `origin/main`. An already-current checkout and executable produce one short message. An available update is fast-forwarded, tested, built, and installed. A terminal shows a one-row level meter while those steps run. A pipe, `NO_COLOR`, `TERM=dumb`, or CI stays on one plain line per step. After a successful update, Recall prints up to eight new commit subjects, one line each. Older subjects are counted on one line.
 
 If the checkout moved or Recall finds more than one valid clone, identify it explicitly:
 
