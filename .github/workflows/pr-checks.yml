@@ -6,7 +6,8 @@ on:
   pull_request:
     # edited: validate again after the description changes.
     # synchronize: a new push must still match the Head: line.
-    types: [opened, synchronize, reopened, edited]
+    # ready_for_review and converted_to_draft: pending is allowed only on a draft.
+    types: [opened, synchronize, reopened, edited, ready_for_review, converted_to_draft]
 
 permissions:
   contents: read

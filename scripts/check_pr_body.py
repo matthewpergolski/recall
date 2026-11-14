@@ -121,6 +121,7 @@ def _run_github(head: str | None) -> int:
         print("pr-body: GitHub returned a body that is not JSON", file=sys.stderr)
         return 1
     body = pr.get("body") or ""
+    draft = bool(pr.get("draft"))
     if head is None:
         head = (pr.get("head") or {}).get("sha")
     updated = should_write_body(
@@ -132,7 +133,7 @@ def _run_github(head: str | None) -> int:
         status, payload = _github_request("PATCH", url, token, {"body": updated})
         if status in (401, 403):
             print(explain_github_denied(status, payload), file=sys.stderr)
-            problems = check_body(body, head=head)
+            problems = check_body(body, head=head, draft=draft)
             if not problems:
                 problems = [
                     "pr-body: the body still needs a GitHub edit and the token cannot write."
@@ -143,7 +144,7 @@ def _run_github(head: str | None) -> int:
             return 1
         print("pr-body: removed the Cursor wrapper")
         body = updated
-    return _report(check_body(body, head=head))
+    return _report(check_body(body, head=head, draft=draft))
 
 
 def main(argv: list[str] | None = None) -> int:

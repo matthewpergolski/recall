@@ -24,6 +24,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import importlib.util
+
+_GIT_ENV_PATH = Path(__file__).resolve().parent / "git_env.py"
+_GIT_ENV_SPEC = importlib.util.spec_from_file_location("recall_scripts_git_env", _GIT_ENV_PATH)
+if _GIT_ENV_SPEC is None or _GIT_ENV_SPEC.loader is None:
+    raise RuntimeError(f"could not load {_GIT_ENV_PATH}")
+_GIT_ENV = importlib.util.module_from_spec(_GIT_ENV_SPEC)
+_GIT_ENV_SPEC.loader.exec_module(_GIT_ENV)
+
 _VERSION = re.compile(
     r'(?m)^\[package\]\s*\n(?:(?!\[).*\n)*?^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"'
 )
@@ -31,12 +40,14 @@ _PR_NUMBER = re.compile(r"#(\d+)")
 
 
 def _run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = _GIT_ENV.scrub()
     return subprocess.run(
         ["git", *args],
         cwd=repo,
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
 
 

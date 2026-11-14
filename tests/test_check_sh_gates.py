@@ -15,6 +15,8 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from tests.git_env import without_hook_git
+
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_SH = ROOT / "scripts" / "check.sh"
 CHECK_IDENTITY = ROOT / "scripts" / "check_identity.py"
@@ -22,6 +24,8 @@ CHECK_PR_BODY = ROOT / "scripts" / "check_pr_body.py"
 CHECK_PR_RULES = ROOT / "scripts" / "pr_body_rules.py"
 CHECK_PR_SECTIONS = ROOT / "scripts" / "pr_body_sections.py"
 CHECK_VERSION = ROOT / "scripts" / "check_version_bump.py"
+GIT_ENV_PY = ROOT / "scripts" / "git_env.py"
+GIT_ENV_SH = ROOT / "scripts" / "git_env.sh"
 INSTALL_HOOKS = ROOT / "scripts" / "install-git-hooks.sh"
 
 NEUTRAL_NAME = "recall contributors"
@@ -77,7 +81,7 @@ def git(cwd: Path, *args: str, env: dict | None = None) -> None:
         check=True,
         capture_output=True,
         text=True,
-        env=env,
+        env=without_hook_git(env),
     )
 
 
@@ -106,6 +110,8 @@ class CheckShGatesTests(unittest.TestCase):
         shutil.copy(CHECK_PR_RULES, scripts / "pr_body_rules.py")
         shutil.copy(CHECK_PR_SECTIONS, scripts / "pr_body_sections.py")
         shutil.copy(CHECK_VERSION, scripts / "check_version_bump.py")
+        shutil.copy(GIT_ENV_PY, scripts / "git_env.py")
+        shutil.copy(GIT_ENV_SH, scripts / "git_env.sh")
         shutil.copy(INSTALL_HOOKS, scripts / "install-git-hooks.sh")
         (scripts / "check.sh").chmod(0o755)
 
@@ -274,6 +280,7 @@ class CheckShGatesTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
                 text=True,
+                env=without_hook_git(),
             ).stdout.strip()
             good = good_body_file(work, head)
             result = self._run_check_sh(

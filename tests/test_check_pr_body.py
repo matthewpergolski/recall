@@ -208,6 +208,19 @@ class CheckPrBodyTests(unittest.TestCase):
     def test_required_headings_constant_matches_template_expectation(self) -> None:
         self.assertEqual(list(self.mod.REQUIRED_HEADINGS), HEADINGS)
 
+    def test_pending_reviewer_passes_on_a_draft(self) -> None:
+        errors = self.mod.check_body(
+            filled_body(reviewer="pending"), head=HEAD_SHA, draft=True
+        )
+        self.assertEqual(errors, [])
+
+    def test_pending_reviewer_fails_when_the_pull_request_is_ready(self) -> None:
+        errors = self.mod.check_body(
+            filled_body(reviewer="pending"), head=HEAD_SHA, draft=False
+        )
+        self.assertTrue(any("draft" in error for error in errors), errors)
+        self.assertTrue(any("Fix:" in error for error in errors), errors)
+
     def test_pull_request_template_passes_the_body_check(self) -> None:
         template = ROOT / ".github" / "pull_request_template.md"
         self.assertTrue(

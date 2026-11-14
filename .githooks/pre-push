@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Version bump against the current origin/main, then the full check.
 set -euo pipefail
+source "$(cd "$(dirname "$0")/.." && pwd)/scripts/git_env.sh"
 
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
