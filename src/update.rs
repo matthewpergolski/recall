@@ -75,12 +75,18 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     progress.arm_ephemeral("Checking origin/main");
     let fetch_started = Instant::now();
     let fetched = run_quiet_command(
-        Command::new("git").arg("-C").arg(&checkout).args([
-            "fetch",
-            "--quiet",
-            "origin",
-            "refs/heads/main:refs/remotes/origin/main",
-        ]),
+        Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .args([
+                "fetch",
+                "--quiet",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ]),
         "fetch origin/main",
     );
     let check_shown = progress.disarm_ephemeral();
@@ -141,12 +147,13 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             &mut progress,
             times.as_mut(),
             "Fast-forward",
-            Command::new("git").arg("-C").arg(&checkout).args([
-                "merge",
-                "--ff-only",
-                "--quiet",
-                "refs/remotes/origin/main",
-            ]),
+            Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .args(["merge", "--ff-only", "--quiet", "refs/remotes/origin/main"]),
         )?;
         validate_checkout(&checkout)?
     };
@@ -221,59 +228,95 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     Ok(())
 }
 
+struct CheckoutSearch {
+    explicit: Option<PathBuf>,
+    from_env: Option<PathBuf>,
+    configured: Option<PathBuf>,
+    embedded: PathBuf,
+    current_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+}
+
 fn discover_checkout(options: &UpdateOptions) -> io::Result<PathBuf> {
-    if let Some(path) = &options.repo {
+    let from_env =
+        env::var_os("RECALL_REPO").map(|value| expand_path(value.to_string_lossy().into_owned()));
+    choose_checkout(&CheckoutSearch {
+        explicit: options.repo.clone(),
+        from_env,
+        configured: options.configured_repo.clone(),
+        embedded: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        current_dir: env::current_dir().ok(),
+        home: env::var_os("HOME").map(PathBuf::from),
+    })
+}
+
+fn choose_checkout(search: &CheckoutSearch) -> io::Result<PathBuf> {
+    if let Some(path) = &search.explicit {
         return require_checkout(path, "--repo");
     }
-
-    if let Some(path) = env::var_os("RECALL_REPO").map(PathBuf::from) {
-        return require_checkout(
-            &expand_path(path.to_string_lossy().into_owned()),
-            "RECALL_REPO",
-        );
+    if let Some(path) = &search.from_env {
+        return require_checkout(path, "RECALL_REPO");
     }
-
-    if let Some(path) = &options.configured_repo {
-        return require_checkout(path, "source_dir in Recall config");
+    if let Some(path) = &search.configured {
+        if let Ok(found) = require_checkout(path, "source_dir in Recall config") {
+            return Ok(found);
+        }
     }
-
-    let embedded = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if validate_checkout(&embedded).is_ok() {
-        return canonical_path(&embedded);
+    if validate_checkout(&search.embedded).is_ok() {
+        return canonical_path(&search.embedded);
     }
-
-    if let Ok(current_dir) = env::current_dir() {
+    if let Some(current_dir) = &search.current_dir {
         for ancestor in current_dir.ancestors() {
             if validate_checkout(ancestor).is_ok() {
                 return canonical_path(ancestor);
             }
         }
     }
+    let Some(home) = &search.home else {
+        return missing_checkout();
+    };
+    select_common(valid_common_checkouts(home)?, home)
+}
 
-    let valid_common = common_checkout_candidates()
+fn valid_common_checkouts(home: &Path) -> io::Result<Vec<PathBuf>> {
+    let valid = common_checkout_candidates(home)
         .into_iter()
         .filter(|path| validate_checkout(path).is_ok())
         .map(|path| canonical_path(&path))
         .collect::<io::Result<Vec<_>>>()?;
-    let valid_common = deduplicate_paths(valid_common);
+    Ok(deduplicate_paths(valid))
+}
 
-    match valid_common.as_slice() {
-        [path] => Ok(path.clone()),
-        [] => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "Could not find the Recall source checkout. Run `recall update --repo /path/to/recall`, set RECALL_REPO, or add source_dir to ~/.config/recall/config.toml.",
-        )),
-        paths => {
-            let choices = paths
-                .iter()
-                .map(|path| format!("  - {}", path.display()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Err(io::Error::other(format!(
-                "Multiple Recall checkouts were found:\n{choices}\nChoose one with `recall update --repo <path>`."
-            )))
+fn select_common(valid: Vec<PathBuf>, home: &Path) -> io::Result<PathBuf> {
+    let preferred = home.join("Projects/recall");
+    if let Ok(preferred) = canonical_path(&preferred) {
+        if valid.iter().any(|path| path == &preferred) {
+            return Ok(preferred);
         }
     }
+    match valid.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => missing_checkout(),
+        paths => Err(multiple_checkouts(paths)),
+    }
+}
+
+fn missing_checkout() -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "Could not find the Recall source checkout. Run `recall update --repo /path/to/recall`, set RECALL_REPO, or add source_dir to ~/.config/recall/config.toml.",
+    ))
+}
+
+fn multiple_checkouts(paths: &[PathBuf]) -> io::Error {
+    let choices = paths
+        .iter()
+        .map(|path| format!("  - {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    io::Error::other(format!(
+        "Multiple Recall checkouts were found:\n{choices}\nChoose one with `recall update --repo <path>`."
+    ))
 }
 
 fn require_checkout(path: &Path, source: &str) -> io::Result<PathBuf> {
@@ -414,11 +457,21 @@ fn ensure_at_origin_main(checkout: &Path) -> io::Result<()> {
     ))
 }
 
+fn git_at(checkout: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(checkout)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    command
+}
+
 fn git_output(checkout: &Path, args: &[&str]) -> io::Result<String> {
-    let output = command_output(
-        Command::new("git").arg("-C").arg(checkout).args(args),
-        &format!("run git {}", args.join(" ")),
-    )?;
+    let mut command = git_at(checkout);
+    command.args(args);
+    let output = command_output(&mut command, &format!("run git {}", args.join(" ")))?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
@@ -687,11 +740,7 @@ fn canonical_path(path: &Path) -> io::Result<PathBuf> {
     })
 }
 
-fn common_checkout_candidates() -> Vec<PathBuf> {
-    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
-    };
-
+fn common_checkout_candidates(home: &Path) -> Vec<PathBuf> {
     [
         "Projects/recall",
         "Developer/recall",
@@ -742,11 +791,11 @@ fn normalized_remote(remote: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_matches, change_pause, command_line, commit_subjects, deduplicate_paths,
-        ensure_at_origin_main, ensure_clean, git_output, normalized_remote, note_lines,
-        run_quiet_step, run_shown_step, short_commit, subjects_from_log, times_summary,
-        unread_changes, validate_checkout, version_from_metadata, StepTimes, UpdateOptions,
-        HISTORY_LOG_ARGS, NOTE_LIMIT, RECALL_REMOTE,
+        build_matches, change_pause, choose_checkout, command_line, commit_subjects,
+        deduplicate_paths, ensure_at_origin_main, ensure_clean, git_output, normalized_remote,
+        note_lines, run_quiet_step, run_shown_step, short_commit, subjects_from_log, times_summary,
+        unread_changes, validate_checkout, version_from_metadata, CheckoutSearch, StepTimes,
+        UpdateOptions, HISTORY_LOG_ARGS, NOTE_LIMIT, RECALL_REMOTE,
     };
     use crate::update_progress::UpdateProgress;
     use std::fs;
@@ -766,6 +815,10 @@ mod tests {
             let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir()
                 .join(format!("recall-update-test-{}-{id}", std::process::id()));
+            Self::at(path)
+        }
+
+        fn at(path: PathBuf) -> Self {
             fs::create_dir_all(path.join("src")).unwrap();
             fs::create_dir_all(path.join("capture-helper")).unwrap();
             fs::write(
@@ -828,6 +881,9 @@ mod tests {
             .arg("-C")
             .arg(path)
             .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output()
             .unwrap();
         assert!(
@@ -974,6 +1030,9 @@ mod tests {
             let output = Command::new("git")
                 .arg("-C")
                 .arg(&fixture.path)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
                 .env("GNUPGHOME", &gpg_home)
                 .args(args)
                 .output()
@@ -987,6 +1046,9 @@ mod tests {
         let noisy = Command::new("git")
             .arg("-C")
             .arg(&fixture.path)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .env("GNUPGHOME", &gpg_home)
             .args(["-c", "log.showSignature=true", "log", "-1", "--format=%s"])
             .output()
@@ -1183,5 +1245,132 @@ mod tests {
 
         let error = ensure_at_origin_main(&fixture.path).unwrap_err();
         assert!(error.to_string().contains("not on origin/main"));
+    }
+
+    struct TempHome {
+        path: PathBuf,
+    }
+
+    impl TempHome {
+        fn new(label: &str) -> Self {
+            let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("recall-home-{label}-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn search_at(
+        home: &Path,
+        embedded: PathBuf,
+        configured: Option<PathBuf>,
+        from_env: Option<PathBuf>,
+    ) -> CheckoutSearch {
+        let cwd = home.join("cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        CheckoutSearch {
+            explicit: None,
+            from_env,
+            configured,
+            embedded,
+            current_dir: Some(cwd),
+            home: Some(home.to_path_buf()),
+        }
+    }
+
+    #[test]
+    fn a_stale_source_dir_falls_through_to_the_embedded_checkout() {
+        let home = TempHome::new("stale");
+        let embedded = CheckoutFixture::at(home.path.join("embedded"));
+        let found = choose_checkout(&search_at(
+            &home.path,
+            embedded.path.clone(),
+            Some(home.path.join("missing-source")),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(found, fs::canonicalize(&embedded.path).unwrap());
+    }
+
+    #[test]
+    fn a_valid_source_dir_wins_over_the_canonical_checkout() {
+        let home = TempHome::new("valid-source");
+        let configured = CheckoutFixture::at(home.path.join("configured"));
+        let _canonical = CheckoutFixture::at(home.path.join("Projects/recall"));
+        let found = choose_checkout(&search_at(
+            &home.path,
+            home.path.join("no-embedded"),
+            Some(configured.path.clone()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(found, fs::canonicalize(&configured.path).unwrap());
+    }
+
+    #[test]
+    fn an_invalid_recall_repo_does_not_fall_through() {
+        let home = TempHome::new("bad-env");
+        let embedded = CheckoutFixture::at(home.path.join("embedded"));
+        let error = choose_checkout(&search_at(
+            &home.path,
+            embedded.path.clone(),
+            None,
+            Some(home.path.join("missing-env")),
+        ))
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("RECALL_REPO"), "{message}");
+        assert!(
+            !message.contains(&format!("{}", embedded.path.display())),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn two_common_checkouts_without_a_canonical_path_are_listed() {
+        let home = TempHome::new("two");
+        let code = CheckoutFixture::at(home.path.join("Code/recall"));
+        let developer = CheckoutFixture::at(home.path.join("Developer/recall"));
+        let error = choose_checkout(&search_at(
+            &home.path,
+            home.path.join("no-embedded"),
+            None,
+            None,
+        ))
+        .unwrap_err();
+        let message = error.to_string();
+        let code = fs::canonicalize(&code.path).unwrap();
+        let developer = fs::canonicalize(&developer.path).unwrap();
+        assert!(message.contains("Multiple Recall checkouts"), "{message}");
+        assert!(
+            message.contains(&format!("{}", code.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("{}", developer.display())),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_canonical_checkout_wins_over_another_common_folder() {
+        let home = TempHome::new("canonical");
+        let projects = CheckoutFixture::at(home.path.join("Projects/recall"));
+        let _other = CheckoutFixture::at(home.path.join("Code/recall"));
+        let found = choose_checkout(&search_at(
+            &home.path,
+            home.path.join("no-embedded"),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(found, fs::canonicalize(&projects.path).unwrap());
     }
 }
