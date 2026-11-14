@@ -88,6 +88,8 @@ class CheckWorkflowTests(unittest.TestCase):
         self.assertIn("check_identity.py", commit_msg)
         pre_push = (ROOT / ".githooks/pre-push").read_text(encoding="utf-8")
         self.assertIn("check.sh", pre_push)
+        self.assertIn("check_version_bump.py", pre_push)
+        self.assertIn("origin/main", pre_push)
         check = (ROOT / "scripts/check.sh").read_text(encoding="utf-8")
         self.assertIn("check_version_bump.py", check)
         self.assertIn("install-git-hooks.sh", check)

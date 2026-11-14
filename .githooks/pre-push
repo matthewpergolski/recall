@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Opt-in: enable with `git config core.hooksPath .githooks`
+# Version bump against the current origin/main, then the full check.
 set -euo pipefail
 
 root="$(git rev-parse --show-toplevel)"
-exec bash "${root}/scripts/check.sh"
+cd "$root"
+python3 scripts/check_version_bump.py --base origin/main --head HEAD
+exec bash scripts/check.sh

@@ -127,6 +127,52 @@ class CheckVersionBumpTests(unittest.TestCase):
             result = run_check(repo, "--base", "origin/main", "--head", "HEAD", "--labels", "")
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_second_patch_bump_must_follow_the_current_base(self) -> None:
+        """Two branches that both take 0.7.4: the later one must become 0.7.5."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = init_repo(Path(tmp) / "race")
+            git(repo, "checkout", "-q", "-b", "first")
+            write_crate(repo, "0.7.4")
+            git(repo, "add", "Cargo.toml", "Cargo.lock")
+            git(repo, "commit", "-q", "-m", "first bump")
+            git(repo, "checkout", "-q", "main")
+            write_crate(repo, "0.7.4")
+            git(repo, "add", "Cargo.toml", "Cargo.lock")
+            git(repo, "commit", "-q", "-m", "other pr merged")
+            git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+            git(repo, "checkout", "-q", "first")
+            result = run_check(repo, "--base", "origin/main", "--head", "HEAD", "--labels", "")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("0.7.4", result.stderr)
+            self.assertIn("0.7.5", result.stderr)
+
+    def test_labeled_minor_collision_names_next_minor_not_patch(self) -> None:
+        """A minor collision must name the next minor, not the next patch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = init_repo(Path(tmp) / "minor-race")
+            git(repo, "checkout", "-q", "-b", "first")
+            write_crate(repo, "0.8.0")
+            git(repo, "add", "Cargo.toml", "Cargo.lock")
+            git(repo, "commit", "-q", "-m", "minor bump")
+            git(repo, "checkout", "-q", "main")
+            write_crate(repo, "0.8.0")
+            git(repo, "add", "Cargo.toml", "Cargo.lock")
+            git(repo, "commit", "-q", "-m", "other minor merged")
+            git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+            git(repo, "checkout", "-q", "first")
+            result = run_check(
+                repo,
+                "--base",
+                "origin/main",
+                "--head",
+                "HEAD",
+                "--labels",
+                "semver:minor",
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("0.9.0", result.stderr)
+            self.assertNotIn("0.8.1", result.stderr)
+
     def test_src_change_without_bump_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = init_repo(Path(tmp) / "nobump")

@@ -58,7 +58,7 @@ python3 .grok/skills/push-main/scripts/next-version.py --kind none
 | `patch` | Default. `scripts/check_version_bump.py` accepts this bump | `next_patch` |
 | `none` | No `src/` change, and the version is already correct | keep `released` |
 
-`scripts/check_version_bump.py` allows only a patch +1 from `origin/main` unless the PR has `semver:minor` or `semver:major`. Use `--kind patch` unless Matthew has said he will add one of those labels.
+`scripts/check_version_bump.py` allows only a patch +1 from the current `origin/main` tip unless the PR has `semver:minor` or `semver:major`. If that tip already has the version you chose, the check fails and names the next version the labels allow. Use `--kind patch` unless Matthew has said he will add one of those labels.
 
 `released` is `origin/main`'s `Cargo.toml`. `working` is this checkout. After a feature ships, the next feature is the **new** `released` plus one minor (0.2.0 on main → next feature 0.3.0). Two features in the same push share one bump; two features in two pushes are two bumps.
 

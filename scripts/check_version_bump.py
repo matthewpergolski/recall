@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail unless Cargo.toml is unchanged or an exact patch bump from the base.
+"""Fail unless Cargo.toml is unchanged or an exact patch bump from the base tip.
 
 A change under src/ requires that patch bump. Cargo.lock must name the same
 recall version. semver:minor or semver:major allows the bigger exact bump.
@@ -73,26 +73,47 @@ def allowed_bumps(base: tuple[int, int, int], labels: set[str]) -> set[tuple[int
     return allowed
 
 
+def next_version(base: tuple[int, int, int], labels: set[str]) -> tuple[int, int, int]:
+    """The next version the labels allow. A label selects that bump, not a patch."""
+    major, minor, _patch = base
+    if "semver:major" in labels:
+        return major + 1, 0, 0
+    if "semver:minor" in labels:
+        return major, minor + 1, 0
+    return major, minor, base[2] + 1
+
+
 def bump_problems(
     base: tuple[int, int, int],
     head: tuple[int, int, int],
     labels: set[str],
     src_changed: bool,
+    version_moved: bool = False,
 ) -> list[str]:
-    if head == base:
-        if not src_changed:
-            return []
-        nxt = fmt((base[0], base[1], base[2] + 1))
-        return [
-            "version/src-bump: src/ changed but Cargo.toml version is still "
-            f"{fmt(base)}. Fix: bump the patch to {nxt}."
-        ]
+    """Judge `head` against the current base tip, not an older merge-base.
+
+    `version_moved` is true when this branch changed Cargo.toml since it split
+    from the base. Two branches can both pick the same version. The second one
+    then matches the base tip and must take the next allowed version.
+    """
+    nxt = fmt(next_version(base, labels))
+    if not version_moved and not src_changed:
+        return []
     if head in allowed_bumps(base, labels):
         return []
-    nxt = fmt((base[0], base[1], base[2] + 1))
+    if head == base and src_changed and not version_moved:
+        return [
+            "version/src-bump: src/ changed but the current base is "
+            f"{fmt(base)}. Set Cargo.toml and Cargo.lock to {nxt}."
+        ]
+    if head == base:
+        return [
+            f"version/patch: the current base is already {fmt(base)}. "
+            f"Set Cargo.toml and Cargo.lock to {nxt}."
+        ]
     return [
-        f"version/patch: Cargo.toml {fmt(base)} -> {fmt(head)} is not an exact patch bump. "
-        f"Fix: set the version to {nxt}. "
+        f"version/patch: the current base is {fmt(base)}. "
+        f"Cargo.toml is {fmt(head)}. Set Cargo.toml and Cargo.lock to {nxt}. "
         "A bigger bump needs the semver:minor or semver:major label, which Matthew applies."
     ]
 
@@ -176,20 +197,33 @@ def check_range(repo: Path, base: str, head: str, labels: set[str]) -> tuple[lis
     if merged.returncode != 0:
         detail = (merged.stderr or merged.stdout).strip()
         return [f"version-bump: git merge-base {base} {head} failed: {detail}"], 2
-    base_sha = merged.stdout.strip()
-    base_toml = _show(repo, f"{base_sha}:Cargo.toml")
+    merge_sha = merged.stdout.strip()
+    tip = _run(repo, "rev-parse", "--verify", base)
+    if tip.returncode != 0:
+        detail = (tip.stderr or tip.stdout).strip()
+        return [f"version-bump: could not resolve base {base}: {detail}"], 2
+    tip_sha = tip.stdout.strip()
+    tip_toml = _show(repo, f"{tip_sha}:Cargo.toml")
+    merge_toml = _show(repo, f"{merge_sha}:Cargo.toml")
     head_toml = _show(repo, f"{head}:Cargo.toml")
     head_lock = _show(repo, f"{head}:Cargo.lock")
-    if base_toml is None or head_toml is None:
+    if tip_toml is None or merge_toml is None or head_toml is None:
         return ["version-bump: could not read Cargo.toml at the base or the head"], 2
-    base_version = parse_version(base_toml)
+    tip_version = parse_version(tip_toml)
+    merge_version = parse_version(merge_toml)
     head_version = parse_version(head_toml)
-    if base_version is None or head_version is None:
+    if tip_version is None or merge_version is None or head_version is None:
         return ["version-bump: could not parse [package] version in Cargo.toml"], 2
-    changed, diff_error = _src_diff(repo, base_sha, head)
+    changed, diff_error = _src_diff(repo, merge_sha, head)
     if diff_error:
         return [diff_error], 2
-    problems = bump_problems(base_version, head_version, labels, changed)
+    problems = bump_problems(
+        tip_version,
+        head_version,
+        labels,
+        changed,
+        head_version != merge_version,
+    )
     if head_lock is None:
         problems.append("version/lock: Cargo.lock is missing at the head. Fix: commit Cargo.lock.")
     else:

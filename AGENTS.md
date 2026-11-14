@@ -140,7 +140,7 @@ That runs, in order, and fails fast: `cargo fmt --check`, `cargo check`, `cargo 
 
 `scripts/check_version_freshness.sh` only prints a warning (exit 0) when `src/` or `capture-helper/` changed since the latest `v*` tag but `Cargo.toml` version did not. It does not rewrite `recall --version`; installed freshness already uses `RECALL_BUILD_COMMIT`. With no `v*` tags yet, it skips gracefully.
 
-`./scripts/check.sh` runs `scripts/install-git-hooks.sh`, which sets `core.hooksPath` to `.githooks` when it is unset. A different path is left unchanged and the check fails. `pre-commit` checks a staged `Cargo.lock`. `commit-msg` runs `scripts/check_identity.py --commit-msg`. `pre-push` runs `scripts/check.sh`. Do not use `--no-verify`.
+`./scripts/check.sh` runs `scripts/install-git-hooks.sh`, which sets `core.hooksPath` to `.githooks` when it is unset. A different path is left unchanged and the check fails. `pre-commit` checks a staged `Cargo.lock`. `commit-msg` runs `scripts/check_identity.py --commit-msg`. `pre-push` runs `scripts/check_version_bump.py` against the current `origin/main`, then `scripts/check.sh`. Do not use `--no-verify`.
 
 `cargo test` already runs unit tests and `tests/cli_smoke.rs`, which invokes the compiled `recall` binary. Use that (or `cargo run -- <args>`) to verify CLI behavior from this checkout. Do not ask the user to `cargo install` or start a live meeting just to prove flag parsing, resume errors, or other non-TUI paths.
 
@@ -174,7 +174,7 @@ The installed `~/.cargo/bin/recall` is a separate binary. Source edits are verif
 
 `recall update` already-up-to-date uses that running version. After a refresh or fast-forward install, print the checkout crate version from `cargo metadata` (`packages[].version` where `name == "recall"`), not the old binary's compile-time version.
 
-`scripts/check_version_bump.py` compares `Cargo.toml` with the merge-base of `origin/main`. A `src/` change must bump the patch by 1 (`x.x.Z+1`). `Cargo.lock` must match. Any other bump fails unless the PR has the `semver:minor` or `semver:major` label. Matthew applies that label. CI reads the label. A local bigger bump sets `RECALL_SEMVER_LABEL` to the same label; CI ignores the variable. Do not add a public changelog unless the user asks.
+`scripts/check_version_bump.py` compares `Cargo.toml` with the current base tip, not an older merge-base. A `src/` change must bump the patch by 1 (`x.x.Z+1`). `Cargo.lock` must match. If the base already has that version, set the next patch. Any other bump fails unless the PR has the `semver:minor` or `semver:major` label. Matthew applies that label. CI reads the label. A local bigger bump sets `RECALL_SEMVER_LABEL` to the same label; CI ignores the variable. Do not add a public changelog unless the user asks.
 
 For docs-only changes, run:
 
