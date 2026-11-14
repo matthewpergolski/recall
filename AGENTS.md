@@ -136,17 +136,11 @@ For Rust (and agent-facing) changes, run the one check entry point:
 ./scripts/check.sh
 ```
 
-That runs, in order, and fails fast: `cargo fmt --check`, `cargo check`, `cargo test`, `cargo clippy -- -D warnings`, then optional `cairnkit check` only when cairnkit is on PATH and `memory status` shows a memory folder for this checkout (otherwise skipped silently; legacy `memory-bank/` alone does not trigger it), then a warning-only crate-version freshness reminder, then self-checks for `.githooks/commit-msg` and the cairnkit gate. Prefer this over scattering the cargo bullets. macOS CI (GitHub Actions on `macos-*`) is an optional future and is not implemented here — runner minutes are the cost.
+That runs, in order, and fails fast: `cargo fmt --check`, `cargo check`, `cargo test`, `cargo clippy -- -D warnings`, then optional `cairnkit check` only when cairnkit is on PATH and `memory status` shows a memory folder for this checkout (otherwise skipped silently; legacy `memory-bank/` alone does not trigger it), then a warning-only crate-version freshness reminder, then self-checks for `.githooks/commit-msg` and the cairnkit gate, then the identity, version, and optional PR-body scripts below. Prefer this over scattering the cargo bullets. macOS CI (GitHub Actions on `macos-*`) is an optional future and is not implemented here — runner minutes are the cost.
 
 `scripts/check_version_freshness.sh` only prints a warning (exit 0) when `src/` or `capture-helper/` changed since the latest `v*` tag but `Cargo.toml` version did not. It does not rewrite `recall --version`; installed freshness already uses `RECALL_BUILD_COMMIT`. With no `v*` tags yet, it skips gracefully.
 
-Opt-in repo-local hooks (not a forced install):
-
-```sh
-git config core.hooksPath .githooks
-```
-
-`.githooks/pre-push` runs `scripts/check.sh`. `.githooks/commit-msg` rejects messages containing `Generated with` or agent `Co-Authored-By` trailers (Claude/Anthropic/Cursor Agent/cursoragent/bare Cursor/Codex and similar).
+`./scripts/check.sh` runs `scripts/install-git-hooks.sh`, which sets `core.hooksPath` to `.githooks` when it is unset. A different path is left unchanged and the check fails. `pre-commit` checks a staged `Cargo.lock`. `commit-msg` runs `scripts/check_identity.py --commit-msg`. `pre-push` runs `scripts/check_version_bump.py` against the current `origin/main`, then `scripts/check.sh`. Do not use `--no-verify`.
 
 `cargo test` already runs unit tests and `tests/cli_smoke.rs`, which invokes the compiled `recall` binary. Use that (or `cargo run -- <args>`) to verify CLI behavior from this checkout. Do not ask the user to `cargo install` or start a live meeting just to prove flag parsing, resume errors, or other non-TUI paths.
 
@@ -180,13 +174,7 @@ The installed `~/.cargo/bin/recall` is a separate binary. Source edits are verif
 
 `recall update` already-up-to-date uses that running version. After a refresh or fast-forward install, print the checkout crate version from `cargo metadata` (`packages[].version` where `name == "recall"`), not the old binary's compile-time version.
 
-On a user-facing push (new TUI/CLI behavior people will notice), bump `Cargo.toml` `version` in the same commit:
-
-- `0.x.y` while the product is still pre-1.0
-- **minor** (`0.2.0`) for features (resume, session append/new, capture changes)
-- **patch** (`0.2.1`) for fixes and docs-only user-visible corrections
-
-Do not bump for agent-only notes or test-only changes. Do not add a public changelog unless the user asks.
+`scripts/check_version_bump.py` compares `Cargo.toml` with the current base tip, not an older merge-base. A `src/` change must bump the patch by 1 (`x.x.Z+1`). `Cargo.lock` must match. If the base already has that version, set the next patch. Any other bump fails unless the PR has the `semver:minor` or `semver:major` label. Matthew applies that label. CI reads the label. A local bigger bump sets `RECALL_SEMVER_LABEL` to the same label; CI ignores the variable. Do not add a public changelog unless the user asks.
 
 For docs-only changes, run:
 
@@ -203,12 +191,11 @@ swift run recall-capture list-sources
 
 In sandboxed Codex sessions, SwiftPM may need elevated execution because it uses normal macOS sandbox/cache paths.
 
-## Not Yet: Pull Requests and Releases
+## Pull requests
 
-Recall has no pull requests and no tagged releases yet. Work lands on `main` by a direct push, and `recall update` installs from `origin/main`.
+Open a pull request when the user asks. Do not merge it. Do not create a tag unless the user asks. `recall update` still installs from `origin/main`.
 
-- Do not open a pull request, create a tag, or publish a GitHub release unless the user asks.
-- The intended shape, for when the user starts them: one pull request per feature, with a plain summary, how to test, and the review findings with their answers; and one tagged release per version, with notes.
+The body check is `scripts/pr_body_check <file> --head <sha>`. `--fix` drops a Cursor wrapper. Commit trailers are `scripts/check_identity.py --commit-msg`. The version rule is `scripts/check_version_bump.py`. CI calls those scripts.
 
 ## Installed Command
 

@@ -288,6 +288,81 @@ class CheckIdentityTests(unittest.TestCase):
             errors = self.mod.check_range(repo, "HEAD~1..HEAD")
             self.assertTrue(any("assisted-by" in e.lower() for e in errors))
 
+    def test_cursor_key_trailer_is_reported(self) -> None:
+        """A Cursor: trailer is an AI trailer even without Co-authored-by."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = init_repo(Path(tmp) / "cursor-key")
+            (repo / "a.txt").write_text("x\n")
+            git(repo, "add", "a.txt")
+            git(repo, "commit", "-q", "-m", "feat\n\nCursor: did the edits\n")
+            errors = self.mod.check_range(repo, "HEAD~1..HEAD")
+            self.assertTrue(any("cursor" in e.lower() for e in errors), errors)
+
+    def test_generated_by_trailer_is_reported(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = init_repo(Path(tmp) / "generated-by")
+            (repo / "a.txt").write_text("x\n")
+            git(repo, "add", "a.txt")
+            git(repo, "commit", "-q", "-m", "feat\n\nGenerated-by: Cursor\n")
+            errors = self.mod.check_range(repo, "HEAD~1..HEAD")
+            self.assertTrue(any("generated-by" in e.lower() or "cursor" in e.lower() for e in errors))
+
+    def test_made_with_cursor_trailer_is_reported(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = init_repo(Path(tmp) / "made-with")
+            (repo / "a.txt").write_text("x\n")
+            git(repo, "add", "a.txt")
+            git(repo, "commit", "-q", "-m", "feat\n\nMade-with: Cursor\n")
+            errors = self.mod.check_range(repo, "HEAD~1..HEAD")
+            self.assertTrue(errors)
+            self.assertTrue(any("cursor" in e.lower() or "made-with" in e.lower() for e in errors))
+
+    def test_reported_by_human_reviewer_is_allowed(self) -> None:
+        """A human Reported-by trailer is not an AI trailer. An AI value still fails."""
+        human = self.mod.check_commit(
+            "abc1234",
+            NEUTRAL_NAME,
+            NEUTRAL_EMAIL,
+            NEUTRAL_NAME,
+            NEUTRAL_EMAIL,
+            "Fix the meter\n\nReported-by: Ada Lovelace <ada@example.com>\n",
+        )
+        self.assertEqual(human, [])
+        ai = self.mod.check_commit(
+            "abc1234",
+            NEUTRAL_NAME,
+            NEUTRAL_EMAIL,
+            NEUTRAL_NAME,
+            NEUTRAL_EMAIL,
+            "Fix the meter\n\nReported-by: Claude <bot@example.com>\n",
+        )
+        self.assertTrue(any("claude" in e.lower() or "attribution" in e.lower() for e in ai), ai)
+
+    def test_commit_msg_flag_rejects_any_coauthored_by(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            msg = Path(tmp) / "COMMIT_EDITMSG"
+            msg.write_text(
+                "Fix docs\n\nCo-Authored-By: Ada Lovelace <ada@example.com>\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                ["python3", str(SCRIPT), "--commit-msg", str(msg)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("co-authored-by", result.stderr.lower())
+
     def test_branch_like_cursor_token_is_not_a_model_id(self) -> None:
         """F4: hyphenated cursor-... branch names must not trip model-id rules."""
         import tempfile

@@ -5,11 +5,13 @@ Allowed identity (author and committer):
 
   recall contributors <contributors@recall.invalid>
 
-Fails when a commit has a Co-Authored-By, Reviewed-by, Claude, Cursor Agent,
-or Assisted-by trailer, a "Generated with" attribution marker, or an AI model
-name/id in the author, committer, or message. Signed-off-by must use the
-neutral identity when present. Hyphenated branch-like `cursor-...` tokens are
-not treated as model ids.
+Fails when a commit has a Co-Authored-By, Reviewed-by, Assisted-by, Claude,
+Cursor, Cursor Agent, Generated-by, or Made-with trailer, a "Generated with"
+marker, or an AI model name/id in the author, committer, or message.
+Signed-off-by must use the neutral identity when present. Hyphenated
+branch-like `cursor-...` tokens are not treated as model ids.
+
+  python3 scripts/check_identity.py --commit-msg FILE
 
 Also fails when a commit's added lines introduce a personal-looking email
 address other than that neutral address. Generic placeholders such as
@@ -46,10 +48,34 @@ _GENERIC_EMAIL = re.compile(
 )
 _EMAIL = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
 
-# Trailers that must never appear (any value).
-_FORBIDDEN_TRAILER = re.compile(
-    r"^(Co-authored-by|Reviewed-by|Assisted-by|Cursor Agent|Claude(?:-[A-Za-z0-9]+)?)\s*:",
+# Trailer line. "Cursor Agent" keeps the space. Other keys are single tokens.
+_TRAILER_LINE = re.compile(
+    r"^(?P<key>Cursor Agent|[A-Za-z][A-Za-z0-9-]*)\s*:\s*(?P<value>.+?)\s*$",
     re.I | re.M,
+)
+# Keys that are never allowed, whatever the value is.
+_FORBIDDEN_KEYS = {
+    "co-authored-by",
+    "reviewed-by",
+    "assisted-by",
+    "cursor",
+    "cursor agent",
+    "cursor-agent",
+    "cursoragent",
+    "claude",
+    "generated-by",
+    "made-with",
+    "ai",
+    "ai-assisted",
+    "ai-assisted-by",
+}
+# Helped-by / Generated-by style keys. A subject such as "Fix:" does not match.
+_ATTRIBUTION_KEY = re.compile(r"(?i)(?:-by|-with|agent|generated|assisted|cursor|claude|ai)$")
+_AI_VALUE = re.compile(
+    r"(?i)\b(?:"
+    r"Claude|Anthropic|ChatGPT|OpenAI|Gemini|Copilot|Codex|"
+    r"Cursor(?: Agent)?|cursoragent|Aider|Devin|Composer|Grok"
+    r")\b"
 )
 # Signed-off-by may exist only with the neutral identity.
 _SIGNED_OFF = re.compile(
@@ -144,13 +170,23 @@ def check_commit(
     if _GENERATED_WITH.search(body):
         errors.append(f'{short}: commit message has "Generated with" attribution')
 
-    for match in _FORBIDDEN_TRAILER.finditer(body):
-        kind = match.group(1)
-        errors.append(
-            f"{short}: forbidden trailer {kind} "
-            "(no Co-Authored-By, Reviewed-by, Assisted-by, "
-            "Cursor Agent, or Claude trailers)"
-        )
+    for match in _TRAILER_LINE.finditer(body):
+        key = match.group("key")
+        value = match.group("value")
+        key_norm = key.casefold()
+        if key_norm == "signed-off-by":
+            continue
+        if key_norm in _FORBIDDEN_KEYS or key_norm.startswith("claude"):
+            errors.append(
+                f"{short}: forbidden trailer {key} "
+                "(no Co-Authored-By, Reviewed-by, Assisted-by, "
+                "Cursor Agent, Cursor, Generated-by, Made-with, or Claude trailers)"
+            )
+            continue
+        if _ATTRIBUTION_KEY.search(key) and _AI_VALUE.search(value):
+            errors.append(
+                f"{short}: forbidden trailer {key} has AI or Cursor attribution: {value}"
+            )
 
     for match in _SIGNED_OFF.finditer(body):
         value = match.group(1)
@@ -243,11 +279,43 @@ def main(argv: list[str] | None = None) -> int:
         help="git revision range (default: origin/main..HEAD)",
     )
     parser.add_argument(
+        "--commit-msg",
+        metavar="FILE",
+        help="check one commit message file for trailers (commit-msg hook)",
+    )
+    parser.add_argument(
         "--repo",
         default=".",
         help="git repository path (default: .)",
     )
     args = parser.parse_args(argv)
+    if args.commit_msg:
+        try:
+            message = Path(args.commit_msg).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"identity: could not read commit message: {exc}", file=sys.stderr)
+            return 2
+        problems = check_commit(
+            "0000000",
+            ALLOWED_NAME,
+            ALLOWED_EMAIL,
+            ALLOWED_NAME,
+            ALLOWED_EMAIL,
+            message,
+        )
+        if not problems:
+            print("identity: ok (commit message)")
+            return 0
+        print(f"identity: {len(problems)} problem(s) in commit message", file=sys.stderr)
+        for line in problems:
+            print(f"error: {line}", file=sys.stderr)
+        print(
+            f"Fix: use {ALLOWED} for author and committer; "
+            "no Co-Authored-By, Reviewed-by, Assisted-by, Cursor, "
+            "Generated-by, Made-with, or Claude trailers.",
+            file=sys.stderr,
+        )
+        return 1
     problems = check_range(Path(args.repo), args.range)
     if not problems:
         print(f"identity: ok ({args.range})")
