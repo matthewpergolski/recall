@@ -1,14 +1,4 @@
 [package]
 name = "recall"
-version = "0.7.6"
+version = "0.0.1"
 edition = "2021"
-rust-version = "1.95"
-description = "Local-first macOS meeting memory from the terminal."
-
-[dependencies]
-crossterm = "0.29.0"
-ratatui = "0.30.0"
-unicode-width = "0.2.2"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-jiff = "0.2"
