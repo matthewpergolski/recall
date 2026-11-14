@@ -123,19 +123,26 @@ The script is idempotent. A second run that finds the toolchain, a clean checkou
 
 ### What the script does
 
-1. If `xcode-select -p` fails, run `xcode-select --install` and wait until the tools exist or you cancel the dialog.
-2. If `cargo` is missing, install rustup into `~/.cargo` with the upstream noninteractive install. If the active `rustc` is older than `rust-version` in `Cargo.toml`, run `rustup update stable` and `rustup default stable`. That second command runs even when `cargo` was already installed, so an older default toolchain does not stay selected.
-3. If `ffmpeg` is missing and `brew` exists, run `brew install ffmpeg`. If `ffmpeg` is missing and `brew` does not exist, print the existing hint from `src/transcription.rs` and keep going. Recall still installs.
-4. Choose a checkout with the rules in the next section. If none exists, `git clone https://github.com/matthewpergolski/recall.git` into `~/Projects/recall`. If that path exists and is not a valid Recall checkout, stop. Do not delete it.
-5. Patch the top-level `source_dir` line when the rules say to write it. Do this before the git check, so a later refusal still leaves the checkout recorded.
-6. If the checkout is dirty, or not on `main` tracking `origin/main`, stop and print the git status or the branch. Do not stash and do not reset.
-7. Fast-forward `origin/main` when `HEAD` is behind it.
-8. `swift build --package-path <checkout>/capture-helper`.
-9. `cargo install --path <checkout> --locked --force`. No `--root`. That replaces Cargo's installed `recall` binary, which is usually `~/.cargo/bin/recall`.
-10. If `command -v recall` fails and the new binary is in Cargo's bin directory, append `export PATH="$HOME/.cargo/bin:$PATH"` to the shell rc when that line is absent. This run invokes the binary by its full path.
-11. Print the permission steps for the terminal that launched the script. Print `recall doctor`, `recall sources`, `recall audio-tap-probe`, and the instruction to play system audio and watch the Call meter. Print that Apple Speech needs an on-device model Recall does not download.
+1. Look for three tools. Xcode Command Line Tools, via `xcode-select -p`. rustup, via a `rustc` that `rustup show active-toolchain` can see. ffmpeg, via `command -v ffmpeg`.
+2. When any of those are missing, print one line and wait for one answer. The line names only the missing tools, in that order.
 
-`recall update`, once rebuilt by this design, starts at step 4. It does not install the Command Line Tools, rustup, or ffmpeg. If no checkout exists it prints the one script command and exits. It does not clone. The script is the only cloner. That keeps a surprise `recall update` from creating `~/Projects/recall` on a machine where you were not asking for a clone.
+```text
+Missing: rustup, ffmpeg. Install them? [Y/n]
+```
+
+Enter or `y` means yes. `n` means no. `--yes` skips the question and means yes. When stdin is not a terminal and `--yes` was not passed, print `Missing: rustup, ffmpeg. Re-run with --yes to install them.` and exit. Do not read stdin. When nothing is missing, print no question.
+3. On yes, install each missing tool. Xcode Command Line Tools: `xcode-select --install`, then wait until `xcode-select -p` works or you cancel the dialog. rustup: the upstream noninteractive install into `~/.cargo`. ffmpeg: `brew install ffmpeg` when `brew` is present. When `brew` is absent, print the hint from `src/transcription.rs` and continue. On no, stop and name what is still missing.
+4. When `rustc` is present, older than `rust-version` in `Cargo.toml`, and owned by rustup, run `rustup update stable`. Do not run `rustup default stable`. When `rustc` is present and rustup does not own it, leave it alone. If that compiler is older than `rust-version`, print that and stop.
+5. Choose a checkout with the rules in the next section. If none exists, `git clone https://github.com/matthewpergolski/recall.git` into `~/Projects/recall`. If that path exists and is not a valid Recall checkout, stop. Do not delete it.
+6. Patch the top-level `source_dir` line when the rules say to write it. Do this before the git check, so a later refusal still leaves the checkout recorded.
+7. If the checkout is dirty, or not on `main` tracking `origin/main`, stop and print the git status or the branch. Do not stash and do not reset.
+8. Fast-forward `origin/main` when `HEAD` is behind it.
+9. `swift build --package-path <checkout>/capture-helper`.
+10. `cargo install --path <checkout> --locked --force`. No `--root`. That replaces Cargo's installed `recall` binary, which is usually `~/.cargo/bin/recall`.
+11. If `command -v recall` fails and the new binary is in Cargo's bin directory, append `export PATH="$HOME/.cargo/bin:$PATH"` to the shell rc when that line is absent. This run invokes the binary by its full path.
+12. Print the permission steps for the terminal that launched the script. Print `recall doctor`, `recall sources`, `recall audio-tap-probe`, and the instruction to play system audio and watch the Call meter. Print that Apple Speech needs an on-device model Recall does not download.
+
+`recall update`, once rebuilt by this design, starts at step 5. It does not install the Command Line Tools, rustup, or ffmpeg. If no checkout exists it prints the one script command and exits. It does not clone. The script is the only cloner. That keeps a surprise `recall update` from creating `~/Projects/recall` on a machine where you were not asking for a clone.
 
 The script does not call the old `recall update` to decide where the checkout is. An older binary still has the hard stop on `source_dir`. The script finds the checkout itself, installs the new binary, and only then is `recall update` safe.
 
@@ -210,8 +217,8 @@ The goal is one command plus the permission grants. This is every manual step in
 
 | Step today | What removes it |
 | --- | --- |
-| Install Xcode Command Line Tools by remembering `xcode-select --install` | The script runs that command and waits. The Apple dialog still needs a click. That click is one-time per Mac and is the same class of step as the permission grants. |
-| Install rustup, then `rustup update stable` and `rustup default stable` when Rust is older than 1.95 | The script installs rustup into `~/.cargo` when `cargo` is missing. When the active `rustc` is older than `Cargo.toml`, it runs both `rustup update stable` and `rustup default stable`, even if `cargo` was already there. This uses the network. It is an open decision below. The default in this note is yes. |
+| Install Xcode Command Line Tools by remembering `xcode-select --install` | The script puts it on one missing-tools line. On yes it runs `xcode-select --install` and waits. The Apple dialog still needs a click. |
+| Install rustup, and update it when `rustc` is older than `Cargo.toml` | The same one line offers rustup when it is missing. On yes the install goes into `~/.cargo`. `rustup update stable` runs only when the active `rustc` is older than `rust-version` and rustup owns that compiler. A compiler rustup does not own is left unchanged. |
 | `git clone` | The script clones into `~/Projects/recall` when no valid checkout exists. |
 | `cargo install` without `--force`, and a separate `swift build` | The script always builds the helper and always installs with `--force`, so Cargo's installed `recall` binary is replaced. That file is usually `~/.cargo/bin/recall`. |
 | Remember `recall update` versus `cargo install` | The docs show one curl line. Re-running it updates. `recall update` calls the same repair after the new binary is installed, and it is not a second install recipe. |
@@ -221,7 +228,7 @@ The goal is one command plus the permission grants. This is every manual step in
 | Put `~/.cargo/bin` on `PATH` | If `cargo` is missing, rustup writes the shell profile. If `cargo` is already installed and `command -v recall` still fails, the script appends the `export PATH` line when it is absent. This run uses the full path to the new binary. |
 | Run `recall doctor`, `recall sources`, and `recall audio-tap-probe`, then watch the Call meter | The script prints those three commands and the meter instruction at the end. The meter watch stays. A created `call.m4a` can be silence, so the file is not the check. |
 | Install the on-device Apple speech model | Stays manual. Recall does not auto-download Apple speech assets (`docs/TRANSCRIPTION.md` line 166). The script and doctor say so. Starting that download from the script would cross the line the transcription docs already draw. |
-| Install ffmpeg | When `brew` exists, the script installs ffmpeg. When it does not, the script prints the hint already in `src/transcription.rs` and Recall still installs. The no-brew case stays manual. |
+| Install ffmpeg | The same one line offers ffmpeg when it is missing. On yes, `brew install ffmpeg` when `brew` exists. When `brew` does not exist, the script prints the hint in `src/transcription.rs` and continues. The no-brew case stays manual. |
 | Install `parakeet-mlx` or a Whisper model | Not part of the default Apple Speech path. The command does not install them. They stay manual, and only if you select that engine. |
 | Grant Microphone to the launching terminal | Cannot be removed. A script that granted this would be a permission bypass, which Recall does not do. The script names the terminal and the Settings pane. Doctor repeats the same lines. |
 | Grant System Audio Recording Only, then quit and reopen that app | Same constraint. A new shell tab is not enough. The script says to quit the app. Each terminal app is a separate grant. Apple Terminal, Ghostty, VS Code, and Codex stay separate. |
@@ -246,7 +253,7 @@ Auto-stashing or resetting a dirty checkout would make the update succeed more o
 
 Syncing `~/.config/recall` across Macs would remove the copy step and would fight the local-first rule. `docs/SPEC.md` lists cloud sync as a non-goal. A later `recall settings export` could copy `config.toml` and `session-places.txt` and nothing else. It is not in the phases below.
 
-`docs/DEPENDENCIES.md` lines 219-228 already sketch `recall setup transcription`. That command is for transcription tools. The paragraph says setup asks before it downloads anything, and that a corporate machine can place binaries by hand. It is not an installer for the `recall` binary. The script in this note is that missing installer. Downloading rustup and ffmpeg is the open decision below, because that paragraph and the one-command goal pull in opposite directions.
+`docs/DEPENDENCIES.md` lines 219-228 already sketch `recall setup transcription`. That command is for transcription tools. The paragraph says setup asks before it downloads anything, and that a corporate machine can place binaries by hand. It is not an installer for the `recall` binary. The script in this note is that installer. The one prompt above is the ask. `--yes` is how a non-interactive run answers it.
 
 ## Phases
 
@@ -308,11 +315,13 @@ Change `README.md`, `docs/SETUP.md`, and `docs/PORTABILITY.md` so the only insta
 
 `scripts/test_install_docs.sh` fails if any of those three files is missing the curl line, or if `docs/SETUP.md` still contains `uses the checkout embedded in the installed binary, then falls back`. `git diff --check` still runs for whitespace. A docs edit that leaves the old discovery sentence passes `git diff --check` and fails this script. No version bump.
 
+## Decided
+
+Matthew decided the toolchain question on 2026-11-14. The words were "install, with one prompt". The script asks once, in the form `Missing: rustup, ffmpeg. Install them? [Y/n]`, and only names tools that are absent. `--yes` skips the question. A non-interactive run without `--yes` exits instead of reading stdin. Nothing is asked when nothing is missing. `rustup update stable` runs only for an older rustup-owned `rustc`. A Rust install that rustup does not own is not modified. The other defaults below stay as written.
+
 ## Open decisions
 
 These defaults are what the phases above assume. Each one is a preference. Say so in a sentence and the phase changes. Nothing here is a token to type back.
-
-The script may download rustup and may run `brew install ffmpeg`. The default is yes, because otherwise a fresh Mac still has a toolchain scavenger hunt, and the goal was one command. `docs/DEPENDENCIES.md` says a future setup command asks before downloading. Say "do not let the script install rustup or ffmpeg" if those stay prerequisites you install yourself. Say "ask before each download" if the script should stop and wait for a yes before rustup or ffmpeg.
 
 The canonical clone path is `~/Projects/recall`. The default is that path because it is already the first common candidate in `src/update.rs`. An existing valid checkout is never moved. Say "use this other directory as the canonical clone" and name the path if you want a different one.
 
