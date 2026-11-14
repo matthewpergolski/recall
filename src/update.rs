@@ -878,22 +878,93 @@ mod tests {
 
     #[test]
     fn signature_text_is_not_a_commit_subject() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let noisy = git_output(
-            root,
-            &["-c", "log.showSignature=true", "log", "-3", "--format=%s"],
-        )
-        .unwrap();
+        let fixture = CheckoutFixture::new();
+        let gpg_home = fixture.path.join("gnupg");
+        fs::create_dir(&gpg_home).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&gpg_home, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let gen = Command::new("gpg")
+            .env("GNUPGHOME", &gpg_home)
+            .args([
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-gen-key",
+                "Recall Fixture <recall@example.invalid>",
+                "ed25519",
+                "sign",
+                "never",
+            ])
+            .output()
+            .unwrap();
         assert!(
-            noisy.contains("gpg:"),
-            "the last commits must be signed so this test can fail"
+            gen.status.success(),
+            "{}",
+            String::from_utf8_lossy(&gen.stderr)
         );
+        let listed = Command::new("gpg")
+            .env("GNUPGHOME", &gpg_home)
+            .args(["--list-secret-keys", "--with-colons"])
+            .output()
+            .unwrap();
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        let key = listed
+            .lines()
+            .find(|line| line.starts_with("fpr:"))
+            .and_then(|line| line.split(':').nth(9))
+            .expect("gpg fingerprint");
+        fs::write(fixture.path.join("signed.txt"), "signed\n").unwrap();
+        let signing_key = format!("user.signingkey={key}");
+        for args in [
+            vec!["add", "signed.txt"],
+            vec![
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "-c",
+                "gpg.format=openpgp",
+                "-c",
+                signing_key.as_str(),
+                "commit",
+                "-S",
+                "-m",
+                "Signed subject",
+            ],
+        ] {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&fixture.path)
+                .env("GNUPGHOME", &gpg_home)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let noisy = Command::new("git")
+            .arg("-C")
+            .arg(&fixture.path)
+            .env("GNUPGHOME", &gpg_home)
+            .args(["-c", "log.showSignature=true", "log", "-1", "--format=%s"])
+            .output()
+            .unwrap();
+        let noisy = String::from_utf8_lossy(&noisy.stdout);
+        assert!(noisy.contains("gpg:"), "{noisy}");
         let mut clean_args = vec!["-c", "log.showSignature=true"];
         clean_args.extend(HISTORY_LOG_ARGS);
-        clean_args.push("-3");
-        let clean = git_output(root, &clean_args).unwrap();
+        clean_args.push("-1");
+        let clean = git_output(&fixture.path, &clean_args).unwrap();
         assert!(!clean.contains("gpg:"), "{clean}");
-        assert!(clean.contains("meeting notes"));
+        assert!(clean.contains("Signed subject"), "{clean}");
     }
 
     #[test]
