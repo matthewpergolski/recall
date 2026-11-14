@@ -12,7 +12,7 @@ The broader bar is zero manual steps beyond one install command and the one-time
 
 ### The installed command and the checkout are different things
 
-`cargo install --path . --locked` is the documented way to put `recall` on the command path. `docs/PORTABILITY.md` says Cargo places that binary in `~/.cargo/bin`. `recall update` is a different command. After it finds a checkout it runs `cargo test --locked`, `swift build --package-path <checkout>/capture-helper`, and `cargo install --path <checkout> --locked --force` (`src/update.rs` lines 158-189).
+`cargo install --path . --locked` is the documented way to put `recall` on the command path. `recall update` is a different command. After it finds a checkout it runs `cargo test --locked`, `swift build --package-path <checkout>/capture-helper`, and `cargo install --path <checkout> --locked --force` (`src/update.rs` lines 158-189). The install command does not pass `--root`. Cargo writes the binary into its own bin directory. `docs/PORTABILITY.md` says that directory is usually `~/.cargo/bin`. `CARGO_HOME`, or Cargo's `install.root`, sends it somewhere else. The update code never reads `PATH` and never reads the path of the running executable.
 
 The `--force` flag is only on the update path. `README.md` and `docs/SETUP.md` tell a first install to run `cargo install` without `--force`. Update replaces the Cargo-installed binary. Nothing in `src/update.rs` or `recall doctor` searches `PATH` for a second `recall`. A copy that appears earlier on `PATH` keeps running. The shell never reaches the binary Cargo just replaced.
 
@@ -34,6 +34,8 @@ There is no `scripts/install.sh`. `scripts/install-git-hooks.sh` only sets `core
 A valid checkout has `Cargo.toml`, `capture-helper/Package.swift`, a git root equal to that directory, and `origin` pointing at `github.com/matthewpergolski/recall` (`src/update.rs` lines 292-320). `https`, `ssh`, and `git@` forms of that remote are accepted.
 
 Two valid common locations produce an error that lists them and tells you to pass `--repo`. Zero locations produce an error that names `--repo`, `RECALL_REPO`, and `source_dir`. Update never clones.
+
+While the compiled-in checkout still validates, it is chosen before the current directory. `recall update` run inside a second clone updates the clone this binary was built from. The directory you are standing in is used only when that compiled-in path no longer validates, and no earlier source named a checkout. When `main` is behind `origin/main`, the fast-forward moves `HEAD`. When `main` has commits that are not on `origin/main`, the command refuses to install. The error still says "Recall pulled safely" (`src/update.rs` line 413). The code fetches, then runs `git merge --ff-only`.
 
 `docs/SETUP.md` describes a different order. It says the updater uses the embedded checkout first, then `RECALL_REPO`, then `source_dir`. `docs/PORTABILITY.md` matches the code. An invalid `source_dir` does not fall through in either document. The code returns at `src/update.rs` lines 236-238.
 
@@ -158,6 +160,8 @@ Resolution order.
 8. Exactly one other valid common folder from the list already in `src/update.rs`.
 9. Otherwise stop and print every valid checkout that was found. Print the one script command when the list is empty.
 
+A checkout moved to a path that is not on the common list is found when you run the script from inside that directory. The ancestor walk selects it, and the patch writes `source_dir`. Running the script from your home directory in that case clones a new `~/Projects/recall` and leaves the moved tree where it is. Run the script once from the moved tree when that tree is the one to keep.
+
 When step 4 marked the key as needing a write, and a checkout was chosen, replace the `source_dir` line or append one. The edit is a text patch of one line. The current parser drops comments and unknown keys, so a round trip through it would delete them. The patch replaces a single line that starts with `source_dir` and optional spaces around `=`. If the file has no such line, it appends `source_dir = "<absolute path>"`. If the file does not exist, it creates a file that contains only that line. Paths are quoted so a space survives `parse_string`. `session-places.txt` is not opened.
 
 Doctor grows four checks. None of them start a Swift build.
@@ -239,6 +243,8 @@ Auto-stashing or resetting a dirty checkout would make the update succeed more o
 
 Syncing `~/.config/recall` across Macs would remove the copy step and would fight the local-first rule. `docs/SPEC.md` lists cloud sync as a non-goal. A later `recall settings export` could copy `config.toml` and `session-places.txt` and nothing else. It is not in the phases below.
 
+`docs/DEPENDENCIES.md` lines 219-228 already sketch `recall setup transcription`. That command is for transcription tools. The paragraph says setup asks before it downloads anything, and that a corporate machine can place binaries by hand. It is not an installer for the `recall` binary. The script in this note is that missing installer. Downloading rustup and ffmpeg is the open decision below, because that paragraph and the one-command goal pull in opposite directions.
+
 ## Phases
 
 Each phase is its own pull request. Each one ends in a check you can run. Phases that change `src/` bump the patch version by 1, and `Cargo.lock` matches, per `scripts/check_version_bump.py`. This document does not bump the version.
@@ -292,7 +298,7 @@ Change `README.md`, `docs/SETUP.md`, and `docs/PORTABILITY.md` so the install an
 
 These defaults are what the phases above assume. Each one is a preference. Say so in a sentence and the phase changes. Nothing here is a token to type back.
 
-The script may download rustup and may run `brew install ffmpeg`. The default is yes, because otherwise a fresh Mac still has a toolchain scavenger hunt, and the goal was one command. Say "do not let the script install rustup or ffmpeg" if those stay prerequisites you install yourself.
+The script may download rustup and may run `brew install ffmpeg`. The default is yes, because otherwise a fresh Mac still has a toolchain scavenger hunt, and the goal was one command. `docs/DEPENDENCIES.md` says a future setup command asks before downloading. Say "do not let the script install rustup or ffmpeg" if those stay prerequisites you install yourself. Say "ask before each download" if the script should stop and wait for a yes before rustup or ffmpeg.
 
 The canonical clone path is `~/Projects/recall`. The default is that path because it is already the first common candidate in `src/update.rs`. An existing valid checkout is never moved. Say "use this other directory as the canonical clone" and name the path if you want a different one.
 
