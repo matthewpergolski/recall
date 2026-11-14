@@ -13,6 +13,12 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_OBJECT_DIRECTORY GIT_COMMON_DIR
+unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT
+while IFS='=' read -r name _; do
+  case "$name" in
+    GIT_CONFIG_KEY_*|GIT_CONFIG_VALUE_*) unset "$name" ;;
+  esac
+done < <(env)
 
 echo "==> scripts/install-git-hooks.sh"
 bash scripts/install-git-hooks.sh

@@ -113,14 +113,17 @@ _GENERATED_WITH = re.compile(r"Generated with", re.I)
 
 def _run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
-    for key in (
-        "GIT_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_WORK_TREE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_COMMON_DIR",
-    ):
-        env.pop(key, None)
+    for key in list(env):
+        if key in {
+            "GIT_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_WORK_TREE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        } or key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+            env.pop(key, None)
     return subprocess.run(
         ["git", *args],
         cwd=repo,

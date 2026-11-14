@@ -25,14 +25,17 @@ def git(root: Path, *args: str) -> str | None:
     """The output of a git command in `root`, or None when it fails."""
     try:
         env = os.environ.copy()
-        for key in (
-            "GIT_DIR",
-            "GIT_INDEX_FILE",
-            "GIT_WORK_TREE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_COMMON_DIR",
-        ):
-            env.pop(key, None)
+        for key in list(env):
+            if key in {
+                "GIT_DIR",
+                "GIT_INDEX_FILE",
+                "GIT_WORK_TREE",
+                "GIT_OBJECT_DIRECTORY",
+                "GIT_COMMON_DIR",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_COUNT",
+            } or key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+                env.pop(key, None)
         done = subprocess.run(
             ["git", "-C", str(root), *args],
             capture_output=True,
