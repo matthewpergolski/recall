@@ -13,6 +13,9 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
+echo "==> scripts/install-git-hooks.sh"
+bash scripts/install-git-hooks.sh
+
 run() {
   echo "==> $*"
   "$@"
@@ -41,13 +44,18 @@ python3 -m unittest discover -s tests -p 'test_check_*.py' -q
 echo "==> python3 scripts/check_identity.py origin/main..HEAD"
 python3 scripts/check_identity.py origin/main..HEAD
 
-# Optional local/CI PR-body gate: pass a file path or the PR_BODY env var.
+echo "==> python3 scripts/check_version_bump.py --base origin/main --head HEAD"
+python3 scripts/check_version_bump.py --base origin/main --head HEAD
+
+# Optional local PR-body gate: pass a file path or the PR_BODY env var.
+# --head is this checkout. CI passes the pull request head SHA instead.
+head_sha="$(git rev-parse HEAD)"
 if [[ -n "${PR_BODY_FILE:-}" ]]; then
-  echo "==> python3 scripts/check_pr_body.py ${PR_BODY_FILE}"
-  python3 scripts/check_pr_body.py "${PR_BODY_FILE}"
+  echo "==> python3 scripts/check_pr_body.py ${PR_BODY_FILE} --head ${head_sha}"
+  python3 scripts/check_pr_body.py "${PR_BODY_FILE}" --head "${head_sha}"
 elif [[ -n "${PR_BODY:-}" ]]; then
-  echo "==> python3 scripts/check_pr_body.py (PR_BODY env)"
-  python3 scripts/check_pr_body.py
+  echo "==> python3 scripts/check_pr_body.py --head ${head_sha}"
+  python3 scripts/check_pr_body.py --head "${head_sha}"
 fi
 
 echo "All checks passed."

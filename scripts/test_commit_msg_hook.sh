@@ -46,9 +46,23 @@ expect_reject "co-authored-codex" "Fix bug
 
 Co-Authored-By: Codex <codex@openai.com>"
 
-expect_accept "plain" "Add scripts/check.sh entry point"
-expect_accept "human-coauthor" "Fix docs
+expect_reject "human-coauthor" "Fix docs
 
 Co-Authored-By: Ada Lovelace <ada@example.com>"
+expect_reject "cursor-key" "Fix bug
+
+Cursor: did the edits"
+expect_reject "generated-by" "Fix bug
+
+Generated-by: Cursor"
+expect_reject "made-with" "Fix bug
+
+Made-with: Cursor"
+
+expect_accept "plain" "Add scripts/check.sh entry point"
+expect_accept "branch-token" "Land cursor/pr-rule-checks-8ea7"
+expect_accept "neutral-signed-off" "Fix docs
+
+Signed-off-by: recall contributors <contributors@recall.invalid>"
 
 echo "commit-msg hook self-check passed."

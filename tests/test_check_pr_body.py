@@ -61,13 +61,20 @@ commit rules alone.
 
 ## How to test
 
-- Unit: `python3 -m unittest tests.test_check_pr_body -q` — pass
-- Smoke: not needed, because the unit cases cover the CLI exits
-- End-to-end: not needed, because CI only invokes the script on the event body
+- Unit: `python3 -m unittest tests.test_check_pr_body -q` — passed
+- Smoke: `python3 scripts/pr_body_check body.md --head 0000000000000000000000000000000000000000` — printed ok
+- End-to-end: `python3 -m unittest tests.test_check_pr_body -q` — printed ok and exited 0
+- Mac-only:
+  - `swift build` — needs macOS 14
 
 ## Review
 
+Implementer: Grok 4.7
+Reviewer: Claude Opus 4.6
+
 - none yet
+
+Head: `0000000000000000000000000000000000000000`
 """
 
 
@@ -209,6 +216,240 @@ class CheckPrBodyTests(unittest.TestCase):
         )
         errors = self.mod.check_body(template.read_text(encoding="utf-8"))
         self.assertEqual(errors, [])
+
+
+HEAD_SHA = "0123456789abcdef0123456789abcdef01234567"
+OTHER_SHA = "fedcba9876543210fedcba9876543210fedcba98"
+_BEGIN = "<!-- CURSOR_AGENT_PR_BODY_BEGIN -->"
+_END = "<!-- CURSOR_AGENT_PR_BODY_END -->"
+
+
+def filled_body(*, implementer: str = "Grok 4.7", reviewer: str = "Claude Opus 4.6") -> str:
+    """Body that satisfies the six-section rules, including the new lines."""
+    return f"""## TL;DR
+
+After merge, local hooks and CI reject a PR that breaks the body rules.
+
+## How it works
+
+```mermaid
+flowchart LR
+  A[Commit] --> B[Hook]
+  B --> C[CI]
+```
+
+The diagram shows the hook and then CI.
+
+## Summary
+
+The checks live in scripts. The hooks call those scripts.
+
+## Files changed
+
+| Purpose | Files |
+| --- | --- |
+| Body rules | `scripts/check_pr_body.py` |
+
+## How to test
+
+- Unit: `python3 -m unittest tests.test_check_pr_body -q` — 20 passed
+- Smoke: `python3 scripts/pr_body_check body.md --head {HEAD_SHA}` — printed `pr-body: ok`
+- End-to-end: `python3 scripts/pr_body_check body.md --head {HEAD_SHA}` — printed `pr-body: ok` and exited 0
+- Mac-only:
+  - `swift run --package-path capture-helper recall-capture list-sources` — needs macOS 14 and a microphone permission
+
+## Review
+
+Implementer: {implementer}
+Reviewer: {reviewer}
+
+- none yet
+
+Head: `{HEAD_SHA}`
+"""
+
+
+class CheckPrBodyRuleTests(unittest.TestCase):
+    """Each new body rule fails on a bad example."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = load_mod()
+
+    def test_end_to_end_not_run_alone_fails(self) -> None:
+        body = filled_body().replace(
+            f"- End-to-end: `python3 scripts/pr_body_check body.md --head {HEAD_SHA}` — printed `pr-body: ok` and exited 0",
+            "- End-to-end: Not run",
+        )
+        errors = self.mod.check_body(body, head=HEAD_SHA)
+        self.assertTrue(any("End-to-end" in e and "Not run" in e for e in errors), errors)
+        self.assertIn("Fix:", "\n".join(errors))
+
+    def test_end_to_end_command_with_not_run_result_fails(self) -> None:
+        body = filled_body().replace(
+            f"- End-to-end: `python3 scripts/pr_body_check body.md --head {HEAD_SHA}` — printed `pr-body: ok` and exited 0",
+            "- End-to-end: `cargo test` — Not run",
+        )
+        errors = self.mod.check_body(body, head=HEAD_SHA)
+        self.assertTrue(any("End-to-end" in e for e in errors), errors)
+
+    def test_section_rules_require_level2_headings(self) -> None:
+        body = filled_body().replace("## ", "# ")
+        errors = self.mod.check_body(body, head=HEAD_SHA)
+        self.assertTrue(errors)
+        self.assertTrue(any("heading" in e.lower() for e in errors), errors)
+
+    def test_plan_body_update_strips_when_inner_mentions_marker_name(self) -> None:
+        inner = filled_body().replace(
+            "The checks live in scripts. The hooks call those scripts.",
+            "The checks name the CURSOR_AGENT_PR_BODY marker in prose.",
+        )
+        wrapped = _BEGIN + "\n" + inner + _END + "\nOpen in Web\n"
+        cleaned = self.mod.plan_body_update(wrapped)
+        self.assertIsNotNone(cleaned)
+        assert cleaned is not None
+        self.assertIn("CURSOR_AGENT_PR_BODY", cleaned)
+        self.assertNotIn("CURSOR_AGENT_PR_BODY_BEGIN", cleaned)
+        self.assertNotIn("Open in Web", cleaned)
+        self.assertEqual(self.mod.check_body(cleaned, head=HEAD_SHA), [])
+        self.assertIsNone(self.mod.plan_body_update(cleaned))
+
+    def test_body_without_mac_only_steps_passes(self) -> None:
+        body = filled_body().replace(
+            "- Mac-only:\n"
+            "  - `swift run --package-path capture-helper recall-capture list-sources`"
+            " — needs macOS 14 and a microphone permission\n",
+            "",
+        )
+        self.assertNotIn("Mac-only", body)
+        self.assertEqual(self.mod.check_body(body, head=HEAD_SHA), [])
+
+    def test_end_to_end_passed_is_a_result(self) -> None:
+        body = filled_body().replace(
+            f"- End-to-end: `python3 scripts/pr_body_check body.md --head {HEAD_SHA}` — printed `pr-body: ok` and exited 0",
+            "- End-to-end: `cargo test` — passed",
+        )
+        self.assertEqual(self.mod.check_body(body, head=HEAD_SHA), [])
+
+    def test_end_to_end_without_a_command_fails(self) -> None:
+        body = filled_body().replace(
+            f"- End-to-end: `python3 scripts/pr_body_check body.md --head {HEAD_SHA}` — printed `pr-body: ok` and exited 0",
+            "- End-to-end: see above",
+        )
+        errors = self.mod.check_body(body, head=HEAD_SHA)
+        self.assertTrue(any("End-to-end" in e and "command" in e.lower() for e in errors), errors)
+
+    def test_review_without_model_names_fails(self) -> None:
+        body = filled_body().replace("Implementer: Grok 4.7\nReviewer: Claude Opus 4.6\n", "")
+        errors = self.mod.check_body(body, head=HEAD_SHA)
+        self.assertTrue(any("Implementer" in e for e in errors), errors)
+        self.assertTrue(any("Reviewer" in e for e in errors), errors)
+
+    def test_versioned_model_id_is_rejected(self) -> None:
+        body = filled_body(implementer="grok-4.7")
+        errors = self.mod.check_body(body, head=HEAD_SHA)
+        self.assertTrue(any("grok-4.7" in e for e in errors), errors)
+
+    def test_same_model_without_fresh_agent_fails(self) -> None:
+        body = filled_body(implementer="Grok 4.7", reviewer="Grok 4.7")
+        errors = self.mod.check_body(body, head=HEAD_SHA)
+        joined = "\n".join(errors).lower()
+        self.assertIn("fresh agent", joined)
+        self.assertTrue("unavailable" in joined or "same" in joined)
+
+    def test_same_model_fresh_agent_passes(self) -> None:
+        extra = (
+            "Claude, GPT 5.6, and Gemini 4 were unavailable because the quota was refused. "
+            "The reviewer was a fresh agent, not the implementing agent.\n"
+        )
+        body = filled_body(implementer="Grok 4.7", reviewer="grok 4.7").replace(
+            "- none yet\n",
+            extra + "- none yet\n",
+        )
+        self.assertEqual(self.mod.check_body(body, head=HEAD_SHA), [])
+
+    def test_different_models_pass_without_the_fresh_agent_sentence(self) -> None:
+        self.assertEqual(self.mod.check_body(filled_body(), head=HEAD_SHA), [])
+
+    def test_head_sha_must_equal_the_pr_head(self) -> None:
+        errors = self.mod.check_body(filled_body(), head=OTHER_SHA)
+        self.assertTrue(any("Head" in e and OTHER_SHA in e for e in errors), errors)
+
+    def test_short_head_sha_fails(self) -> None:
+        body = filled_body().replace(HEAD_SHA, HEAD_SHA[:7])
+        errors = self.mod.check_body(body, head=HEAD_SHA)
+        self.assertTrue(any("Head" in e for e in errors), errors)
+
+    def test_mac_only_step_without_a_why_fails(self) -> None:
+        body = filled_body().replace(
+            "  - `swift run --package-path capture-helper recall-capture list-sources` — needs macOS 14 and a microphone permission",
+            "  - `swift test`",
+        )
+        errors = self.mod.check_body(body, head=HEAD_SHA)
+        self.assertTrue(any("Mac-only" in e for e in errors), errors)
+
+    def test_markers_keep_only_the_inner_text(self) -> None:
+        self.assertTrue(
+            hasattr(self.mod, "plan_body_update"),
+            "plan_body_update must live in the PR body script",
+        )
+        inner = filled_body()
+        wrapped = (
+            "stale body above\nOpen in Cursor\n"
+            + _BEGIN
+            + "\n"
+            + inner
+            + _END
+            + '\n<div><a href="https://cursor.com">Open in Web</a></div>\n'
+        )
+        cleaned = self.mod.plan_body_update(wrapped)
+        self.assertEqual(cleaned, inner if inner.endswith("\n") else inner + "\n")
+        self.assertNotIn("CURSOR_AGENT_PR_BODY", cleaned)
+        self.assertNotIn("Open in Web", cleaned)
+        self.assertNotIn("stale body", cleaned)
+        self.assertIsNone(self.mod.plan_body_update(cleaned))
+
+    def test_bot_edit_does_not_patch_again(self) -> None:
+        self.assertTrue(hasattr(self.mod, "should_write_body"))
+        wrapped = _BEGIN + "\n" + filled_body() + _END + "\n"
+        self.assertIsNone(
+            self.mod.should_write_body(
+                wrapped,
+                actor="github-actions[bot]",
+                action="edited",
+            )
+        )
+        self.assertIsNotNone(
+            self.mod.should_write_body(wrapped, actor="matthewpergolski", action="opened")
+        )
+
+    def test_fix_is_idempotent(self) -> None:
+        import tempfile
+
+        inner = filled_body()
+        wrapped = "old\n" + _BEGIN + "\n" + inner + "\n" + _END + "\nOpen in Cursor\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "body.md"
+            path.write_text(wrapped, encoding="utf-8")
+            first = subprocess.run(
+                ["python3", str(SCRIPT), str(path), "--fix", "--head", HEAD_SHA],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            once = path.read_text(encoding="utf-8")
+            self.assertNotIn("CURSOR_AGENT_PR_BODY", once)
+            second = subprocess.run(
+                ["python3", str(SCRIPT), str(path), "--fix", "--head", HEAD_SHA],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(path.read_text(encoding="utf-8"), once)
 
 
 if __name__ == "__main__":

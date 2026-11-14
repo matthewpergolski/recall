@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Staged Cargo.toml and Cargo.lock must agree.
+# The patch bump against origin/main runs in pre-push (scripts/check.sh).
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+exec python3 "${root}/scripts/check_version_bump.py" --repo "${root}" --staged
