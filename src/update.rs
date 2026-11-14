@@ -561,14 +561,33 @@ fn plain_subject(subject: &str) -> String {
     let mut chars = subject.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                // CSI ends on a final byte (@ through ~). Digits and ';' stay inside it.
-                for next in chars.by_ref() {
-                    if matches!(next, '\u{40}'..='\u{7e}') {
-                        break;
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    // CSI ends on a final byte (@ through ~). Digits and ';' stay inside it.
+                    for next in chars.by_ref() {
+                        if matches!(next, '\u{40}'..='\u{7e}') {
+                            break;
+                        }
                     }
                 }
+                Some(']') => {
+                    chars.next();
+                    // OSC ends on BEL, or on ESC \.
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
             }
             continue;
         }
@@ -832,10 +851,16 @@ mod tests {
 
     #[test]
     fn notes_drop_control_sequences_and_clip_a_long_subject() {
-        let subjects = subjects_from_log("hello\u{1b}[31m world\n\n\u{1b}[2J\ngo\u{1b}[@ next");
+        let subjects = subjects_from_log(
+            "hello\u{1b}[31m world\n\n\u{1b}[2J\ngo\u{1b}[@ next\nlink\u{1b}]8;;https://example.invalid\u{7}text\u{1b}]8;;\u{7}",
+        );
         assert_eq!(
             subjects,
-            vec!["hello world".to_string(), "go next".to_string()]
+            vec![
+                "hello world".to_string(),
+                "go next".to_string(),
+                "linktext".to_string()
+            ]
         );
         let lines = note_lines(&subjects, NOTE_LIMIT);
         assert!(lines.iter().all(|line| !line.contains('\u{1b}')));
@@ -878,6 +903,15 @@ mod tests {
 
     #[test]
     fn signature_text_is_not_a_commit_subject() {
+        let gpg_ready = Command::new("gpg")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !gpg_ready {
+            eprintln!("gpg is not installed; the signed fixture was not run");
+            return;
+        }
         let fixture = CheckoutFixture::new();
         let gpg_home = fixture.path.join("gnupg");
         fs::create_dir(&gpg_home).unwrap();
