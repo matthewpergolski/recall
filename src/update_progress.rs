@@ -10,12 +10,6 @@ const BAR_WIDTH: usize = 32;
 const MIN_BAR_WIDTH: usize = 8;
 const FALLBACK_COLUMNS: usize = 80;
 
-/// Live progress bar for `recall update` on a terminal.
-///
-/// Piped and `TERM=dumb` output stays the old `  Tests... done` lines.
-/// A terminal shows one bar for the whole update. `NO_COLOR` keeps the bar
-/// shape and drops ANSI color. The bar shrinks to fit a narrow pane and drops
-/// to elapsed time alone when there is no room for it.
 pub struct UpdateProgress {
     interactive: bool,
     color: bool,
@@ -23,6 +17,8 @@ pub struct UpdateProgress {
     state: Arc<BarState>,
     draw: Arc<Mutex<()>>,
     ticker: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    transcript: Vec<String>,
 }
 
 struct BarState {
@@ -44,7 +40,19 @@ struct BarState {
 
 impl UpdateProgress {
     pub fn detect() -> Self {
-        Self::with_mode(terminal::stdout_is_live(), terminal::stdout_takes_style())
+        Self::from_flags(
+            terminal::stdout_is_live(),
+            std::env::var_os("NO_COLOR").is_some(),
+            std::env::var_os("CI").is_some(),
+        )
+    }
+
+    pub(crate) fn from_flags(live: bool, no_color: bool, ci: bool) -> Self {
+        if update_animates(live, no_color, ci) {
+            Self::with_mode(true, true)
+        } else {
+            Self::plain()
+        }
     }
 
     /// Plain lines and no bar, whatever the output is.
@@ -74,11 +82,26 @@ impl UpdateProgress {
             }),
             draw: Arc::new(Mutex::new(())),
             ticker: None,
+            #[cfg(test)]
+            transcript: Vec::new(),
         }
     }
 
     pub fn is_interactive(&self) -> bool {
         self.interactive
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plain_text(&self) -> String {
+        self.transcript.concat()
+    }
+
+    fn emit_plain(&mut self, text: &str) -> io::Result<()> {
+        #[cfg(test)]
+        self.transcript.push(text.to_string());
+        let mut out = io::stdout().lock();
+        write!(out, "{text}")?;
+        out.flush()
     }
 
     /// Bar for a short wait such as `git fetch`. Stays hidden for 200ms so a
@@ -125,8 +148,7 @@ impl UpdateProgress {
 
     pub fn start_step(&mut self, label: &str) -> io::Result<()> {
         if !self.interactive {
-            print!("  {label}... ");
-            io::stdout().flush()?;
+            self.emit_plain(&format!("  {label}... "))?;
             self.running = true;
             return Ok(());
         }
@@ -140,7 +162,7 @@ impl UpdateProgress {
             return Ok(());
         }
         if !self.interactive {
-            println!("done");
+            self.emit_plain("done\n")?;
             self.running = false;
             return Ok(());
         }
@@ -153,7 +175,7 @@ impl UpdateProgress {
             return Ok(());
         }
         if !self.interactive {
-            println!("failed");
+            self.emit_plain("failed\n")?;
             self.running = false;
             return Ok(());
         }
@@ -181,7 +203,16 @@ impl UpdateProgress {
         let started = *lock(&self.state.work_started);
         let elapsed = started.map(|t| t.elapsed()).unwrap_or_default();
         let cols = terminal_columns();
-        let bar = meter_row(Meter::Fraction(1.0), elapsed, cols, self.color).text;
+        let bar = meter_row(
+            Meter::Fraction {
+                filled: 1.0,
+                frame: 0,
+            },
+            elapsed,
+            cols,
+            self.color,
+        )
+        .text;
         let summary = format!("  ◇ {label}");
         let painted = lock(&self.state.painted).take();
         if let Some(painted) = painted {
@@ -282,7 +313,10 @@ fn ticker_loop(state: Arc<BarState>, draw: Arc<Mutex<()>>, color: bool) {
             let done = *lock(&state.done);
             let current = *lock(&state.current);
             let total = *lock(&state.total);
-            Meter::Fraction(shown_fraction(done, current, total, elapsed))
+            Meter::Fraction {
+                filled: shown_fraction(done, current, total, elapsed),
+                frame,
+            }
         };
         {
             let _guard = lock(&draw);
@@ -401,7 +435,7 @@ pub(crate) struct Row {
 
 #[derive(Clone, Copy)]
 pub(crate) enum Meter {
-    Fraction(f64),
+    Fraction { filled: f64, frame: u32 },
     Sliding(u32),
 }
 
@@ -435,8 +469,8 @@ pub(crate) fn meter_row(meter: Meter, elapsed: Duration, cols: usize, color: boo
         return clip(&time, usable_columns(cols));
     }
     let bar = match meter {
-        Meter::Fraction(fraction) => render_bar(fraction, width, color),
-        Meter::Sliding(frame) => render_indeterminate(frame, width, color),
+        Meter::Fraction { filled, frame } => render_level(frame, width, filled, color),
+        Meter::Sliding(frame) => render_pulse(frame, width, color),
     };
     Row {
         text: render_meter_line(&bar, elapsed, color),
@@ -444,45 +478,84 @@ pub(crate) fn meter_row(meter: Meter, elapsed: Duration, cols: usize, color: boo
     }
 }
 
-pub(crate) fn render_bar(fraction: f64, width: usize, color: bool) -> String {
-    let filled = ((fraction.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
-    let empty = width - filled;
-    if color {
-        format!(
-            "\x1b[38;5;43m{}\x1b[38;5;240m{}\x1b[0m",
-            "━".repeat(filled),
-            "━".repeat(empty)
-        )
-    } else {
-        format!("{}{}", "━".repeat(filled), "─".repeat(empty))
-    }
+const RAMP: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const WAVE: [u8; 16] = [0, 1, 2, 4, 6, 7, 6, 4, 2, 1, 0, 2, 5, 7, 5, 2];
+const LIVE_COLOR: &str = "\x1b[38;5;43m";
+const QUIET_COLOR: &str = "\x1b[38;5;240m";
+
+pub(crate) fn render_level(frame: u32, width: usize, fraction: f64, color: bool) -> String {
+    paint(&level_cells(frame, width, fraction), color)
 }
 
-pub(crate) fn render_indeterminate(frame: u32, width: usize, color: bool) -> String {
-    const SPAN: usize = 8;
+pub(crate) fn render_pulse(frame: u32, width: usize, color: bool) -> String {
+    paint(&pulse_cells(frame, width), color)
+}
+
+fn level_cells(frame: u32, width: usize, fraction: f64) -> String {
     if width == 0 {
         return String::new();
     }
-    let span = SPAN.min(width / 2).max(1);
-    let travel = width - span;
+    let mut filled = ((fraction.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    if fraction > 0.0 && filled == 0 {
+        filled = 1;
+    }
+    let mut out = String::with_capacity(width * 3);
+    for i in 0..width {
+        if i < filled {
+            out.push(wave_cell(frame, i));
+        } else {
+            out.push('·');
+        }
+    }
+    out
+}
+
+fn pulse_cells(frame: u32, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let span = 8.min(width / 2).max(1);
+    let travel = width.saturating_sub(span);
     let cycle = (travel * 2).max(1);
     let pos = (frame as usize) % cycle;
     let pos = if pos <= travel { pos } else { cycle - pos };
-    if color {
-        format!(
-            "\x1b[38;5;240m{}\x1b[38;5;43m{}\x1b[38;5;240m{}\x1b[0m",
-            "━".repeat(pos),
-            "━".repeat(span),
-            "━".repeat(width - pos - span)
-        )
-    } else {
-        format!(
-            "{}{}{}",
-            "─".repeat(pos),
-            "━".repeat(span),
-            "─".repeat(width - pos - span)
-        )
+    let mut out = String::with_capacity(width * 3);
+    for i in 0..width {
+        if (pos..pos + span).contains(&i) {
+            out.push(wave_cell(frame, i));
+        } else {
+            out.push('·');
+        }
     }
+    out
+}
+
+fn wave_cell(frame: u32, index: usize) -> char {
+    let sample = (index as u32).wrapping_add(frame) as usize % WAVE.len();
+    RAMP[WAVE[sample] as usize]
+}
+
+fn paint(cells: &str, color: bool) -> String {
+    if !color || cells.is_empty() {
+        return cells.to_string();
+    }
+    let mut out = String::with_capacity(cells.len() + 16);
+    let mut live: Option<bool> = None;
+    for ch in cells.chars() {
+        let next = ch != '·';
+        if live != Some(next) {
+            if live.is_some() {
+                out.push_str("\x1b[0m");
+            }
+            out.push_str(if next { LIVE_COLOR } else { QUIET_COLOR });
+            live = Some(next);
+        }
+        out.push(ch);
+    }
+    if live.is_some() {
+        out.push_str("\x1b[0m");
+    }
+    out
 }
 
 pub(crate) fn render_meter_line(bar: &str, elapsed: Duration, color: bool) -> String {
@@ -493,6 +566,10 @@ pub(crate) fn render_meter_line(bar: &str, elapsed: Duration, color: bool) -> St
         format!("({time})")
     };
     format!("  {bar}  {time}")
+}
+
+pub(crate) fn update_animates(live: bool, no_color: bool, ci: bool) -> bool {
+    live && !no_color && !ci
 }
 
 fn glyph_fail(color: bool) -> String {
@@ -544,11 +621,28 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::{
-        bar_width, block_rows, format_elapsed, label_row, meter_row, plan_total, render_bar,
-        render_indeterminate, render_meter_line, rewind, shown_fraction, step_weight, Meter,
-        UpdateProgress, BAR_WIDTH,
+        bar_width, block_rows, format_elapsed, label_row, meter_row, plan_total, render_level,
+        render_meter_line, render_pulse, rewind, shown_fraction, step_weight, update_animates,
+        Meter, UpdateProgress, BAR_WIDTH,
     };
     use std::time::Duration;
+
+    #[test]
+    fn the_meter_runs_only_on_a_live_terminal_outside_ci_and_without_no_color() {
+        assert!(update_animates(true, false, false));
+        assert!(!update_animates(false, false, false));
+        assert!(!update_animates(true, true, false));
+        assert!(!update_animates(true, false, true));
+        assert!(!update_animates(false, true, true));
+    }
+
+    #[test]
+    fn no_color_and_ci_use_plain_lines() {
+        assert!(UpdateProgress::from_flags(true, false, false).is_interactive());
+        assert!(!UpdateProgress::from_flags(true, true, false).is_interactive());
+        assert!(!UpdateProgress::from_flags(false, false, false).is_interactive());
+        assert!(!UpdateProgress::from_flags(true, false, true).is_interactive());
+    }
 
     #[test]
     fn formats_elapsed_for_the_active_step() {
@@ -561,33 +655,40 @@ mod tests {
     }
 
     #[test]
-    fn plain_steps_keep_the_existing_line() {
+    fn plain_steps_say_done_and_failed_with_no_meter() {
         let mut progress = UpdateProgress::plain();
         progress.start_step("Tests").unwrap();
         progress.succeed().unwrap();
-        progress.start_step("Capture helper").unwrap();
+        progress.start_step("Install").unwrap();
         progress.fail().unwrap();
+        assert_eq!(
+            progress.plain_text(),
+            "  Tests... done\n  Install... failed\n"
+        );
+        assert!(!progress.plain_text().contains('\u{1b}'));
+        assert!(!progress.plain_text().contains('▁'));
     }
 
     #[test]
-    fn bar_fills_from_the_left_and_colors_only_when_asked() {
-        let half = "━".repeat(16) + &"─".repeat(16);
-        assert_eq!(render_bar(0.5, BAR_WIDTH, false), half);
-        assert_eq!(render_bar(0.0, BAR_WIDTH, false), "─".repeat(32));
-        assert_eq!(render_bar(1.0, BAR_WIDTH, false), "━".repeat(32));
-        let colored = render_bar(0.5, BAR_WIDTH, true);
+    fn level_meter_fills_from_the_left_and_scrolls() {
+        assert_eq!(render_level(0, 16, 0.25, false), "▁▂▃▅············");
+        assert_eq!(render_level(2, 16, 0.25, false), "▃▅▇█············");
+        assert_eq!(render_level(0, 16, 0.0, false), "·".repeat(16));
+        assert_eq!(render_level(0, 8, 1.0, false), "▁▂▃▅▇█▇▅");
+        assert!(!render_level(0, 16, 0.5, false).contains('\u{1b}'));
+        let colored = render_level(0, 8, 0.5, true);
         assert!(colored.contains("\u{1b}[38;5;43m"));
         assert!(colored.contains("\u{1b}[38;5;240m"));
-        assert!(!half.contains('\u{1b}'));
+        assert!(colored.contains("\u{1b}[0m"));
     }
 
     #[test]
     fn meter_line_puts_elapsed_time_on_the_right() {
-        let bar = render_bar(0.5, BAR_WIDTH, false);
+        let bar = render_level(0, BAR_WIDTH, 0.5, false);
         let line = render_meter_line(&bar, Duration::from_secs(4), false);
         assert_eq!(line, format!("  {bar}  (4s)"));
         let colored = render_meter_line(
-            &render_bar(1.0, BAR_WIDTH, true),
+            &render_level(0, BAR_WIDTH, 1.0, true),
             Duration::from_secs(4),
             true,
         );
@@ -596,18 +697,17 @@ mod tests {
 
     #[test]
     fn indeterminate_window_slides() {
-        let first = render_indeterminate(0, BAR_WIDTH, false);
-        let later = render_indeterminate(4, BAR_WIDTH, false);
-        assert!(first.starts_with("━━━━━━━━"));
+        let first = render_pulse(0, BAR_WIDTH, false);
+        let later = render_pulse(4, BAR_WIDTH, false);
+        let prefix: String = first.chars().take(8).collect();
+        assert_eq!(prefix, "▁▂▃▅▇█▇▅");
+        assert!(first.chars().skip(8).all(|ch| ch == '·'));
         assert_ne!(first, later);
         assert!(!first.contains('\u{1b}'));
-        assert!(render_indeterminate(0, BAR_WIDTH, true).contains("\u{1b}[38;5;43m"));
+        assert!(render_pulse(0, BAR_WIDTH, true).contains("\u{1b}[38;5;43m"));
         for width in 0..=BAR_WIDTH {
             for frame in 0..80 {
-                assert_eq!(
-                    render_indeterminate(frame, width, false).chars().count(),
-                    width
-                );
+                assert_eq!(render_pulse(frame, width, false).chars().count(), width);
             }
         }
     }
@@ -660,7 +760,13 @@ mod tests {
         let long = Duration::from_secs(3661);
         for cols in 1..=120 {
             for elapsed in [Duration::ZERO, Duration::from_secs(124), long] {
-                for meter in [Meter::Fraction(0.4), Meter::Sliding(7)] {
+                for meter in [
+                    Meter::Fraction {
+                        filled: 0.4,
+                        frame: 0,
+                    },
+                    Meter::Sliding(7),
+                ] {
                     let row = meter_row(meter, elapsed, cols, false);
                     assert_eq!(row.text.chars().count(), row.width);
                     assert!(row.width < cols.max(2), "meter at {cols} columns");
@@ -681,15 +787,41 @@ mod tests {
         assert_eq!(bar_width(17, elapsed), 8);
         assert_eq!(bar_width(16, elapsed), 0);
         assert_eq!(
-            meter_row(Meter::Fraction(0.5), elapsed, 16, true).text,
+            meter_row(
+                Meter::Fraction {
+                    filled: 0.5,
+                    frame: 0,
+                },
+                elapsed,
+                16,
+                true,
+            )
+            .text,
             "  (4s)"
         );
         assert_eq!(
-            meter_row(Meter::Fraction(0.5), elapsed, 5, true).text,
+            meter_row(
+                Meter::Fraction {
+                    filled: 0.5,
+                    frame: 0,
+                },
+                elapsed,
+                5,
+                true,
+            )
+            .text,
             "  (4"
         );
         // Color codes do not count toward the measured width.
-        let colored = meter_row(Meter::Fraction(0.5), elapsed, 30, true);
+        let colored = meter_row(
+            Meter::Fraction {
+                filled: 0.5,
+                frame: 0,
+            },
+            elapsed,
+            30,
+            true,
+        );
         assert_eq!(colored.width, 29);
         assert!(colored.text.contains('\u{1b}'));
     }

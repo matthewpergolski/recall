@@ -108,9 +108,9 @@ After this first installation, update the source checkout and installed command 
 recall update
 ```
 
-Recall locates its verified source checkout and checks `origin/main`. If the checkout and installed executable already match, it exits with one short message. When an update exists, it fast-forwards safely, runs the Rust tests, builds the Swift helper, and reinstalls the command. A terminal shows a progress bar for those steps; piped output stays one plain line per step. Use `recall update --repo /path/to/recall` if automatic discovery cannot find the checkout.
+Recall locates its verified source checkout and checks `origin/main`. If the checkout and installed executable already match, it exits with one short message. When an update exists, it fast-forwards safely, runs the Rust tests, builds the Swift helper, and reinstalls the command. A terminal shows a one-row level meter while those steps run. The meter fills as the work advances. After a successful update, Recall prints up to eight new commit subjects, one line each. Older subjects are counted on one line. A pipe, `NO_COLOR`, `TERM=dumb`, or CI uses one plain line per step. Those runs print the same subjects with no pause. Use `recall update --repo /path/to/recall` if automatic discovery cannot find the checkout.
 
-`recall update --verbose` drops the bar and shows each step's command, its full output, and how long it took, with the total at the end. Use it to see why an update is slow.
+`recall update --verbose` drops the meter and shows each step's command, its full output, and how long it took, with the total at the end. Use it to see why an update is slow.
 
 To list earlier versions and get the commands that go back to one, run `uv run scripts/versions.py` in the checkout. See `docs/ROLLBACK.md`.
 

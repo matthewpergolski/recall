@@ -127,7 +127,7 @@ To select a checkout explicitly:
 recall update --repo /path/to/recall
 ```
 
-The command quietly fetches `origin/main`. If both the checkout and installed executable are current, it exits without rebuilding. Otherwise it fast-forwards, runs the Rust tests, builds the Swift helper, and replaces the installed Cargo binary. A terminal shows a progress bar for those steps; piped output stays one plain line per step. It refuses to modify a dirty checkout and never resets or stashes changes.
+The command quietly fetches `origin/main`. If both the checkout and installed executable are current, it exits without rebuilding. Otherwise it fast-forwards, runs the Rust tests, builds the Swift helper, and replaces the installed Cargo binary. A terminal shows a one-row level meter while those steps run. A pipe, `NO_COLOR`, `TERM=dumb`, or CI stays on one plain line per step. After a successful update, Recall prints up to eight new commit subjects, one line each. Older subjects are counted on one line. It refuses to modify a dirty checkout and never resets or stashes changes.
 
 ## Session Output
 

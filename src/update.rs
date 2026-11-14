@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -208,6 +208,12 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             short_commit(&current_commit)
         );
     }
+    print_changes(
+        &checkout,
+        &previous_commit,
+        &current_commit,
+        change_pause(progress.is_interactive()),
+    );
     if let Some(times) = times {
         println!("{}", times.summary());
     }
@@ -539,6 +545,135 @@ fn build_matches(source_commit: &str, build_commit: &str) -> bool {
     build_commit != "unknown" && source_commit == build_commit
 }
 
+pub(crate) const NOTE_LIMIT: usize = 8;
+
+/// Commit subjects are untrusted text. A color sequence in one would repaint the terminal.
+pub(crate) fn subjects_from_log(log: &str) -> Vec<String> {
+    log.lines()
+        .map(plain_subject)
+        .map(|subject| subject.trim().to_string())
+        .filter(|subject| !subject.is_empty())
+        .collect()
+}
+
+fn plain_subject(subject: &str) -> String {
+    let mut out = String::new();
+    let mut chars = subject.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    // CSI ends on a final byte (@ through ~). Digits and ';' stay inside it.
+                    for next in chars.by_ref() {
+                        if matches!(next, '\u{40}'..='\u{7e}') {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    // OSC ends on BEL, or on ESC \.
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub(crate) fn note_lines(subjects: &[String], limit: usize) -> Vec<String> {
+    if subjects.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let omitted = subjects.len().saturating_sub(limit);
+    let shown = &subjects[omitted..];
+    let mut lines = Vec::with_capacity(shown.len() + 2);
+    lines.push("What changed".to_string());
+    if omitted > 0 {
+        lines.push(format!("  and {omitted} earlier"));
+    }
+    for subject in shown {
+        lines.push(format!("  · {}", clip_subject(subject, 96)));
+    }
+    lines
+}
+
+fn clip_subject(subject: &str, max: usize) -> String {
+    let count = subject.chars().count();
+    if count <= max || max <= 3 {
+        return subject.chars().take(max).collect();
+    }
+    let clipped: String = subject.chars().take(max - 3).collect();
+    format!("{clipped}...")
+}
+
+const HISTORY_LOG_ARGS: &[&str] = &["log", "--reverse", "--no-show-signature", "--format=%s"];
+
+fn history_log(checkout: &Path, range: &str) -> io::Result<String> {
+    let mut args = HISTORY_LOG_ARGS.to_vec();
+    args.push(range);
+    git_output(checkout, &args)
+}
+
+fn commit_subjects(checkout: &Path, range: &str) -> io::Result<Vec<String>> {
+    Ok(subjects_from_log(&history_log(checkout, range)?))
+}
+
+fn unread_changes(error: &io::Error) -> String {
+    format!("Could not read what changed: {error}")
+}
+
+fn change_pause(animated: bool) -> Duration {
+    if animated {
+        Duration::from_millis(40)
+    } else {
+        Duration::ZERO
+    }
+}
+
+fn print_changes(checkout: &Path, from: &str, to: &str, pause: Duration) {
+    if from == to {
+        return;
+    }
+    let spec = format!("{from}..{to}");
+    match commit_subjects(checkout, &spec) {
+        Ok(subjects) => print_change_lines(&note_lines(&subjects, NOTE_LIMIT), pause),
+        Err(error) => eprintln!("{}", unread_changes(&error)),
+    }
+}
+
+fn print_change_lines(lines: &[String], pause: Duration) {
+    if lines.is_empty() {
+        return;
+    }
+    println!();
+    for line in lines {
+        println!("{line}");
+        if pause.is_zero() {
+            continue;
+        }
+        let _ = io::stdout().flush();
+        std::thread::sleep(pause);
+    }
+}
+
 fn short_commit(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
 }
@@ -607,10 +742,13 @@ fn normalized_remote(remote: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_matches, command_line, deduplicate_paths, ensure_at_origin_main, ensure_clean,
-        normalized_remote, run_shown_step, short_commit, times_summary, validate_checkout,
-        version_from_metadata, StepTimes, UpdateOptions, RECALL_REMOTE,
+        build_matches, change_pause, command_line, commit_subjects, deduplicate_paths,
+        ensure_at_origin_main, ensure_clean, git_output, normalized_remote, note_lines,
+        run_quiet_step, run_shown_step, short_commit, subjects_from_log, times_summary,
+        unread_changes, validate_checkout, version_from_metadata, StepTimes, UpdateOptions,
+        HISTORY_LOG_ARGS, NOTE_LIMIT, RECALL_REMOTE,
     };
+    use crate::update_progress::UpdateProgress;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -651,6 +789,10 @@ mod tests {
         }
 
         fn commit(&self) {
+            self.commit_message("fixture");
+        }
+
+        fn commit_message(&self, message: &str) {
             run_git(&self.path, &["add", "."]);
             run_git(
                 &self.path,
@@ -661,7 +803,7 @@ mod tests {
                     "user.email=recall@example.invalid",
                     "commit",
                     "-m",
-                    "fixture",
+                    message,
                 ],
             );
         }
@@ -694,6 +836,186 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn notes_list_subjects_in_order_and_name_the_ones_left_out() {
+        let subjects: Vec<String> = (1..=10).map(|n| format!("note {n}")).collect();
+        let mut expected = vec!["What changed".to_string(), "  and 2 earlier".to_string()];
+        for n in 3..=10 {
+            expected.push(format!("  · note {n}"));
+        }
+        assert_eq!(note_lines(&subjects, NOTE_LIMIT), expected);
+        assert!(note_lines(&[], NOTE_LIMIT).is_empty());
+    }
+
+    #[test]
+    fn notes_drop_control_sequences_and_clip_a_long_subject() {
+        let subjects = subjects_from_log(
+            "hello\u{1b}[31m world\n\n\u{1b}[2J\ngo\u{1b}[@ next\nlink\u{1b}]8;;https://example.invalid\u{7}text\u{1b}]8;;\u{7}",
+        );
+        assert_eq!(
+            subjects,
+            vec![
+                "hello world".to_string(),
+                "go next".to_string(),
+                "linktext".to_string()
+            ]
+        );
+        let lines = note_lines(&subjects, NOTE_LIMIT);
+        assert!(lines.iter().all(|line| !line.contains('\u{1b}')));
+        let long = "a".repeat(120);
+        let clipped = note_lines(&[long], NOTE_LIMIT);
+        let body = clipped[1].strip_prefix("  · ").unwrap();
+        assert_eq!(body.chars().count(), 96);
+        assert!(body.ends_with("..."));
+    }
+
+    #[test]
+    fn a_missing_history_is_reported_and_plain_output_does_not_pause() {
+        let err = std::io::Error::other("no such revision");
+        assert_eq!(
+            unread_changes(&err),
+            "Could not read what changed: no such revision"
+        );
+        assert!(change_pause(false).is_zero());
+        assert_eq!(change_pause(true), std::time::Duration::from_millis(40));
+    }
+
+    #[test]
+    fn notes_are_the_commit_subjects_between_the_old_and_new_head() {
+        let fixture = CheckoutFixture::new();
+        fixture.commit_message("first");
+        let old = git_output(&fixture.path, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(fixture.path.join("meter.txt"), "meter\n").unwrap();
+        fixture.commit_message("Show a record meter");
+        fs::write(fixture.path.join("notes.txt"), "notes\n").unwrap();
+        fixture.commit_message("Print commit subjects");
+        let new = git_output(&fixture.path, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            commit_subjects(&fixture.path, &format!("{old}..{new}")).unwrap(),
+            vec![
+                "Show a record meter".to_string(),
+                "Print commit subjects".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn signature_text_is_not_a_commit_subject() {
+        let gpg_ready = Command::new("gpg")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !gpg_ready {
+            eprintln!("gpg is not installed; the signed fixture was not run");
+            return;
+        }
+        let fixture = CheckoutFixture::new();
+        let gpg_home = fixture.path.join("gnupg");
+        fs::create_dir(&gpg_home).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&gpg_home, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let gen = Command::new("gpg")
+            .env("GNUPGHOME", &gpg_home)
+            .args([
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-gen-key",
+                "Recall Fixture <recall@example.invalid>",
+                "ed25519",
+                "sign",
+                "never",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            gen.status.success(),
+            "{}",
+            String::from_utf8_lossy(&gen.stderr)
+        );
+        let listed = Command::new("gpg")
+            .env("GNUPGHOME", &gpg_home)
+            .args(["--list-secret-keys", "--with-colons"])
+            .output()
+            .unwrap();
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        let key = listed
+            .lines()
+            .find(|line| line.starts_with("fpr:"))
+            .and_then(|line| line.split(':').nth(9))
+            .expect("gpg fingerprint");
+        fs::write(fixture.path.join("signed.txt"), "signed\n").unwrap();
+        let signing_key = format!("user.signingkey={key}");
+        for args in [
+            vec!["add", "signed.txt"],
+            vec![
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "-c",
+                "gpg.format=openpgp",
+                "-c",
+                signing_key.as_str(),
+                "commit",
+                "-S",
+                "-m",
+                "Signed subject",
+            ],
+        ] {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&fixture.path)
+                .env("GNUPGHOME", &gpg_home)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let noisy = Command::new("git")
+            .arg("-C")
+            .arg(&fixture.path)
+            .env("GNUPGHOME", &gpg_home)
+            .args(["-c", "log.showSignature=true", "log", "-1", "--format=%s"])
+            .output()
+            .unwrap();
+        let noisy = String::from_utf8_lossy(&noisy.stdout);
+        assert!(noisy.contains("gpg:"), "{noisy}");
+        let mut clean_args = vec!["-c", "log.showSignature=true"];
+        clean_args.extend(HISTORY_LOG_ARGS);
+        clean_args.push("-1");
+        let clean = git_output(&fixture.path, &clean_args).unwrap();
+        assert!(!clean.contains("gpg:"), "{clean}");
+        assert!(clean.contains("Signed subject"), "{clean}");
+    }
+
+    #[test]
+    fn a_failed_step_keeps_the_child_error() {
+        let mut progress = UpdateProgress::plain();
+        let error = run_quiet_step(
+            &mut progress,
+            "Install",
+            &mut Command::new("sh").args(["-c", "echo boom >&2; exit 1"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("boom"), "{error}");
+        assert!(error.contains("Install"), "{error}");
+        assert!(!error.contains('\u{1b}'), "{error}");
+        assert!(progress.plain_text().contains("Install... failed"));
+        assert!(!progress.plain_text().contains('\u{1b}'));
     }
 
     #[test]
