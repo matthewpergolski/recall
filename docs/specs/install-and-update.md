@@ -69,11 +69,11 @@ Nothing in the product writes `config.toml`. The parser skips unknown keys and c
 
 `keep_audio` accepts only the bare words `true` and `false` (`src/config.rs` lines 180-186). Quoted `"false"` is ignored, and an ignored value means keep the audio.
 
-Sessions go to `--storage`, then `storage_dir`, then `<current directory>/sessions` (`src/session.rs` lines 124-126). The places list is a path per line. `recall places` prints `missing` when a path is not a directory. Temp directories are not recorded.
+`default_storage_dir` joins the current directory with `sessions` (`src/session.rs` lines 124-126). Config copies `storage_dir` into the run options (`src/main.rs` line 901). A later `--storage` flag replaces that value (`src/main.rs` lines 961-965). The TUI uses the option when it is set, and otherwise calls `default_storage_dir` (`src/tui.rs` lines 192-195). The places list is a path per line. `recall places` prints `missing` when a path is not a directory. Temp directories are not recorded.
 
 Copying `config.toml` to a new Mac does not copy `session-places.txt`, the session folders, model files, the checkout, or the binary. A `source_dir` or `storage_dir` written as an absolute path still names the old disk. A `~/` value expands with the new `HOME`. Microphone and system-audio grants stay with the terminal app on that Mac. They are not files in `~/.config/recall`.
 
-Model lookup also checks `~/Library/Application Support/recall/models/` when that directory is already there (`src/transcription.rs` lines 1083-1084 and 1501-1505). Install and update do not fill it.
+Whisper model lookup adds two files under `~/Library/Application Support/recall/models/` and keeps one only when that file exists (`src/transcription.rs` lines 1082-1087). The Parakeet cache uses that folder only when the directory itself exists (`src/transcription.rs` lines 1501-1505). Install and update do not fill either place.
 
 ### The docs leave the choice open
 
@@ -111,34 +111,29 @@ The design does not sync settings. If you copy the two files onto the new Mac fi
 
 This is the behavior to build. The program does not do it yet.
 
-One command is `scripts/install.sh`. Run it on a Mac that has never seen Recall and on a Mac that already has it. After this design is installed, `recall update` performs the same checkout repair, so the old habit is safe. The docs name `scripts/install.sh` only.
-
-On a Mac with no checkout yet, the command you can paste is the script from `main`.
+The one line the docs show is this.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh
 ```
 
-Re-running that line is the update. The script is also safe to run from a checkout you already have.
+That line is the install and the update, on a Mac that has never seen Recall and on a Mac that already has it. The file it runs is `scripts/install.sh` in the checkout after the first success. The docs do not offer the checkout path as a second recipe. `recall update`, after the binary from this design is installed, runs the same checkout repair. It does not install tools and it does not clone. A Mac with no `recall` binary uses the curl line.
 
-```sh
-~/Projects/recall/scripts/install.sh
-```
-
-The script is idempotent. A second run that finds the toolchain, a clean checkout at `origin/main`, a helper binary, and `~/.cargo/bin/recall` built from that commit does the checks and exits. It does not discard git changes. It does not delete session files, model files, or `session-places.txt`. It does not rewrite any config line except `source_dir`, and only in the cases below.
+The script is idempotent. A second run that finds the toolchain, a clean checkout at `origin/main`, a helper binary, and Cargo's `recall` binary built from that commit does the checks and exits. It does not discard git changes. It does not delete session files, model files, or `session-places.txt`. It does not rewrite any config line except a top-level `source_dir`, and only in the cases below.
 
 ### What the script does
 
 1. If `xcode-select -p` fails, run `xcode-select --install` and wait until the tools exist or you cancel the dialog.
-2. If `cargo` is missing, install rustup into `~/.cargo` with the upstream noninteractive install. If `rustc` is older than `rust-version` in `Cargo.toml`, run `rustup update stable`.
+2. If `cargo` is missing, install rustup into `~/.cargo` with the upstream noninteractive install. If the active `rustc` is older than `rust-version` in `Cargo.toml`, run `rustup update stable` and `rustup default stable`. That second command runs even when `cargo` was already installed, so an older default toolchain does not stay selected.
 3. If `ffmpeg` is missing and `brew` exists, run `brew install ffmpeg`. If `ffmpeg` is missing and `brew` does not exist, print the existing hint from `src/transcription.rs` and keep going. Recall still installs.
 4. Choose a checkout with the rules in the next section. If none exists, `git clone https://github.com/matthewpergolski/recall.git` into `~/Projects/recall`. If that path exists and is not a valid Recall checkout, stop. Do not delete it.
-5. If the checkout is dirty, or not on `main` tracking `origin/main`, stop and print the git status or the branch. Do not stash and do not reset.
-6. Fast-forward `origin/main` when `HEAD` is behind it.
-7. `swift build --package-path <checkout>/capture-helper`.
-8. `cargo install --path <checkout> --locked --force`, which replaces `~/.cargo/bin/recall`.
-9. Patch `source_dir` when the rules say to write it.
-10. Print the permission steps for the terminal that launched the script. Print one line when this shell still cannot see `recall` and a new terminal window will.
+5. Patch the top-level `source_dir` line when the rules say to write it. Do this before the git check, so a later refusal still leaves the checkout recorded.
+6. If the checkout is dirty, or not on `main` tracking `origin/main`, stop and print the git status or the branch. Do not stash and do not reset.
+7. Fast-forward `origin/main` when `HEAD` is behind it.
+8. `swift build --package-path <checkout>/capture-helper`.
+9. `cargo install --path <checkout> --locked --force`. No `--root`. That replaces Cargo's installed `recall` binary, which is usually `~/.cargo/bin/recall`.
+10. If `command -v recall` fails and the new binary is in Cargo's bin directory, append `export PATH="$HOME/.cargo/bin:$PATH"` to the shell rc when that line is absent. This run invokes the binary by its full path.
+11. Print the permission steps for the terminal that launched the script. Print `recall doctor`, `recall sources`, `recall audio-tap-probe`, and the instruction to play system audio and watch the Call meter. Print that Apple Speech needs an on-device model Recall does not download.
 
 `recall update`, once rebuilt by this design, starts at step 4. It does not install the Command Line Tools, rustup, or ffmpeg. If no checkout exists it prints the one script command and exits. It does not clone. The script is the only cloner. That keeps a surprise `recall update` from creating `~/Projects/recall` on a machine where you were not asking for a clone.
 
@@ -162,7 +157,9 @@ Resolution order.
 
 A checkout moved to a path that is not on the common list is found when you run the script from inside that directory. The ancestor walk selects it, and the patch writes `source_dir`. Running the script from your home directory in that case clones a new `~/Projects/recall` and leaves the moved tree where it is. Run the script once from the moved tree when that tree is the one to keep.
 
-When step 4 marked the key as needing a write, and a checkout was chosen, replace the `source_dir` line or append one. The edit is a text patch of one line. The current parser drops comments and unknown keys, so a round trip through it would delete them. The patch replaces a single line that starts with `source_dir` and optional spaces around `=`. If the file has no such line, it appends `source_dir = "<absolute path>"`. If the file does not exist, it creates a file that contains only that line. Paths are quoted so a space survives `parse_string`. `session-places.txt` is not opened.
+When step 4 marked the key as needing a write, and a checkout was chosen, patch the file as text. The current parser drops comments and unknown keys, so a round trip through it would delete them. It also reads `source_dir` only in the top-level table (`src/config.rs` lines 96-97). A line written after `[transcription]` is invisible, and the next run would append another one.
+
+The patch replaces one top-level line that starts with `source_dir` and optional spaces around `=`. A line under a `[section]` is left alone. If no top-level line exists, insert `source_dir = "<absolute path>"` before the first `[section]` heading. If the file has no heading, append that line. If the file does not end in a newline, write one before the new line so the previous key stays intact. A second run finds the top-level line and does not add another. If the file does not exist, create it with only that line. Paths are quoted so a space survives `parse_string`. `session-places.txt` is not opened.
 
 Doctor grows four checks. None of them start a Swift build.
 
@@ -182,9 +179,10 @@ flowchart TD
   chosen{A checkout was chosen?}
   clone[Clone into ~/Projects/recall]
   stop[Print the list and stop]
+  write[Patch the top-level source_dir line]
+  git{Clean main tracking origin/main?}
   build[Fast-forward, swift build, cargo install --force]
-  write[Patch the source_dir line only]
-  grants[Print the permission steps]
+  grants[Print permissions and the three checks]
   start --> tools
   tools --> find
   find --> stale
@@ -192,17 +190,19 @@ flowchart TD
   chosen -->|none and canonical path is free| clone
   chosen -->|none and the path is occupied| stop
   chosen -->|several and no canonical checkout| stop
-  chosen -->|one| build
-  clone --> build
-  build --> write
-  write --> grants
+  chosen -->|one| write
+  clone --> write
+  write --> git
+  git -->|no| stop
+  git -->|yes| build
+  build --> grants
 ```
 
 `recall update` enters at "Resolve a checkout" and does not install tools. An empty result prints the script command instead of cloning.
 
 ### What the command refuses to touch
 
-Session folders, `session-places.txt`, every config key other than `source_dir`, `models/`, `tools/`, and the Application Support model cache. A dirty checkout. Any git remote that is not the official repository. Any binary outside `~/.cargo/bin`. macOS permission decisions.
+Session folders, `session-places.txt`, every config key other than a top-level `source_dir`, `models/`, `tools/`, and the Application Support model files. A dirty checkout. Any git remote that is not the official repository. Any binary outside Cargo's bin directory. macOS permission decisions.
 
 ## Steps that still need a person
 
@@ -211,13 +211,16 @@ The goal is one command plus the permission grants. This is every manual step in
 | Step today | What removes it |
 | --- | --- |
 | Install Xcode Command Line Tools by remembering `xcode-select --install` | The script runs that command and waits. The Apple dialog still needs a click. That click is one-time per Mac and is the same class of step as the permission grants. |
-| Install rustup, then `rustup update` when Rust is older than 1.95 | The script installs rustup into `~/.cargo` when `cargo` is missing, and updates stable when `rustc` is older than `Cargo.toml`. This uses the network. It is an open decision below. The default in this note is yes. |
+| Install rustup, then `rustup update stable` and `rustup default stable` when Rust is older than 1.95 | The script installs rustup into `~/.cargo` when `cargo` is missing. When the active `rustc` is older than `Cargo.toml`, it runs both `rustup update stable` and `rustup default stable`, even if `cargo` was already there. This uses the network. It is an open decision below. The default in this note is yes. |
 | `git clone` | The script clones into `~/Projects/recall` when no valid checkout exists. |
-| `cargo install` without `--force`, and a separate `swift build` | The script always builds the helper and always installs with `--force`, so an older `~/.cargo/bin/recall` is replaced. |
-| Remember `recall update` versus `cargo install` | The docs name `scripts/install.sh` only. Re-running it updates. `recall update` calls the same repair after the new binary is installed. |
-| Edit `source_dir` after a move or a delete | Fall through, then patch that one line. This is the bug. |
+| `cargo install` without `--force`, and a separate `swift build` | The script always builds the helper and always installs with `--force`, so Cargo's installed `recall` binary is replaced. That file is usually `~/.cargo/bin/recall`. |
+| Remember `recall update` versus `cargo install` | The docs show one curl line. Re-running it updates. `recall update` calls the same repair after the new binary is installed, and it is not a second install recipe. |
+| Edit `source_dir` after a move or a delete | Fall through, then patch the top-level line. This is the bug. |
+| Run the command from home after the checkout moved somewhere outside the common list | The ancestor walk finds that tree only when the command's current directory is inside it. The curl line from home would clone a new `~/Projects/recall`. Run that same curl line once from inside the moved tree so `source_dir` records it. |
 | Pass `--repo` on every update when two clones exist | Prefer the compiled-in checkout, then `~/Projects/recall`. A remaining pair with no canonical checkout is printed once. `--repo` writes `source_dir`, so the choice does not recur. |
-| Put `~/.cargo/bin` on `PATH` | rustup writes the shell profile. The script calls the new binary by its full path. When the current shell still cannot see `recall`, the script says to open a new terminal. |
+| Put `~/.cargo/bin` on `PATH` | If `cargo` is missing, rustup writes the shell profile. If `cargo` is already installed and `command -v recall` still fails, the script appends the `export PATH` line when it is absent. This run uses the full path to the new binary. |
+| Run `recall doctor`, `recall sources`, and `recall audio-tap-probe`, then watch the Call meter | The script prints those three commands and the meter instruction at the end. The meter watch stays. A created `call.m4a` can be silence, so the file is not the check. |
+| Install the on-device Apple speech model | Stays manual. Recall does not auto-download Apple speech assets (`docs/TRANSCRIPTION.md` line 166). The script and doctor say so. Starting that download from the script would cross the line the transcription docs already draw. |
 | Install ffmpeg | When `brew` exists, the script installs ffmpeg. When it does not, the script prints the hint already in `src/transcription.rs` and Recall still installs. The no-brew case stays manual. |
 | Install `parakeet-mlx` or a Whisper model | Not part of the default Apple Speech path. The command does not install them. They stay manual, and only if you select that engine. |
 | Grant Microphone to the launching terminal | Cannot be removed. A script that granted this would be a permission bypass, which Recall does not do. The script names the terminal and the Settings pane. Doctor repeats the same lines. |
@@ -235,7 +238,7 @@ A prebuilt release binary has the same gap, and `docs/ROLLBACK.md` says there ar
 
 A signed Recall application would let macOS attach the grants to Recall instead of to the terminal. That is a different product. The current permission model is deliberate. `docs/SPEC.md` lists bypassing permission prompts as a non-goal. This plan does not change who holds the grant.
 
-Making `recall update` the only command cannot cover a Mac with no `recall` binary. The script is the command that exists before the binary does. After the first successful run, `recall update` and the script share the repair so either habit converges. The docs still show one line.
+Making `recall update` the only command cannot cover a Mac with no `recall` binary. The curl line is the command that exists before the binary does. After the first successful run, `recall update` shares the checkout repair. The docs show the curl line and do not show a second install line.
 
 Keeping `source_dir` as a hard pin is the current code. It is the bug. A pin that points nowhere should not outrank a checkout the binary was built from, or `~/Projects/recall`.
 
@@ -253,46 +256,57 @@ Each phase is its own pull request. Each one ends in a check you can run. Phases
 
 Change `discover_checkout` so an invalid `source_dir` is skipped. A valid `source_dir` still wins and does not look further. `--repo` and `RECALL_REPO` still fail when the path is invalid. The compiled-in checkout is next, then the current directory, then `~/Projects/recall`, then exactly one other common checkout.
 
-Tests, next to the fixtures already in `src/update.rs`.
+Put that choice in a function that takes the embedded path as an argument. `discover_checkout` passes `CARGO_MANIFEST_DIR`. The tests pass temp directories. They do not call the compile-time path. During `./scripts/check.sh` that path is this repo, and it validates, so a test that goes through `discover_checkout` never reaches the common-folder branches.
 
-- A `source_dir` whose directory does not exist yields the compiled-in checkout when that checkout is valid.
-- A valid `source_dir` is used even when `~/Projects/recall` is also valid.
+Tests, in `src/update.rs`.
+
+- A stale `source_dir` and a valid embedded path return the embedded path.
+- A valid `source_dir` is used even when the canonical path is also valid.
 - An invalid `RECALL_REPO` is an error and does not fall through.
-- Two common checkouts, no canonical path, and a stale `source_dir` return the list and do not pick one.
-- `~/Projects/recall` wins when it is valid and another common folder is also valid.
+- A missing embedded path, no canonical path, and two other common checkouts return the list and do not pick one.
+- A missing embedded path, a valid `~/Projects/recall`, and another common folder return `~/Projects/recall`.
 
-`./scripts/check.sh` is the check. No config file is written in this phase.
+`./scripts/check.sh` is the check. No config file is written in this phase. If the canonical test still passes while the function ignores `~/Projects/recall`, the test is wrong and has to be replaced before the phase counts.
 
 ### 2. Patch `source_dir` in place
 
-Add a text patch that replaces or appends the one line. Call it only after a checkout has been chosen and the rules say to write. Call it even when a later git check refuses the update, so the next run can find the checkout without the flag.
+Add the text patch described above. Call it as soon as a checkout is chosen, including when the next git check refuses the update.
 
 Tests.
 
-- A file with a comment, an unknown key, and `storage_dir` keeps those bytes except for the `source_dir` line.
-- A missing `source_dir` line is appended. The other lines stay.
+- A file with a comment, an unknown key, and `storage_dir` keeps those bytes except for the top-level `source_dir` line.
+- A file that ends inside `[transcription]`, with no top-level `source_dir`, gains the line before that heading. `RecallConfig::parse` sees the path. A second call does not add a second line.
+- A file with no trailing newline keeps the previous key whole, and `source_dir` is on the next line.
 - A missing file is created with only that line.
 - `session-places.txt` in the same directory is byte for byte unchanged.
 - A path with a space round-trips through `RecallConfig::parse`.
+- A dirty checkout fixture and a stale `source_dir` in a temp config still get the line written, and the dirty file is still dirty afterward.
 
 ### 3. Doctor reports a stale install
 
-Extend `print_doctor` with the four checks above. Tests set `HOME`, `XDG_CONFIG_HOME`, and `PATH` to temp directories and assert the printed lines. A stale `source_dir` prints `warn` and the replacement path. Two `recall` binaries print in order. A missing helper prints `warn` without invoking `swift`. A commit mismatch prints both strings. Doctor still exits 0.
+Extend doctor with the four checks above. The lines come from a function that takes the source-dir status, the `PATH` hits, the helper paths, and the two commit strings. Tests pass those values. They do not depend on the compiled-in helper or on `RECALL_BUILD_COMMIT`.
+
+- A stale `source_dir` prints `warn` and the replacement path.
+- Two `recall` paths print in order, and the text says the shell runs the first.
+- An empty helper list prints `warn` while the test still reports `swift` as present. Today's doctor does not print that warn in that case, so this assertion fails until the new check exists. The test also asserts that no `swift` process was started.
+- Two different commit strings print `warn` and both strings.
+- Doctor still exits 0.
 
 ### 4. `scripts/install.sh`
 
-The script implements the steps in "What the script does". `scripts/install.sh --plan` prints the actions and changes nothing. Tests run the plan against a fake `PATH` and a temp `HOME`.
+The script implements the steps in "What the script does". Two entry points are tested.
 
-- A second plan, after the fake tools and a clean checkout are in place, prints that there is nothing to change.
-- A stale `source_dir` shows a rewrite of that line and does not show a rewrite of `storage_dir`.
-- A dirty checkout shows a stop, and the plan names a file, and it does not show a reset.
-- A missing canonical directory shows a clone. A canonical path that is a non-git directory shows a stop and does not show a delete.
+`scripts/install.sh --plan` prints the actions and changes nothing. A test asserts a second plan says there is nothing to change, a dirty checkout names a file and does not mention reset, and a missing canonical directory mentions a clone.
+
+`scripts/install.sh --rewrite-config <checkout>` writes the top-level `source_dir` and nothing else, against `HOME` from the test. The test uses a config that ends inside `[transcription]` and asserts the parsed `source_dir`, an unchanged `storage_dir`, and a single `source_dir` line after a second run. A script that only prints the rewrite fails this test.
 
 The real Command Line Tools dialog, rustup download, `swift build`, and `cargo install` are macOS checks. They are not part of `./scripts/check.sh`.
 
-### 5. Point the docs at the one command
+### 5. Point the docs at the curl line
 
-Change `README.md`, `docs/SETUP.md`, and `docs/PORTABILITY.md` so the install and update instructions are the script. Fix the discovery order in `docs/SETUP.md`. State that a stale `source_dir` is rewritten. Leave the permission section as the human step. `git diff --check` is the check. No version bump.
+Change `README.md`, `docs/SETUP.md`, and `docs/PORTABILITY.md` so the only install line is the curl command above. Remove the sentence in `docs/SETUP.md` that puts the embedded checkout first. State that a stale top-level `source_dir` is rewritten. Leave the permission section as the human step.
+
+`scripts/test_install_docs.sh` fails if any of those three files is missing the curl line, or if `docs/SETUP.md` still contains `uses the checkout embedded in the installed binary, then falls back`. `git diff --check` still runs for whitespace. A docs edit that leaves the old discovery sentence passes `git diff --check` and fails this script. No version bump.
 
 ## Open decisions
 
