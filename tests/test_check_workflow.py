@@ -5,6 +5,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+from tests.git_env import without_hook_git
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -32,13 +34,19 @@ class CheckWorkflowTests(unittest.TestCase):
             repo = Path(tmp) / "repo"
             (repo / "scripts").mkdir(parents=True)
             shutil.copy(script, repo / "scripts" / "install-git-hooks.sh")
-            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "init", "-q", "-b", "main"],
+                cwd=repo,
+                check=True,
+                env=without_hook_git(),
+            )
             first = subprocess.run(
                 ["bash", "scripts/install-git-hooks.sh"],
                 cwd=repo,
                 capture_output=True,
                 text=True,
                 check=False,
+                env=without_hook_git(),
             )
             self.assertEqual(first.returncode, 0, first.stderr)
             second = subprocess.run(
@@ -47,6 +55,7 @@ class CheckWorkflowTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                env=without_hook_git(),
             )
             self.assertEqual(second.returncode, 0, second.stderr)
             got = subprocess.run(
@@ -55,12 +64,14 @@ class CheckWorkflowTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=True,
+                env=without_hook_git(),
             ).stdout.strip()
             self.assertEqual(got, ".githooks")
             subprocess.run(
                 ["git", "config", "core.hooksPath", "custom-hooks"],
                 cwd=repo,
                 check=True,
+                env=without_hook_git(),
             )
             blocked = subprocess.run(
                 ["bash", "scripts/install-git-hooks.sh"],
@@ -68,7 +79,7 @@ class CheckWorkflowTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
-                env={**os.environ},
+                env=without_hook_git(),
             )
             self.assertNotEqual(blocked.returncode, 0, blocked.stdout)
             still = subprocess.run(
@@ -77,6 +88,7 @@ class CheckWorkflowTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=True,
+                env=without_hook_git(),
             ).stdout.strip()
             self.assertEqual(still, "custom-hooks")
 

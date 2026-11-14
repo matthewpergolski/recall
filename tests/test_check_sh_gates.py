@@ -15,6 +15,8 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from tests.git_env import without_hook_git
+
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_SH = ROOT / "scripts" / "check.sh"
 CHECK_IDENTITY = ROOT / "scripts" / "check_identity.py"
@@ -77,7 +79,7 @@ def git(cwd: Path, *args: str, env: dict | None = None) -> None:
         check=True,
         capture_output=True,
         text=True,
-        env=env,
+        env=without_hook_git(env),
     )
 
 
@@ -274,6 +276,7 @@ class CheckShGatesTests(unittest.TestCase):
                 check=True,
                 capture_output=True,
                 text=True,
+                env=without_hook_git(),
             ).stdout.strip()
             good = good_body_file(work, head)
             result = self._run_check_sh(

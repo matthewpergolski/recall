@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import shlex
 import subprocess
+import os
 import sys
 from pathlib import Path
 
@@ -23,8 +24,21 @@ VERSION = re.compile(r'(?m)^\[package\]\s*\n(?:(?!\[).*\n)*?^version\s*=\s*"([^"
 def git(root: Path, *args: str) -> str | None:
     """The output of a git command in `root`, or None when it fails."""
     try:
+        env = os.environ.copy()
+        for key in (
+            "GIT_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_WORK_TREE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_COMMON_DIR",
+        ):
+            env.pop(key, None)
         done = subprocess.run(
-            ["git", "-C", str(root), *args], capture_output=True, text=True, check=False
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
         )
     except OSError:
         return None

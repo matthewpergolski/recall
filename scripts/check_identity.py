@@ -29,6 +29,7 @@ Exit 0 when clean, 1 when problems are found, 2 on usage/git errors.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -111,12 +112,22 @@ _GENERATED_WITH = re.compile(r"Generated with", re.I)
 
 
 def _run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    for key in (
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+    ):
+        env.pop(key, None)
     return subprocess.run(
         ["git", *args],
         cwd=repo,
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
 
 

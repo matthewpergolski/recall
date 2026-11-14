@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.git_env import without_hook_git
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "check_version_bump.py"
 
@@ -23,6 +25,7 @@ def git(cwd: Path, *args: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        env=without_hook_git(),
     )
     return result.stdout
 
@@ -69,7 +72,7 @@ def run_check(
     *args: str,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    merged = {**os.environ}
+    merged = without_hook_git()
     merged.pop("RECALL_SEMVER_LABEL", None)
     if env:
         merged.update(env)
