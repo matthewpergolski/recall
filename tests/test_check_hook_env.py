@@ -7,6 +7,8 @@ import subprocess
 import unittest
 from pathlib import Path
 
+from tests.git_env import without_hook_git
+
 ROOT = Path(__file__).resolve().parents[1]
 
 # Modules that build temp git repos. This file stays out of that list so it
@@ -20,16 +22,7 @@ GIT_SUITES = (
 
 
 def _git_env() -> dict[str, str]:
-    env = os.environ.copy()
-    for key in (
-        "GIT_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_WORK_TREE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_COMMON_DIR",
-    ):
-        env.pop(key, None)
-    return env
+    return without_hook_git()
 
 
 def _git(*args: str) -> str:

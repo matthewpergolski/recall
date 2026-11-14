@@ -11,12 +11,19 @@ what each command does and what going back does not undo.
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import shlex
 import subprocess
-import os
 import sys
 from pathlib import Path
+
+_GIT_ENV_PATH = Path(__file__).resolve().parent / "git_env.py"
+_GIT_ENV_SPEC = importlib.util.spec_from_file_location("recall_scripts_git_env", _GIT_ENV_PATH)
+if _GIT_ENV_SPEC is None or _GIT_ENV_SPEC.loader is None:
+    raise RuntimeError(f"could not load {_GIT_ENV_PATH}")
+_GIT_ENV = importlib.util.module_from_spec(_GIT_ENV_SPEC)
+_GIT_ENV_SPEC.loader.exec_module(_GIT_ENV)
 
 VERSION = re.compile(r'(?m)^\[package\]\s*\n(?:(?!\[).*\n)*?^version\s*=\s*"([^"]+)"')
 
@@ -24,24 +31,12 @@ VERSION = re.compile(r'(?m)^\[package\]\s*\n(?:(?!\[).*\n)*?^version\s*=\s*"([^"
 def git(root: Path, *args: str) -> str | None:
     """The output of a git command in `root`, or None when it fails."""
     try:
-        env = os.environ.copy()
-        for key in list(env):
-            if key in {
-                "GIT_DIR",
-                "GIT_INDEX_FILE",
-                "GIT_WORK_TREE",
-                "GIT_OBJECT_DIRECTORY",
-                "GIT_COMMON_DIR",
-                "GIT_CONFIG_PARAMETERS",
-                "GIT_CONFIG_COUNT",
-            } or key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
-                env.pop(key, None)
         done = subprocess.run(
             ["git", "-C", str(root), *args],
             capture_output=True,
             text=True,
             check=False,
-            env=env,
+            env=_GIT_ENV.scrub(),
         )
     except OSError:
         return None

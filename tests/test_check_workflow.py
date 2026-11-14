@@ -16,6 +16,8 @@ class CheckWorkflowTests(unittest.TestCase):
         self.assertIn("opened", text)
         self.assertIn("edited", text)
         self.assertIn("synchronize", text)
+        self.assertIn("ready_for_review", text)
+        self.assertIn("converted_to_draft", text)
         self.assertIn("pull-requests: write", text)
         self.assertIn("scripts/check_pr_body.py", text)
         self.assertIn("--github", text)

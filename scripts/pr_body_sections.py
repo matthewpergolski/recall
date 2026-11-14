@@ -19,7 +19,7 @@ _WHY_SPLIT = (" — ", " - ", " -- ")
 _FAMILIES = ("grok", "claude", "gpt", "gemini", "composer", "codex")
 
 
-def review_errors(text: str, head: str | None) -> list[str]:
+def review_errors(text: str, head: str | None, *, draft: bool | None = None) -> list[str]:
     review = _section(text, "Review")
     if not review:
         return []
@@ -28,6 +28,12 @@ def review_errors(text: str, head: str | None) -> list[str]:
     rev_match = _REVIEWER.search(review)
     impl = _name_from(impl_match.group(1)) if impl_match else None
     reviewer = _name_from(rev_match.group(1)) if rev_match else None
+    if reviewer == "pending" and draft is not True:
+        errors.append(
+            "Reviewer: pending is only allowed on a draft pull request. "
+            "Fix: mark the pull request as a draft, or set Reviewer to the "
+            "model that reviewed it."
+        )
     if impl is None:
         errors.append(
             "Review section needs an Implementer line with a bare model name "

@@ -1,24 +1,17 @@
-"""Drop git variables that a hook sets, so a command uses the repo it was given."""
+"""Re-export the one git-variable scrub. The names live in scripts/git_env.py."""
 
 from __future__ import annotations
 
-import os
+import importlib.util
+from pathlib import Path
 
-HOOK_GIT_VARS = (
-    "GIT_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_WORK_TREE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_COMMON_DIR",
-)
+_PATH = Path(__file__).resolve().parents[1] / "scripts" / "git_env.py"
+_SPEC = importlib.util.spec_from_file_location("recall_scripts_git_env", _PATH)
+if _SPEC is None or _SPEC.loader is None:
+    raise RuntimeError(f"could not load {_PATH}")
+_MODULE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_MODULE)
 
-
-def without_hook_git(env: dict[str, str] | None = None) -> dict[str, str]:
-    base = dict(os.environ if env is None else env)
-    for key in list(base):
-        if key in HOOK_GIT_VARS or key == "GIT_CONFIG_PARAMETERS" or key == "GIT_CONFIG_COUNT":
-            base.pop(key, None)
-            continue
-        if key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
-            base.pop(key, None)
-    return base
+EXACT = _MODULE.EXACT
+PREFIXES = _MODULE.PREFIXES
+without_hook_git = _MODULE.scrub

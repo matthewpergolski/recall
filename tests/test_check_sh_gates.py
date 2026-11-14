@@ -24,6 +24,8 @@ CHECK_PR_BODY = ROOT / "scripts" / "check_pr_body.py"
 CHECK_PR_RULES = ROOT / "scripts" / "pr_body_rules.py"
 CHECK_PR_SECTIONS = ROOT / "scripts" / "pr_body_sections.py"
 CHECK_VERSION = ROOT / "scripts" / "check_version_bump.py"
+GIT_ENV_PY = ROOT / "scripts" / "git_env.py"
+GIT_ENV_SH = ROOT / "scripts" / "git_env.sh"
 INSTALL_HOOKS = ROOT / "scripts" / "install-git-hooks.sh"
 
 NEUTRAL_NAME = "recall contributors"
@@ -108,6 +110,8 @@ class CheckShGatesTests(unittest.TestCase):
         shutil.copy(CHECK_PR_RULES, scripts / "pr_body_rules.py")
         shutil.copy(CHECK_PR_SECTIONS, scripts / "pr_body_sections.py")
         shutil.copy(CHECK_VERSION, scripts / "check_version_bump.py")
+        shutil.copy(GIT_ENV_PY, scripts / "git_env.py")
+        shutil.copy(GIT_ENV_SH, scripts / "git_env.sh")
         shutil.copy(INSTALL_HOOKS, scripts / "install-git-hooks.sh")
         (scripts / "check.sh").chmod(0o755)
 

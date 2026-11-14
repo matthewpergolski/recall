@@ -29,11 +29,19 @@ Exit 0 when clean, 1 when problems are found, 2 on usage/git errors.
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+import importlib.util
+
+_GIT_ENV_PATH = Path(__file__).resolve().parent / "git_env.py"
+_GIT_ENV_SPEC = importlib.util.spec_from_file_location("recall_scripts_git_env", _GIT_ENV_PATH)
+if _GIT_ENV_SPEC is None or _GIT_ENV_SPEC.loader is None:
+    raise RuntimeError(f"could not load {_GIT_ENV_PATH}")
+_GIT_ENV = importlib.util.module_from_spec(_GIT_ENV_SPEC)
+_GIT_ENV_SPEC.loader.exec_module(_GIT_ENV)
 
 ALLOWED_NAME = "recall contributors"
 ALLOWED_EMAIL = "contributors@recall.invalid"
@@ -112,18 +120,7 @@ _GENERATED_WITH = re.compile(r"Generated with", re.I)
 
 
 def _run(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    for key in list(env):
-        if key in {
-            "GIT_DIR",
-            "GIT_INDEX_FILE",
-            "GIT_WORK_TREE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_COMMON_DIR",
-            "GIT_CONFIG_PARAMETERS",
-            "GIT_CONFIG_COUNT",
-        } or key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
-            env.pop(key, None)
+    env = _GIT_ENV.scrub()
     return subprocess.run(
         ["git", *args],
         cwd=repo,
