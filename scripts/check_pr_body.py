@@ -10,134 +10,41 @@ Required headings, in order:
   ## How to test
   ## Review
 
-Also requires a ```mermaid fence. Fails on Cursor agent footer markers
-(CURSOR_AGENT_PR_BODY, Open in Cursor / Open in Web), "Generated with",
-and model names/ids. Bare product names (Claude, Cursor, Codex) are fine.
+Also requires a ```mermaid fence, bare Implementer and Reviewer names,
+an End-to-end command and result, and a Head SHA. Fails on Cursor agent
+footer markers and versioned model ids.
 
 Usage:
-  python3 scripts/check_pr_body.py [PATH]
-  PR_BODY='...' python3 scripts/check_pr_body.py
+  python3 scripts/check_pr_body.py [PATH] --head SHA
+  python3 scripts/check_pr_body.py PATH --fix --head SHA
+  python3 scripts/check_pr_body.py --github --head SHA
+  scripts/pr_body_check PATH --head SHA
 
-Reads PATH when given, else the PR_BODY environment variable, else stdin.
+--fix keeps only the text between CURSOR_AGENT_PR_BODY markers and drops
+the footer. It does not write when the body is already clean.
+--github does that to the open pull request, then validates the result.
 Exit 0 when clean, 1 when problems are found, 2 on usage errors.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import re
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-REQUIRED_HEADINGS = [
-    "TL;DR",
-    "How it works",
-    "Summary",
-    "Files changed",
-    "How to test",
-    "Review",
-]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-_HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.M)
-_MERMAID = re.compile(r"^```mermaid\s*$", re.M | re.I)
-
-# Versioned / dotted model ids. Bare Claude / Cursor / Codex are not matched.
-# No bare cursor-... alternative: branch names like cursor-pr-template-...
-# must not false-positive as model ids. Trailing file extensions are ignored
-# so asset names are not treated as ids.
-_MODEL_ID = re.compile(
-    r"(?i)\b(?:"
-    r"gpt-[\w.\-]+|"
-    r"o[1-9](?:-[\w.\-]+)+|"
-    r"claude-[\w.\-]+|"
-    r"gemini-[\w.\-]+|"
-    r"composer-[\w.\-]+|"
-    r"grok-[\w.\-]+|"
-    r"llama-[\w.\-]+|"
-    r"mistral-[\w.\-]+|"
-    r"codex-[\w.\-]+"
-    r")\b"
+from pr_body_rules import (  # noqa: E402
+    REQUIRED_HEADINGS,
+    check_body,
+    explain_github_denied,
+    plan_body_update,
+    should_write_body,
 )
-_ASSET_SUFFIX = re.compile(
-    r"\.(?:png|jpe?g|gif|webp|svg|ico|js|css|map|md|txt)$",
-    re.I,
-)
-
-_GENERATED_WITH = re.compile(r"Generated with", re.I)
-_OPEN_PHRASES = ("Open in Cursor", "Open in Web")
-
-
-def check_body(text: str) -> list[str]:
-    """Return problem lines for one PR body (empty when clean)."""
-    errors: list[str] = []
-
-    if "CURSOR_AGENT_PR_BODY" in text:
-        errors.append(
-            "CURSOR_AGENT_PR_BODY marker found. "
-            "Fix: remove CURSOR_AGENT_PR_BODY HTML comment markers and the "
-            "agent footer from the PR body."
-        )
-
-    open_hits = [phrase for phrase in _OPEN_PHRASES if phrase in text]
-    if open_hits:
-        shown = " / ".join(open_hits)
-        errors.append(
-            f"{shown} footer found. "
-            "Fix: remove the Open in Cursor / Open in Web agent footer "
-            "from the PR body."
-        )
-
-    if _GENERATED_WITH.search(text):
-        errors.append(
-            '"Generated with" attribution found. '
-            'Fix: remove "Generated with ..." lines from the PR body.'
-        )
-
-    models = sorted(
-        {m.group(0) for m in _MODEL_ID.finditer(text) if not _ASSET_SUFFIX.search(m.group(0))}
-    )
-    for model in models:
-        errors.append(
-            f"model id {model!r} found. "
-            "Fix: remove model names/ids from the PR body; product names "
-            "(Claude, Cursor, Codex) are fine."
-        )
-
-    found: list[str] = []
-    for match in _HEADING.finditer(text):
-        title = match.group(2).strip()
-        if title in REQUIRED_HEADINGS:
-            found.append(title)
-
-    missing = [h for h in REQUIRED_HEADINGS if h not in found]
-    if missing:
-        errors.append(
-            "missing required heading(s): "
-            + ", ".join(missing)
-            + ". Fix: add the six headings in order: "
-            + ", ".join(REQUIRED_HEADINGS)
-            + "."
-        )
-    else:
-        # Required titles must appear in order (subsequence of found).
-        want = list(REQUIRED_HEADINGS)
-        pos = 0
-        for title in found:
-            if pos < len(want) and title == want[pos]:
-                pos += 1
-        if pos != len(want):
-            errors.append(
-                "required headings are out of order. "
-                "Fix: use the six headings in order: " + ", ".join(REQUIRED_HEADINGS) + "."
-            )
-
-    if not _MERMAID.search(text):
-        errors.append(
-            "missing ```mermaid fence. Fix: add a ```mermaid code fence (under How it works)."
-        )
-
-    return errors
 
 
 def _read_body(path: str | None) -> str:
@@ -148,17 +55,118 @@ def _read_body(path: str | None) -> str:
         return env
     if not sys.stdin.isatty():
         return sys.stdin.read()
-    raise SystemExit("usage: check_pr_body.py [PATH]  (or set PR_BODY, or pipe stdin)")
+    raise SystemExit("usage: check_pr_body.py [PATH] --head SHA  (or set PR_BODY, or pipe stdin)")
+
+
+def _event_action() -> str:
+    path = os.environ.get("GITHUB_EVENT_PATH")
+    if not path:
+        return ""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    action = payload.get("action")
+    return action if isinstance(action, str) else ""
+
+
+def _github_request(method: str, url: str, token: str, payload: dict | None = None) -> tuple[int, str]:
+    data = None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "recall-pr-body-check",
+    }
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        return exc.code, raw
+
+
+def _report(problems: list[str]) -> int:
+    if not problems:
+        print("pr-body: ok")
+        return 0
+    print(f"pr-body: {len(problems)} problem(s)", file=sys.stderr)
+    for line in problems:
+        print(f"error: {line}", file=sys.stderr)
+    return 1
+
+
+def _run_github(head: str | None) -> int:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+    repo = os.environ.get("GITHUB_REPOSITORY") or ""
+    number = os.environ.get("PR_NUMBER") or ""
+    if not token or not repo or not number:
+        print(
+            "pr-body: --github needs GITHUB_TOKEN, GITHUB_REPOSITORY, and PR_NUMBER",
+            file=sys.stderr,
+        )
+        return 2
+    url = f"https://api.github.com/repos/{repo}/pulls/{number}"
+    status, payload = _github_request("GET", url, token)
+    if status >= 300:
+        print(f"pr-body: could not read PR #{number}: {status} {payload}", file=sys.stderr)
+        return 1
+    try:
+        pr = json.loads(payload)
+    except json.JSONDecodeError:
+        print("pr-body: GitHub returned a body that is not JSON", file=sys.stderr)
+        return 1
+    body = pr.get("body") or ""
+    if head is None:
+        head = (pr.get("head") or {}).get("sha")
+    updated = should_write_body(
+        body,
+        actor=os.environ.get("GITHUB_ACTOR", ""),
+        action=_event_action(),
+    )
+    if updated is not None:
+        status, payload = _github_request("PATCH", url, token, {"body": updated})
+        if status in (401, 403):
+            print(explain_github_denied(status, payload), file=sys.stderr)
+            problems = check_body(body, head=head)
+            if not problems:
+                problems = [
+                    "pr-body: the body still needs a GitHub edit and the token cannot write."
+                ]
+            return _report(problems)
+        if status >= 300:
+            print(f"pr-body: could not update PR #{number}: {status} {payload}", file=sys.stderr)
+            return 1
+        print("pr-body: removed the Cursor wrapper")
+        body = updated
+    return _report(check_body(body, head=head))
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("path", nargs="?", help="PR body file (default: PR_BODY env or stdin)")
+    parser.add_argument("--head", help="PR head SHA. The Head: line must equal it.")
     parser.add_argument(
-        "path",
-        nargs="?",
-        help="PR body file (default: PR_BODY env or stdin)",
+        "--fix",
+        action="store_true",
+        help="keep only the text between Cursor markers and rewrite the file",
+    )
+    parser.add_argument(
+        "--github",
+        action="store_true",
+        help="strip the open PR body through the API, then validate it",
     )
     args = parser.parse_args(argv)
+
+    if args.github:
+        return _run_github(args.head)
+    if args.fix and not args.path:
+        print("pr-body: --fix needs a file path", file=sys.stderr)
+        return 2
     try:
         body = _read_body(args.path)
     except OSError as exc:
@@ -168,14 +176,13 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    problems = check_body(body)
-    if not problems:
-        print("pr-body: ok")
-        return 0
-    print(f"pr-body: {len(problems)} problem(s)", file=sys.stderr)
-    for line in problems:
-        print(f"error: {line}", file=sys.stderr)
-    return 1
+    if args.fix and args.path:
+        updated = plan_body_update(body)
+        if updated is not None:
+            Path(args.path).write_text(updated, encoding="utf-8")
+            body = updated
+            print("pr-body: removed the Cursor wrapper")
+    return _report(check_body(body, head=args.head))
 
 
 if __name__ == "__main__":

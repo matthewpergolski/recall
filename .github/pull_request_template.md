@@ -1,32 +1,48 @@
 ## TL;DR
 
-<!-- 2–3 plain sentences: what someone can see or do after merge, and why. Lead with the user-visible outcome. -->
+<!-- Two or three sentences. Say what a person can do after merge. Say why. -->
+
+Replace this paragraph. Say what a person can do after merge.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-  A[Idea] --> B[Result]
+  A[Change] --> B[Check]
 ```
 
-<!-- One “notice this” sentence about the diagram (the idea, not the files). -->
+<!-- One sentence about the diagram. -->
+
+The diagram shows the change, then the check.
 
 ## Summary
 
-<!-- What changed and why. What was left alone. -->
+<!-- Say what changed and why. Say what you left alone. -->
+
+Replace this summary. Say what you left alone.
 
 ## Files changed
 
 | Purpose | Files |
 | --- | --- |
-|  |  |
+| Fill in one row per purpose | `path` |
 
 ## How to test
 
-- Unit: `command` — result (or “not needed, because …”)
-- Smoke: `command` — result (or “not needed, because …”)
-- End-to-end: `command` — result (or “not needed, because …”)
+- Unit: `python3 -m unittest discover -s tests -p 'test_check_*.py' -q` — passed
+- Smoke: `python3 scripts/pr_body_check .github/pull_request_template.md --head 0000000000000000000000000000000000000000` — printed `pr-body: ok`
+- End-to-end: `python3 scripts/pr_body_check .github/pull_request_template.md --head 0000000000000000000000000000000000000000` — printed `pr-body: ok` and exited 0
+- Mac-only:
+  - `swift run --package-path capture-helper recall-capture list-sources` — needs macOS 14 and a microphone permission
 
 ## Review
 
-<!-- Findings as fixed / accepted / rejected. No AI tool or model names. -->
+Implementer: Grok 4.7
+Reviewer: Claude Opus 4.6
+
+<!-- Use a bare name such as Grok 4.7. Do not use a hyphenated model id.
+If the reviewer is the same model, name the other models you tried, say why each was unavailable, and write that this was a fresh agent, not the implementing agent. -->
+
+- none yet
+
+Head: `0000000000000000000000000000000000000000`

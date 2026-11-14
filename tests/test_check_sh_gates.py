@@ -19,6 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 CHECK_SH = ROOT / "scripts" / "check.sh"
 CHECK_IDENTITY = ROOT / "scripts" / "check_identity.py"
 CHECK_PR_BODY = ROOT / "scripts" / "check_pr_body.py"
+CHECK_PR_RULES = ROOT / "scripts" / "pr_body_rules.py"
+CHECK_PR_SECTIONS = ROOT / "scripts" / "pr_body_sections.py"
+CHECK_VERSION = ROOT / "scripts" / "check_version_bump.py"
+INSTALL_HOOKS = ROOT / "scripts" / "install-git-hooks.sh"
 
 NEUTRAL_NAME = "recall contributors"
 NEUTRAL_EMAIL = "contributors@recall.invalid"
@@ -50,13 +54,18 @@ GOOD_PR_BODY = textwrap.dedent(
 
     ## How to test
 
-    - Unit: not needed, because this is the fixture
-    - Smoke: not needed, because this is the fixture
-    - End-to-end: not needed, because this is the fixture
+    - Unit: `python3 -m unittest tests.test_check_noop -q` — passed
+    - Smoke: `python3 scripts/check_pr_body.py body.md --head {head}` — printed ok
+    - End-to-end: `python3 scripts/check_pr_body.py body.md --head {head}` — printed ok and exited 0
 
     ## Review
 
+    Implementer: Grok 4.7
+    Reviewer: Claude Opus 4.6
+
     - none
+
+    Head: `{head}`
     """
 )
 
@@ -78,9 +87,9 @@ def write_exec(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
-def good_body_file(dir_path: Path) -> Path:
+def good_body_file(dir_path: Path, head: str) -> Path:
     path = dir_path / "good-body.md"
-    path.write_text(GOOD_PR_BODY, encoding="utf-8")
+    path.write_text(GOOD_PR_BODY.format(head=head), encoding="utf-8")
     return path
 
 
@@ -94,6 +103,10 @@ class CheckShGatesTests(unittest.TestCase):
         shutil.copy(CHECK_SH, scripts / "check.sh")
         shutil.copy(CHECK_IDENTITY, scripts / "check_identity.py")
         shutil.copy(CHECK_PR_BODY, scripts / "check_pr_body.py")
+        shutil.copy(CHECK_PR_RULES, scripts / "pr_body_rules.py")
+        shutil.copy(CHECK_PR_SECTIONS, scripts / "pr_body_sections.py")
+        shutil.copy(CHECK_VERSION, scripts / "check_version_bump.py")
+        shutil.copy(INSTALL_HOOKS, scripts / "install-git-hooks.sh")
         (scripts / "check.sh").chmod(0o755)
 
         # check.sh runs unittest discover on test_check_*.py; one trivial
@@ -127,7 +140,15 @@ class CheckShGatesTests(unittest.TestCase):
         git(work, "config", "user.name", NEUTRAL_NAME)
         git(work, "config", "user.email", NEUTRAL_EMAIL)
         (work / "README.md").write_text("base\n", encoding="utf-8")
-        git(work, "add", "README.md", "scripts", "tests")
+        (work / "Cargo.toml").write_text(
+            '[package]\nname = "recall"\nversion = "0.0.1"\nedition = "2021"\n',
+            encoding="utf-8",
+        )
+        (work / "Cargo.lock").write_text(
+            '[[package]]\nname = "recall"\nversion = "0.0.1"\n',
+            encoding="utf-8",
+        )
+        git(work, "add", "README.md", "Cargo.toml", "Cargo.lock", "scripts", "tests")
         git(work, "commit", "-q", "-m", "base")
         # origin/main is the merge base for the identity range.
         git(work, "update-ref", "refs/remotes/origin/main", "HEAD")
@@ -247,7 +268,14 @@ class CheckShGatesTests(unittest.TestCase):
             work.mkdir()
             bin_dir = self._build_fixture(work)
             self._init_repo_with_range(work, bad_tip_author=False)
-            good = good_body_file(work)
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=work,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            good = good_body_file(work, head)
             result = self._run_check_sh(
                 work,
                 bin_dir,
