@@ -36,7 +36,9 @@ The folder name is a 12-digit inverted UTC key, a local timestamp, a zone token,
 
 `metadata.json` does not store the working directory, the git toplevel, the branch, the commit, the worktree, or a pull request. A search of `src/` for those fields on a session finds none. The `sources` object in `session_json` is written as null and is not updated when audio files appear. Audio exists when the files exist. `keep_audio = false` can delete the `m4a` files after a transcript, so a later listing can show no audio for a session that was recorded.
 
-The title is the `title` string in `metadata.json`. Analysis may replace it. `update_session_title_files` writes the new title into metadata, and into the first line of the transcript, markers, and notes when those lines still have their original prefix. It parses metadata as a JSON object and inserts `title`, so other keys stay. It does not edit `meeting.md`. The analysis writer rewrites `meeting.md` separately. If the session has a single take, `maybe_rename_session_dir_for_title` also renames the folder so the slug matches the title. `session_folder_is_sticky` is true when `take_count` is greater than 1, and then the folder name stays. The resume id is the folder name, so a rename can change the id of a one-take session.
+The title is the `title` string in `metadata.json`. Analysis may replace it. `update_session_title_files` writes the new title into metadata, and into the first line of the transcript, markers, and notes when those lines still have their original prefix. It parses metadata as a JSON object and inserts `title` and `id`, so other keys stay. It does not edit `meeting.md`. The analysis writer rewrites `meeting.md` separately.
+
+`recall analyze` with no `--generation` renames the folder before that write, so the stored `id` matches the new folder. The TUI passes a generation, and that path skips the rename. After a published first take the TUI calls `maybe_rename_session_dir_for_title` itself, which only renames the directory. Metadata `id` can still name the old folder. `session_folder_is_sticky` is true when `take_count` is greater than 1, and then the folder name stays. The resume id a person types is the folder name.
 
 Recall remembers every sessions folder it has used in `~/.config/recall/session-places.txt`, one path per line. `src/places.rs` says the file holds paths only. Temp directories are not added. `recall list` scans the current place with `list_sessions`, which keeps directories that contain metadata and sorts them by `created_at_unix` descending, then by path descending. `recall list --all` prints every place, and counts places that are missing.
 
@@ -90,8 +92,8 @@ These values are already on disk.
 - Title, from metadata, or `Recall Session` when the title is missing.
 - Age, from `created_at_unix`. A missing timestamp sorts last and the row shows no age. Do not render Unix epoch as a huge age. `list_sessions` uses 0 today. The picker must not copy that into the label.
 - Duration, from `elapsed_ms` in `capture.json`. Hide it when the file is missing.
-- Size, the sum of file lengths under the session directory. Compute it while listing. Do not read file bytes.
-- Microphone and call audio, from a non-empty `audio/mic*.m4a` or `audio/call*.m4a`.
+- Size, the sum of file lengths under the session directory. Compute it while listing. Do not read file bytes. `directory_size` in `src/transcription.rs` walks a tree the same way, and it is private to the Parakeet cache. The catalog does not call it.
+- Microphone and call audio, from a non-empty file `discover_track_segments` already treats as that track. That includes `mic-001.m4a`, `mic-001-part-02.m4a`, `mic.m4a`, and the matching `call` names.
 - TL;DR, from `overview.json` under the same take rule as `saved_overview`.
 
 Branch at record time cannot be inferred. Do not write today's branch into an old file. A live git query on the sessions folder can still group that folder with a worktree, because the folder is still inside the checkout. That query is for filtering. It is not stored, and it is not shown as the session's branch.
@@ -122,7 +124,7 @@ Sort is `created_at_unix` descending, then path descending. That is the `list_se
 
 Preview is a pure string. It contains the title, the local start time, the duration when known, the branch or the words `branch not recorded`, the audio marks, and the first line of the TL;DR up to 240 characters. It does not contain the transcript body. A test can pin that.
 
-Rename edits the title. Enter saves. Esc cancels the edit and leaves the files alone. An empty title is rejected. The save writes metadata `title`, the first line of `meeting.md` when that line starts with `# `, and the same first-line updates `update_session_title_files` already does for the transcript, markers, and notes. It then calls `maybe_rename_session_dir_for_title`. A one-take folder may change name, and the selection follows the new path. A folder with more than one take keeps its name. The body of `meeting.md` under the heading stays. Audio bytes stay. If the write fails, the picker shows the error and keeps the old title.
+Rename edits the title. Enter saves. Esc cancels the edit and leaves the files alone. An empty title is rejected. On a one-take session the save renames the folder first, then writes the title files, and sets metadata `id` to the new folder name. That is the order `recall analyze` uses when no generation is set. The TUI order leaves `id` on the old name, and the picker does not copy that. The title write covers metadata `title`, the first line of `meeting.md` when that line starts with `# `, and the same first-line updates `update_session_title_files` already does for the transcript, markers, and notes. The selection follows the new path. A folder with more than one take keeps its name. The body of `meeting.md` under the heading stays. Audio bytes stay. If the write fails, the picker shows the error and keeps the old title.
 
 ### Row fields
 
