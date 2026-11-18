@@ -579,6 +579,55 @@ pub fn logs_dir(session_path: &Path) -> PathBuf {
     internal_dir(session_path).join("logs")
 }
 
+/// Write (or rewrite) `.recall/chat/CONTEXT.md` for post-call chat.
+///
+/// Safe to call on every chat launch. Does not create `AGENTS.md`.
+/// Follow-up PRs call this before spawn; kept public ahead of those callers.
+#[allow(dead_code)]
+pub fn write_chat_context(session_path: &Path) -> io::Result<PathBuf> {
+    let chat_dir = internal_dir(session_path).join("chat");
+    fs::create_dir_all(&chat_dir)?;
+    let context_path = chat_dir.join("CONTEXT.md");
+
+    let session_id = session_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown");
+    let title = read_session_title(session_path).unwrap_or_else(|_| "Untitled meeting".to_string());
+    let project_cwd =
+        read_recorded_project_cwd(session_path).unwrap_or_else(|| "not recorded".to_string());
+
+    let meeting_line = if session_path.join("meeting.md").is_file() {
+        "meeting.md".to_string()
+    } else {
+        "meeting.md (pending)".to_string()
+    };
+    let overview_line = if analysis_dir(session_path).join("overview.json").is_file() {
+        ".recall/analysis/overview.json".to_string()
+    } else {
+        ".recall/analysis/overview.json (missing)".to_string()
+    };
+
+    let body = format!(
+        "# Recall chat context\n\nThis file is written by Recall for post-call chat. Recall may overwrite it.\nPaths below are relative to the session folder (the process working directory).\n\n- Session id: {session_id}\n- Title: {title}\n- Project directory at record time: {project_cwd}\n- Transcript: transcript.md\n- Meeting notes: {meeting_line}\n- Overview: {overview_line}\n- Notes: .recall/notes.md\n- Markers: .recall/markers.md\n"
+    );
+    fs::write(&context_path, body)?;
+    Ok(context_path)
+}
+
+#[allow(dead_code)]
+fn read_recorded_project_cwd(session_path: &Path) -> Option<String> {
+    let metadata = fs::read_to_string(metadata_path(session_path)).ok()?;
+    let value = serde_json::from_str::<Value>(&metadata).ok()?;
+    value
+        .get("context")
+        .and_then(|context| context.get("cwd"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_string)
+}
+
 pub fn primary_document_path(session_path: &Path) -> PathBuf {
     for file_name in ["meeting.md", "summary.md", "transcript.md"] {
         let path = session_path.join(file_name);
@@ -1247,12 +1296,87 @@ mod tests {
         mark_transcript_ready, next_note_image_relative_path, pasted_image_path,
         read_session_consent, readable_session_stamp_for, resolve_session_target, resolve_timezone,
         resume_hint, session_entries, session_from_arg, short_session_id, slugify, start_session,
-        zone_token, ConsentMode, StartOptions, FALLBACK_TIMEZONE,
+        write_chat_context, zone_token, ConsentMode, StartOptions, FALLBACK_TIMEZONE,
     };
     use jiff::{civil::date, tz::TimeZone};
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn write_chat_context_is_idempotent_and_lists_transcript() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "recall-chat-context-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&session_dir);
+        fs::create_dir_all(session_dir.join(".recall")).unwrap();
+        fs::write(
+            session_dir.join(".recall/metadata.json"),
+            r#"{
+  "id": "20260526-chat-fixture",
+  "title": "Chat Fixture",
+  "created_at_unix": 1,
+  "status": "initialized",
+  "consent": { "mode": "provided" },
+  "sources": { "microphone": null, "call_audio": null },
+  "files": {}
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("transcript.md"),
+            "# Transcript
+
+hello
+",
+        )
+        .unwrap();
+        // meeting.md intentionally absent: chat still allowed while analysis is pending.
+
+        let first = write_chat_context(&session_dir).unwrap();
+        assert_eq!(
+            first,
+            session_dir.join(".recall/chat/CONTEXT.md"),
+            "writer returns the CONTEXT.md path"
+        );
+        let body = fs::read_to_string(&first).unwrap();
+        assert!(
+            body.contains("transcript.md"),
+            "CONTEXT.md must list transcript.md: {body}"
+        );
+        assert!(
+            body.contains("Recall may overwrite"),
+            "CONTEXT.md must say Recall may overwrite it: {body}"
+        );
+        assert!(
+            body.contains("meeting.md") && body.to_lowercase().contains("pending"),
+            "missing meeting.md must be called out as pending: {body}"
+        );
+        assert!(
+            !session_dir.join("AGENTS.md").exists(),
+            "must not create AGENTS.md at the session root"
+        );
+
+        let second = write_chat_context(&session_dir).unwrap();
+        assert_eq!(first, second);
+        let body2 = fs::read_to_string(&second).unwrap();
+        assert_eq!(
+            body, body2,
+            "second write must replace the file, not duplicate sections"
+        );
+        assert_eq!(
+            body2.matches("transcript.md").count(),
+            body.matches("transcript.md").count(),
+            "idempotent rewrite must not duplicate transcript lines"
+        );
+
+        let _ = fs::remove_dir_all(&session_dir);
+    }
 
     #[test]
     fn editor_invocation_defaults_to_macos_open() {
