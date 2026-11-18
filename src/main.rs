@@ -23,12 +23,13 @@ use analysis::{
     analyze, chat_argv, chat_launch_profile, known_agents, AnalyzeOptions, AnalyzeTarget,
     DEFAULT_CHAT_PROMPT,
 };
+use audio::live_capture_block_reason;
 use capture_sources::{detect_sources, probe_audio_tap};
 use config::{config_path, RecallConfig};
 use session::{
-    default_storage_dir, export_session, faded_text, holds_sessions, latest_session, list_sessions,
-    open_path, primary_document_path, resolve_timezone, resume_hint, session_from_arg,
-    start_session, write_chat_context, ConsentMode, StartOptions,
+    default_storage_dir, export_session, faded_text, holds_sessions, is_session_dir,
+    latest_session, list_sessions, open_path, primary_document_path, resolve_timezone, resume_hint,
+    session_from_arg, start_session, write_chat_context, ConsentMode, StartOptions,
 };
 use terminal::stdout_is_live;
 use transcription::{
@@ -354,6 +355,11 @@ fn run_chat(args: Vec<String>, tui_defaults: &TuiOptions) {
         }
     };
 
+    if let Some(reason) = live_capture_block_reason(&options.session_path) {
+        eprintln!("{reason}");
+        std::process::exit(2);
+    }
+
     if !binary_exists(profile.command) {
         eprintln!(
             "Missing `{command}` on PATH. Install it, or run recall agents doctor.",
@@ -461,6 +467,13 @@ fn parse_chat_options(args: Vec<String>, tui_defaults: &TuiOptions) -> Result<Ch
                 latest_session(&storage_dir).map_err(|error| error.to_string())?
             }
         };
+
+    if !is_session_dir(&session_path) {
+        return Err(format!(
+            "{} is not a Recall session folder.",
+            session_path.display()
+        ));
+    }
 
     Ok(ChatOptions {
         session_path,
