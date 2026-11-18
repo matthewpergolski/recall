@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -221,6 +221,29 @@ fn resume_tui_after_chat(terminal: &mut DefaultTerminal) -> io::Result<()> {
     *terminal = ratatui::try_init()?;
     enable_tui_keyboard();
     Ok(())
+}
+
+fn chat_privacy_warning(agent: &str, session_id: &str) -> String {
+    format!("Opening {agent} in {session_id}… Meeting text may leave this machine.")
+}
+
+/// Steps that must run on the primary screen after `try_restore`, before the agent owns the TTY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatHandoffAfterRestore {
+    EmitPrivacyWarning(String),
+    Spawn,
+}
+
+fn chat_handoff_after_restore(agent: &str, session_id: &str) -> Vec<ChatHandoffAfterRestore> {
+    vec![
+        ChatHandoffAfterRestore::EmitPrivacyWarning(chat_privacy_warning(agent, session_id)),
+        ChatHandoffAfterRestore::Spawn,
+    ]
+}
+
+fn emit_chat_privacy_warning(out: &mut impl Write, warning: &str) -> io::Result<()> {
+    writeln!(out, "{warning}")?;
+    out.flush()
 }
 
 fn command_on_path(name: &str) -> bool {
@@ -1755,8 +1778,7 @@ impl App {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("this session");
-        self.toast =
-            format!("Opening {agent} in {session_id}… Meeting text may leave this machine.");
+        self.toast = chat_privacy_warning(&agent, session_id);
         self.pending_chat = Some(ChatHandoffPlan {
             session_path,
             agent,
@@ -1792,18 +1814,38 @@ impl App {
             return Ok(());
         }
 
+        let session_id = plan
+            .session_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("this session");
+        // Leave the alternate screen first. The in-TUI toast dies with it; print
+        // the same sentence on the primary screen so it stays readable above the agent.
         suspend_tui_for_chat(terminal)?;
-        let argv = chat_argv(&profile, DEFAULT_CHAT_PROMPT);
-        let mut command = Command::new(&argv[0]);
-        if argv.len() > 1 {
-            command.args(&argv[1..]);
+        let mut child_result = Err(io::Error::other("chat handoff did not spawn"));
+        for step in chat_handoff_after_restore(&plan.agent, session_id) {
+            match step {
+                ChatHandoffAfterRestore::EmitPrivacyWarning(warning) => {
+                    if let Err(error) = emit_chat_privacy_warning(&mut io::stdout(), &warning) {
+                        let _ = resume_tui_after_chat(terminal);
+                        return Err(error);
+                    }
+                }
+                ChatHandoffAfterRestore::Spawn => {
+                    let argv = chat_argv(&profile, DEFAULT_CHAT_PROMPT);
+                    let mut command = Command::new(&argv[0]);
+                    if argv.len() > 1 {
+                        command.args(&argv[1..]);
+                    }
+                    command
+                        .current_dir(&plan.session_path)
+                        .stdin(Stdio::inherit())
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit());
+                    child_result = command.status();
+                }
+            }
         }
-        command
-            .current_dir(&plan.session_path)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        let child_result = command.status();
         resume_tui_after_chat(terminal)?;
 
         match child_result {
@@ -6127,6 +6169,67 @@ mod tests {
         assert!(
             app.toast.contains("may leave this machine"),
             "toast should warn that meeting text may leave: {}",
+            app.toast
+        );
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn chat_handoff_emits_privacy_warning_after_restore_before_spawn() {
+        let steps = chat_handoff_after_restore("claude", "20260526-chat-session");
+        assert_eq!(
+            steps,
+            vec![
+                ChatHandoffAfterRestore::EmitPrivacyWarning(
+                    "Opening claude in 20260526-chat-session… Meeting text may leave this machine."
+                        .to_string()
+                ),
+                ChatHandoffAfterRestore::Spawn,
+            ],
+            "privacy warning must be the first primary-screen step after restore"
+        );
+        let mut buf = Vec::new();
+        emit_chat_privacy_warning(
+            &mut buf,
+            &chat_privacy_warning("claude", "20260526-chat-session"),
+        )
+        .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains(
+                "Opening claude in 20260526-chat-session… Meeting text may leave this machine."
+            ),
+            "handoff must print the privacy sentence after restore: {text}"
+        );
+        assert!(
+            text.ends_with('\n'),
+            "privacy warning must end with a newline so it stays above the agent"
+        );
+    }
+
+    #[test]
+    fn shift_c_refuses_live_capture_lock_when_ended() {
+        let (storage, session_path) = note_session("shift-c-lock");
+        let state_dir = session_path.join(".recall/state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("capture.lock"),
+            format!("{}\n1\n", std::process::id()),
+        )
+        .unwrap();
+        let mut app = test_app(session_path);
+        app.state = CaptureState::Ended;
+        app.agent = Some("claude".to_string());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(
+            app.pending_chat.is_none(),
+            "live capture.lock must not queue a chat handoff"
+        );
+        assert!(
+            app.toast.contains("already recording"),
+            "toast must use the live lock message: {}",
             app.toast
         );
         let _ = fs::remove_dir_all(storage);
