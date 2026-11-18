@@ -6,6 +6,8 @@ This is optional. Recording and local transcription still work without an agent.
 
 What is sent to the agent: the transcript, and the text of the notes and markers you made during the session, each with its time. A picture pasted into a note is sent as its file name only; the picture itself is not sent. Nothing else in the session folder is sent. With no agent selected and auto-analyze off, nothing is sent at all.
 
+Post-call chat (`C` in the TUI, or `recall chat`) opens the same selected agent interactively in the session folder. Meeting text may leave this machine when that agent's backend is remote, the same trust boundary as analysis.
+
 ## Supported Agents
 
 Built-in profiles:

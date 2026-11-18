@@ -24,14 +24,15 @@ use ratatui::{DefaultTerminal, Frame};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::analysis::{
-    analyze, known_agents, maybe_rename_session_dir_for_title, saved_overview, AnalysisOverview,
-    AnalyzeOptions, AnalyzeTarget,
+    analyze, chat_argv, chat_launch_profile, known_agents, maybe_rename_session_dir_for_title,
+    saved_overview, AnalysisOverview, AnalyzeOptions, AnalyzeTarget, DEFAULT_CHAT_PROMPT,
 };
 use crate::audio::{
     acquire_capture_lock, copy_take1_aliases, earlier_takes_are_transcript_only,
-    helper_restart_allowed, maybe_discard_session_audio, next_helper_part_name, next_take_index,
-    prepare_continued_take, read_capture_progress, resume_block_reason, write_capture_progress,
-    AudioRetention, AudioTrack, CaptureLock, CaptureProgress,
+    helper_restart_allowed, live_capture_block_reason, maybe_discard_session_audio,
+    next_helper_part_name, next_take_index, prepare_continued_take, read_capture_progress,
+    resume_block_reason, write_capture_progress, AudioRetention, AudioTrack, CaptureLock,
+    CaptureProgress,
 };
 use crate::capture_sources::{
     detect_sources, read_clipboard_text, write_clipboard_image, ClipboardImageOutcome,
@@ -43,7 +44,8 @@ use crate::session::{
     copy_image_into_session, default_storage_dir, discard_unused_note_images, find_session_target,
     format_session_note_bullet, internal_dir, next_note_image_relative_path, open_path,
     pasted_image_path, primary_document_path, read_session_consent, read_session_title,
-    remove_empty_images_dir, resolve_timezone, start_session, ConsentMode, StartOptions,
+    remove_empty_images_dir, resolve_timezone, start_session, write_chat_context, ConsentMode,
+    StartOptions,
 };
 use crate::system_recorder::{stop_system_path, SystemRecorder};
 use crate::transcription::{
@@ -186,6 +188,50 @@ pub struct TuiExit {
     pub notice: Option<String>,
 }
 
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+}
+
+fn enable_tui_keyboard() {
+    let _ = execute!(
+        io::stdout(),
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(keyboard_enhancement_flags()),
+    );
+}
+
+fn disable_tui_keyboard() {
+    let _ = execute!(
+        io::stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
+}
+
+fn suspend_tui_for_chat(terminal: &mut DefaultTerminal) -> io::Result<()> {
+    let _ = terminal;
+    disable_tui_keyboard();
+    ratatui::try_restore()
+}
+
+fn resume_tui_after_chat(terminal: &mut DefaultTerminal) -> io::Result<()> {
+    *terminal = ratatui::try_init()?;
+    enable_tui_keyboard();
+    Ok(())
+}
+
+fn command_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .any(|candidate| candidate.exists())
+}
+
 pub fn run_with_options(options: TuiOptions) -> io::Result<TuiExit> {
     let resume = match &options.resume {
         Some(target) => {
@@ -200,22 +246,9 @@ pub fn run_with_options(options: TuiOptions) -> io::Result<TuiExit> {
     let mut terminal = ratatui::try_init()?;
     // Negotiate keys in-app (Ghostty/kitty protocol) so Shift+Enter and Cmd+V
     // work without a separate /terminal-setup step. Ignore terminals that refuse.
-    let _ = execute!(
-        io::stdout(),
-        EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-        ),
-    );
+    enable_tui_keyboard();
     let result = App::new(options, resume)?.run(&mut terminal);
-    let _ = execute!(
-        io::stdout(),
-        PopKeyboardEnhancementFlags,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    );
+    disable_tui_keyboard();
     let restore_result = ratatui::try_restore();
 
     match (result, restore_result) {
@@ -290,6 +323,7 @@ struct App {
     live_transcript: LiveTranscriptState,
     live_scroll: u16,
     live_pane_width: u16,
+    pending_chat: Option<ChatHandoffPlan>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1533,6 +1567,7 @@ impl App {
             live_transcript: LiveTranscriptState::default(),
             live_scroll: 0,
             live_pane_width: 80,
+            pending_chat: None,
         };
         if let Some(resume) = resume {
             app.apply_resume(resume);
@@ -1596,6 +1631,11 @@ impl App {
             self.process_transcription_events();
             self.process_analysis_events();
             terminal.draw(|frame| self.render(frame))?;
+
+            if let Some(plan) = self.pending_chat.take() {
+                self.perform_chat_handoff(terminal, plan)?;
+                continue;
+            }
 
             if event::poll(TICK_RATE)? {
                 match event::read()? {
@@ -1682,12 +1722,109 @@ impl App {
             KeyCode::Char('r') => self.refresh_sources(),
             KeyCode::Char('a') => self.toggle_auto_analyze(),
             KeyCode::Char('A') => self.cycle_agent(),
+            KeyCode::Char('C') => self.request_chat(),
             KeyCode::Char('o') => self.open_session_folder(),
             KeyCode::Char('O') => self.open_session_document(),
             _ => {}
         }
 
         Ok(false)
+    }
+
+    fn request_chat(&mut self) {
+        if matches!(self.state, CaptureState::Recording)
+            || self.mic_recorder.is_some()
+            || self.system_recorder.is_some()
+        {
+            // Live capture owns the helpers. Do not tear down the TTY mid-take.
+            return;
+        }
+        let Some(session_path) = self.session_path.clone() else {
+            self.toast = "No session yet. Start a recording first.".to_string();
+            return;
+        };
+        if let Some(reason) = live_capture_block_reason(&session_path) {
+            self.toast = reason;
+            return;
+        }
+        let Some(agent) = self.agent.clone() else {
+            self.toast = "Pick an agent with A first.".to_string();
+            return;
+        };
+        let session_id = session_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("this session");
+        self.toast =
+            format!("Opening {agent} in {session_id}… Meeting text may leave this machine.");
+        self.pending_chat = Some(ChatHandoffPlan {
+            session_path,
+            agent,
+        });
+    }
+
+    fn perform_chat_handoff(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        plan: ChatHandoffPlan,
+    ) -> io::Result<()> {
+        let Some(profile) = chat_launch_profile(&plan.agent) else {
+            self.toast = format!(
+                "Unknown agent '{}'. Use {}.",
+                plan.agent,
+                known_agents().join(", ")
+            );
+            return Ok(());
+        };
+        if !command_on_path(profile.command) {
+            self.toast = format!(
+                "Missing `{command}` on PATH. Install it, or run recall agents doctor.",
+                command = profile.command
+            );
+            return Ok(());
+        }
+        if let Some(reason) = live_capture_block_reason(&plan.session_path) {
+            self.toast = reason;
+            return Ok(());
+        }
+        if let Err(error) = write_chat_context(&plan.session_path) {
+            self.toast = format!("Failed to write chat context: {error}");
+            return Ok(());
+        }
+
+        suspend_tui_for_chat(terminal)?;
+        let argv = chat_argv(&profile, DEFAULT_CHAT_PROMPT);
+        let mut command = Command::new(&argv[0]);
+        if argv.len() > 1 {
+            command.args(&argv[1..]);
+        }
+        command
+            .current_dir(&plan.session_path)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let child_result = command.status();
+        resume_tui_after_chat(terminal)?;
+
+        match child_result {
+            Ok(status) if status.success() => {
+                self.toast = format!("Returned from {}.", plan.agent);
+            }
+            Ok(status) => {
+                self.toast = format!(
+                    "`{}` exited with status {}.",
+                    profile.command,
+                    status
+                        .code()
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "signal".to_string())
+                );
+            }
+            Err(error) => {
+                self.toast = format!("Failed to start `{}`: {error}", profile.command);
+            }
+        }
+        Ok(())
     }
 
     fn request_quit(&mut self) -> io::Result<bool> {
@@ -4491,6 +4628,8 @@ impl App {
             Span::raw(" auto-ai  "),
             Span::styled(" A ", Style::default().fg(Color::Black).bg(Color::Green)),
             Span::raw(" agent  "),
+            Span::styled(" C ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::raw(" chat  "),
             Span::styled(" o ", Style::default().fg(Color::Black).bg(Color::Blue)),
             Span::raw(" folder  "),
             Span::styled(" O ", Style::default().fg(Color::Black).bg(Color::Blue)),
@@ -4509,6 +4648,12 @@ impl App {
             area,
         );
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatHandoffPlan {
+    session_path: PathBuf,
+    agent: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4908,6 +5053,7 @@ mod tests {
             live_transcript: LiveTranscriptState::default(),
             live_scroll: 0,
             live_pane_width: 80,
+            pending_chat: None,
         }
     }
 
@@ -5923,6 +6069,65 @@ mod tests {
         assert_eq!(
             dashboard_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
             KeyCode::Enter
+        );
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn shift_c_is_ignored_while_recording() {
+        let (storage, session_path) = note_session("shift-c-rec");
+        let mut app = test_app(session_path);
+        app.state = CaptureState::Recording;
+        app.agent = Some("claude".to_string());
+        app.toast = "recording".to_string();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(
+            app.pending_chat.is_none(),
+            "C must not request chat while recording"
+        );
+        assert_eq!(app.toast, "recording");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(
+            app.pending_chat.is_none(),
+            "capital C must not request chat while recording"
+        );
+        assert_eq!(app.toast, "recording");
+        let _ = fs::remove_dir_all(storage);
+    }
+
+    #[test]
+    fn shift_c_requests_chat_when_ended() {
+        let (storage, session_path) = note_session("shift-c-ended");
+        let session_name = session_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .to_string();
+        let mut app = test_app(session_path.clone());
+        app.state = CaptureState::Ended;
+        app.agent = Some("claude".to_string());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SHIFT))
+            .unwrap();
+        let plan = app
+            .pending_chat
+            .take()
+            .expect("ended C should request chat handoff");
+        assert_eq!(plan.agent, "claude");
+        assert_eq!(plan.session_path, session_path);
+        assert!(
+            app.toast.contains("Opening claude") && app.toast.contains(&session_name),
+            "toast should name the agent and session: {}",
+            app.toast
+        );
+        assert!(
+            app.toast.contains("may leave this machine"),
+            "toast should warn that meeting text may leave: {}",
+            app.toast
         );
         let _ = fs::remove_dir_all(storage);
     }
