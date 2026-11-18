@@ -102,6 +102,69 @@ struct AgentProfile {
     raw_output_file: &'static str,
 }
 
+/// Interactive CLI launch plan for post-call chat (not headless analyze).
+/// Follow-up PRs spawn from this profile; kept public ahead of those callers.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatLaunchProfile {
+    pub command: &'static str,
+    pub args: &'static [&'static str],
+}
+
+/// First prompt shared by agents that accept an interactive initial message.
+#[allow(dead_code)]
+pub const DEFAULT_CHAT_PROMPT: &str = concat!(
+    "You are in a Recall meeting session folder. ",
+    "Read .recall/chat/CONTEXT.md first, then help me discuss this meeting. ",
+    "Prefer transcript.md and meeting.md over guesses."
+);
+
+/// Map a known analysis agent id to its interactive chat argv template.
+#[allow(dead_code)]
+pub fn chat_launch_profile(agent: &str) -> Option<ChatLaunchProfile> {
+    match agent {
+        "grok" => Some(ChatLaunchProfile {
+            command: "grok",
+            args: &["--prompt", "{prompt}"],
+        }),
+        "cline" => Some(ChatLaunchProfile {
+            command: "cline",
+            args: &[],
+        }),
+        "codex" => Some(ChatLaunchProfile {
+            command: "codex",
+            args: &["{prompt}"],
+        }),
+        "claude" => Some(ChatLaunchProfile {
+            command: "claude",
+            args: &["{prompt}"],
+        }),
+        "opencode" => Some(ChatLaunchProfile {
+            command: "opencode",
+            args: &[],
+        }),
+        "pi" => Some(ChatLaunchProfile {
+            command: "pi",
+            args: &["{prompt}"],
+        }),
+        _ => None,
+    }
+}
+
+/// Render `command` plus profile args with `{prompt}` substituted.
+#[allow(dead_code)]
+pub fn chat_argv(profile: &ChatLaunchProfile, prompt: &str) -> Vec<String> {
+    let mut argv = Vec::with_capacity(1 + profile.args.len());
+    argv.push(profile.command.to_string());
+    for arg in profile.args {
+        match *arg {
+            "{prompt}" => argv.push(prompt.to_string()),
+            other => argv.push(other.to_string()),
+        }
+    }
+    argv
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct AgentMeetingResult {
     #[serde(default, alias = "suggested_title", alias = "meeting_title")]
@@ -1318,13 +1381,65 @@ fn append_detail(markdown: &mut String, label: &str, value: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        analysis_work_dir, extract_agent_result_json, known_agents,
+        analysis_work_dir, chat_argv, chat_launch_profile, extract_agent_result_json, known_agents,
         maybe_rename_session_dir_for_title, meeting_markdown, session_timestamp_prefix, title_slug,
         write_analysis_markdown, ActionItem, AgentMeetingResult, Decision, Followup, Insight,
-        Question,
+        Question, DEFAULT_CHAT_PROMPT,
     };
     use crate::audio::{write_capture_progress, CaptureProgress};
     use std::fs;
+
+    #[test]
+    fn chat_launch_for_claude_is_interactive_not_print_mode() {
+        let claude = chat_launch_profile("claude").expect("claude chat profile");
+        let claude_argv = chat_argv(&claude, DEFAULT_CHAT_PROMPT);
+        assert_eq!(claude_argv.first().map(String::as_str), Some("claude"));
+        assert!(
+            !claude_argv.iter().any(|arg| arg == "-p"),
+            "claude chat must not use print-mode -p: {claude_argv:?}"
+        );
+
+        let codex = chat_argv(
+            &chat_launch_profile("codex").expect("codex chat profile"),
+            "hello",
+        );
+        assert!(
+            !codex.iter().any(|arg| arg == "exec"),
+            "codex chat must not use headless exec: {codex:?}"
+        );
+
+        let grok = chat_argv(
+            &chat_launch_profile("grok").expect("grok chat profile"),
+            "hello",
+        );
+        assert!(
+            !(grok.len() == 2 && grok[1] == "-p"),
+            "grok chat must not be only -p without a TUI path: {grok:?}"
+        );
+        assert!(
+            !grok.iter().any(|arg| arg == "-p"),
+            "grok chat must not use headless -p: {grok:?}"
+        );
+
+        let pi = chat_argv(
+            &chat_launch_profile("pi").expect("pi chat profile"),
+            "hello",
+        );
+        assert!(
+            !pi.iter().any(|arg| arg == "--mode" || arg == "json"),
+            "pi chat must not use --mode json: {pi:?}"
+        );
+
+        let opencode = chat_argv(
+            &chat_launch_profile("opencode").expect("opencode chat profile"),
+            "hello",
+        );
+        assert_eq!(
+            opencode,
+            vec!["opencode".to_string()],
+            "opencode chat defaults to bare argv with process cwd"
+        );
+    }
 
     #[test]
     fn extracts_direct_agent_json() {
