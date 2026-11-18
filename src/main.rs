@@ -17,15 +17,20 @@ mod update_progress;
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use analysis::{analyze, known_agents, AnalyzeOptions, AnalyzeTarget};
+use analysis::{
+    analyze, chat_argv, chat_launch_profile, known_agents, AnalyzeOptions, AnalyzeTarget,
+    DEFAULT_CHAT_PROMPT,
+};
 use capture_sources::{detect_sources, probe_audio_tap};
 use config::{config_path, RecallConfig};
 use session::{
     default_storage_dir, export_session, faded_text, holds_sessions, latest_session, list_sessions,
     open_path, primary_document_path, resolve_timezone, resume_hint, session_from_arg,
-    start_session, ConsentMode, StartOptions,
+    start_session, write_chat_context, ConsentMode, StartOptions,
 };
+use terminal::stdout_is_live;
 use transcription::{
     find_parakeet_binary, format_bytes, format_model_download_label, parakeet_binary_doctor_level,
     parakeet_model_is_cached, probe_apple_speech_status, resolve_parakeet_cache_dir_for_options,
@@ -63,6 +68,7 @@ fn main() {
         Some("audio-tap-probe") => run_audio_tap_probe(),
         Some("transcribe") => run_transcribe(args.collect(), &tui_defaults),
         Some("analyze") => run_analyze(args.collect(), &tui_defaults),
+        Some("chat") => run_chat(args.collect(), &tui_defaults),
         Some("agents") => run_agents(args.collect()),
         Some("update") => run_update(args.collect()),
         Some("resume") => run_resume(args.collect(), tui_defaults),
@@ -106,6 +112,7 @@ USAGE:
     recall audio-tap-probe                Probe CoreAudio process-tap availability
     recall transcribe latest              Transcribe the newest session locally
     recall analyze latest --agent grok    Generate summary/actions with an agent
+    recall chat latest --agent claude     Open interactive post-call chat for a session
     recall agents list                    List supported headless agent profiles
     recall update                         Safely update and reinstall Recall
     recall doctor                         Check local development prerequisites
@@ -140,6 +147,12 @@ ANALYZE OPTIONS:
     --storage <path>                      Storage directory for latest lookup
     --generation <n>                      Publish only if this take is still current
     --dry-run                             Write analysis prompt without running agent
+
+CHAT OPTIONS:
+    recall chat latest [options]
+    recall chat <session-id|path> [options]
+    --agent <grok|cline|codex|claude|opencode|pi>  Interactive agent (same ids as analyze)
+    --storage <path>                      Storage directory for latest lookup
 
 TUI OPTIONS:
     --resume [latest|<session-id>|<path>] Reopen a previous session to append another take
@@ -316,6 +329,143 @@ fn run_analyze(args: Vec<String>, tui_defaults: &TuiOptions) {
             std::process::exit(1);
         }
     }
+}
+
+fn run_chat(args: Vec<String>, tui_defaults: &TuiOptions) {
+    let options = match parse_chat_options(args, tui_defaults) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("{message}");
+            eprintln!();
+            print_help();
+            std::process::exit(2);
+        }
+    };
+
+    let profile = match chat_launch_profile(&options.agent) {
+        Some(profile) => profile,
+        None => {
+            eprintln!(
+                "Unknown agent '{}'. Use {}.",
+                options.agent,
+                known_agents().join(", ")
+            );
+            std::process::exit(2);
+        }
+    };
+
+    if !binary_exists(profile.command) {
+        eprintln!(
+            "Missing `{command}` on PATH. Install it, or run recall agents doctor.",
+            command = profile.command
+        );
+        std::process::exit(1);
+    }
+
+    if let Err(error) = write_chat_context(&options.session_path) {
+        eprintln!("Failed to write chat context: {error}");
+        std::process::exit(1);
+    }
+
+    if !stdout_is_live() {
+        eprintln!(
+            "recall chat needs a live terminal (TTY). Run it from an interactive shell, not a pipe."
+        );
+        std::process::exit(2);
+    }
+
+    let argv = chat_argv(&profile, DEFAULT_CHAT_PROMPT);
+    let mut command = Command::new(&argv[0]);
+    if argv.len() > 1 {
+        command.args(&argv[1..]);
+    }
+    command
+        .current_dir(&options.session_path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    match command.status() {
+        Ok(status) => {
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+        Err(error) => {
+            eprintln!("Failed to start `{}`: {error}", profile.command);
+            std::process::exit(1);
+        }
+    }
+}
+
+struct ChatOptions {
+    session_path: PathBuf,
+    agent: String,
+}
+
+fn parse_chat_options(args: Vec<String>, tui_defaults: &TuiOptions) -> Result<ChatOptions, String> {
+    let mut target: Option<Option<PathBuf>> = None;
+    let mut storage_dir = tui_defaults.storage_dir.clone();
+    let mut agent = tui_defaults.agent.clone();
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "latest" => {
+                if target.is_some() {
+                    return Err("Only one chat target is allowed.".to_string());
+                }
+                target = Some(None);
+            }
+            "--agent" => {
+                agent = Some(
+                    iter.next()
+                        .ok_or_else(|| "--agent requires a value".to_string())?,
+                );
+            }
+            "--storage" => {
+                storage_dir = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| "--storage requires a value".to_string())?,
+                ));
+            }
+            value if value.starts_with("--") => {
+                return Err(format!("Unknown chat option: {value}"));
+            }
+            path => {
+                if target.is_some() {
+                    return Err("Only one chat target is allowed.".to_string());
+                }
+                target = Some(Some(PathBuf::from(path)));
+            }
+        }
+    }
+
+    let config = RecallConfig::load();
+    let agent = agent.or(config.analysis.default_agent).ok_or_else(|| {
+        format!(
+            "Missing --agent. Use --agent {}.",
+            known_agents().join(", ")
+        )
+    })?;
+
+    let session_path =
+        match target.unwrap_or(None) {
+            Some(path) => session_from_arg(storage_dir.as_deref(), &path)
+                .map_err(|error| error.to_string())?,
+            None => {
+                let storage_dir = storage_dir
+                    .unwrap_or(default_storage_dir().map_err(|error| {
+                        format!("Failed to resolve storage directory: {error}")
+                    })?);
+                latest_session(&storage_dir).map_err(|error| error.to_string())?
+            }
+        };
+
+    Ok(ChatOptions {
+        session_path,
+        agent,
+    })
 }
 
 fn run_agents(args: Vec<String>) {

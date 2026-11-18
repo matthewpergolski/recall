@@ -76,6 +76,93 @@ fn output_text(output: &std::process::Output) -> String {
 }
 
 #[test]
+fn chat_without_a_tty_exits_2() {
+    let storage = unique_storage("chat-no-tty");
+    fs::create_dir_all(&storage).unwrap();
+    make_session(&storage, "20260526-chat-session", 100);
+    // Fake interactive binary so the TTY gate is reached after the binary check.
+    let bin_dir = storage.join("fake-bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake = bin_dir.join("claude");
+    fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake, perms).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = recall()
+        .env("PATH", &path)
+        .args([
+            "chat",
+            "latest",
+            "--agent",
+            "claude",
+            "--storage",
+            storage.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run recall chat latest");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "piped chat must exit 2 without spawning: {}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        !text.contains("Unknown command"),
+        "chat subcommand must be recognized: {text}"
+    );
+    assert!(
+        text.contains("TTY") || text.contains("tty") || text.contains("live terminal"),
+        "error should explain the TTY requirement: {text}"
+    );
+    let _ = fs::remove_dir_all(storage);
+}
+
+#[test]
+fn chat_missing_binary_reports_agent_name() {
+    let storage = unique_storage("chat-missing-bin");
+    fs::create_dir_all(&storage).unwrap();
+    make_session(&storage, "20260526-chat-missing", 100);
+    // Empty PATH so the selected agent binary cannot be found.
+    let output = recall()
+        .env("PATH", "")
+        .args([
+            "chat",
+            "latest",
+            "--agent",
+            "claude",
+            "--storage",
+            storage.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run recall chat with missing binary");
+    assert!(!output.status.success(), "{}", output_text(&output));
+    let text = output_text(&output);
+    assert!(
+        !text.contains("Unknown command"),
+        "chat subcommand must be recognized: {text}"
+    );
+    assert!(
+        text.contains("Missing `claude` on PATH") || text.contains("Missing 'claude' on PATH"),
+        "missing-binary error must name the agent command: {text}"
+    );
+    assert!(
+        text.contains("recall agents doctor"),
+        "error should point at recall agents doctor: {text}"
+    );
+    let _ = fs::remove_dir_all(storage);
+}
+
+#[test]
 fn help_mentions_resume() {
     let output = recall()
         .arg("--help")
