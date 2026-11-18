@@ -1,5 +1,7 @@
 # Post-call chat
 
+Status (this commit): Matthew approved this design with the recommended defaults. This commit lands only the interactive launch map (`ChatLaunchProfile` / `chat_argv`) and the unit test named below. The missing-binary error stays in PR 3 with `recall chat`. Implementation of later PRs still follows the build order.
+
 Recall already runs a headless CLI agent after a call to write `meeting.md`. This design adds an interactive chat on the same agent so you can ask follow-up questions about what just happened. The baseline is commit `76fd97c`, crate version 0.7.5. This document is the design and the build order. It does not change the program.
 
 Implementation waits for an explicit yes. Each pull request below starts from a test that fails, then makes that test pass.
@@ -269,13 +271,13 @@ Each source pull request bumps the patch version by 1 against its base and updat
 
 ### PR 1. Interactive launch map
 
-- [ ] Depends on nothing. Branch from `main`.
-- [ ] Edits `src/analysis.rs` (or a small `src/chat_launch.rs` if the file split stays clearer), unit tests, and the crate version.
-- [ ] Builds `ChatLaunchProfile { command, args }` per known agent, with `{prompt}` substitution, and a pure function that renders argv.
-- [ ] The result is a testable map. No process is spawned yet.
-- [ ] Unit. Write `chat_launch_for_claude_is_interactive_not_print_mode` first. It fails while only `agent_profile` exists. Assert Claude's chat argv has no `-p`, Codex chat is not `codex exec`, Grok chat is not only `-p` without a TUI path, and Pi chat is not `--mode json`.
-- [ ] Live. Not required. `cargo test` is enough.
-- [ ] Perf. Not applicable.
+- [x] Depends on nothing. Branch from `main`.
+- [x] Edits `src/analysis.rs` (or a small `src/chat_launch.rs` if the file split stays clearer), unit tests, and the crate version.
+- [x] Builds `ChatLaunchProfile { command, args }` per known agent, with `{prompt}` substitution, and a pure function that renders argv.
+- [x] The result is a testable map. No process is spawned yet.
+- [x] Unit. Write `chat_launch_for_claude_is_interactive_not_print_mode` first. It fails while only `agent_profile` exists. Assert Claude's chat argv has no `-p`, Codex chat is not `codex exec`, Grok chat is not only `-p` without a TUI path, and Pi chat is not `--mode json`.
+- [x] Live. Not required. `cargo test` is enough.
+- [x] Perf. Not applicable.
 
 ### PR 2. Context file writer
 

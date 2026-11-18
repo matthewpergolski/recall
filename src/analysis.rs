@@ -104,6 +104,10 @@ struct AgentProfile {
 
 /// Interactive CLI launch plan for post-call chat (not headless analyze).
 /// Follow-up PRs spawn from this profile; kept public ahead of those callers.
+///
+/// `args` may still contain the literal `{prompt}` token. Spawn must call
+/// [`chat_argv`] so the briefing is substituted; do not pass `args` to
+/// `Command` unchanged.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatLaunchProfile {
@@ -1391,53 +1395,71 @@ mod tests {
 
     #[test]
     fn chat_launch_for_claude_is_interactive_not_print_mode() {
-        let claude = chat_launch_profile("claude").expect("claude chat profile");
-        let claude_argv = chat_argv(&claude, DEFAULT_CHAT_PROMPT);
-        assert_eq!(claude_argv.first().map(String::as_str), Some("claude"));
-        assert!(
-            !claude_argv.iter().any(|arg| arg == "-p"),
-            "claude chat must not use print-mode -p: {claude_argv:?}"
+        const PROMPT: &str = "discuss this meeting";
+        let expected: &[(&str, &[&str])] = &[
+            ("grok", &["grok", "--prompt", PROMPT]),
+            ("cline", &["cline"]),
+            ("codex", &["codex", PROMPT]),
+            ("claude", &["claude", PROMPT]),
+            ("opencode", &["opencode"]),
+            ("pi", &["pi", PROMPT]),
+        ];
+        assert_eq!(
+            expected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            known_agents(),
+            "chat launch table must cover every known agent id in order"
         );
 
-        let codex = chat_argv(
-            &chat_launch_profile("codex").expect("codex chat profile"),
-            "hello",
-        );
-        assert!(
-            !codex.iter().any(|arg| arg == "exec"),
-            "codex chat must not use headless exec: {codex:?}"
-        );
+        let denylist = [
+            "-p",
+            "--print",
+            "--json",
+            "exec",
+            "e",
+            "--mode",
+            "--mode=json",
+            "--output-format",
+            "--bare",
+            "--no-session",
+            "--single-turn",
+            "--yolo",
+            "--always-approve",
+            "--dangerously-skip-permissions",
+        ];
 
-        let grok = chat_argv(
-            &chat_launch_profile("grok").expect("grok chat profile"),
-            "hello",
-        );
-        assert!(
-            !(grok.len() == 2 && grok[1] == "-p"),
-            "grok chat must not be only -p without a TUI path: {grok:?}"
-        );
-        assert!(
-            !grok.iter().any(|arg| arg == "-p"),
-            "grok chat must not use headless -p: {grok:?}"
-        );
+        for &(agent, want) in expected {
+            let profile = chat_launch_profile(agent)
+                .unwrap_or_else(|| panic!("missing chat profile for {agent}"));
+            let argv = chat_argv(&profile, PROMPT);
+            assert_eq!(
+                argv,
+                want.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+                "{agent} chat argv must match the interactive map, including prompt placement"
+            );
+            for banned in denylist {
+                assert!(
+                    !argv.iter().any(|arg| arg == banned),
+                    "{agent} chat argv must not include headless/unsafe flag {banned}: {argv:?}"
+                );
+            }
+        }
 
-        let pi = chat_argv(
-            &chat_launch_profile("pi").expect("pi chat profile"),
-            "hello",
-        );
         assert!(
-            !pi.iter().any(|arg| arg == "--mode" || arg == "json"),
-            "pi chat must not use --mode json: {pi:?}"
+            chat_launch_profile("agent").is_none(),
+            "Cursor agent binary stays out of v1 chat map"
         );
+        assert!(chat_launch_profile("cursor-agent").is_none());
+        assert!(chat_launch_profile("unknown").is_none());
+        assert!(chat_launch_profile("").is_none());
 
-        let opencode = chat_argv(
-            &chat_launch_profile("opencode").expect("opencode chat profile"),
-            "hello",
+        // DEFAULT_CHAT_PROMPT is the briefing spawners pass when an agent accepts one.
+        let claude = chat_argv(
+            &chat_launch_profile("claude").expect("claude"),
+            DEFAULT_CHAT_PROMPT,
         );
         assert_eq!(
-            opencode,
-            vec!["opencode".to_string()],
-            "opencode chat defaults to bare argv with process cwd"
+            claude,
+            vec!["claude".to_string(), DEFAULT_CHAT_PROMPT.to_string()]
         );
     }
 
