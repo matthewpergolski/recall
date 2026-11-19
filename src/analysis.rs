@@ -108,7 +108,6 @@ struct AgentProfile {
 /// `args` may still contain the literal `{prompt}` token. Spawn must call
 /// [`chat_argv`] so the briefing is substituted; do not pass `args` to
 /// `Command` unchanged.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatLaunchProfile {
     pub command: &'static str,
@@ -116,7 +115,6 @@ pub struct ChatLaunchProfile {
 }
 
 /// First prompt shared by agents that accept an interactive initial message.
-#[allow(dead_code)]
 pub const DEFAULT_CHAT_PROMPT: &str = concat!(
     "You are in a Recall meeting session folder. ",
     "Read .recall/chat/CONTEXT.md first, then help me discuss this meeting. ",
@@ -124,7 +122,6 @@ pub const DEFAULT_CHAT_PROMPT: &str = concat!(
 );
 
 /// Map a known analysis agent id to its interactive chat argv template.
-#[allow(dead_code)]
 pub fn chat_launch_profile(agent: &str) -> Option<ChatLaunchProfile> {
     match agent {
         "grok" => Some(ChatLaunchProfile {
@@ -156,7 +153,6 @@ pub fn chat_launch_profile(agent: &str) -> Option<ChatLaunchProfile> {
 }
 
 /// Render `command` plus profile args with `{prompt}` substituted.
-#[allow(dead_code)]
 pub fn chat_argv(profile: &ChatLaunchProfile, prompt: &str) -> Vec<String> {
     let mut argv = Vec::with_capacity(1 + profile.args.len());
     argv.push(profile.command.to_string());

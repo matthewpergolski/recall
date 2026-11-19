@@ -583,7 +583,6 @@ pub fn logs_dir(session_path: &Path) -> PathBuf {
 ///
 /// Safe to call on every chat launch. Does not create `AGENTS.md`.
 /// Follow-up PRs call this before spawn; kept public ahead of those callers.
-#[allow(dead_code)]
 pub fn write_chat_context(session_path: &Path) -> io::Result<PathBuf> {
     let chat_dir = internal_dir(session_path).join("chat");
     fs::create_dir_all(&chat_dir)?;
@@ -669,7 +668,6 @@ fn meeting_notes_are_pending(session_path: &Path, meeting_path: &Path) -> bool {
         || body.contains("_Transcript ready. Run agent analysis to generate meeting notes._")
 }
 
-#[allow(dead_code)]
 fn read_recorded_project_cwd(session_path: &Path) -> Option<String> {
     let metadata = fs::read_to_string(metadata_path(session_path)).ok()?;
     let value = serde_json::from_str::<Value>(&metadata).ok()?;
