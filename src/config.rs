@@ -338,7 +338,10 @@ mod tests {
         assert_eq!(text.matches("source_dir").count(), 1, "{text}");
         let parsed = RecallConfig::parse(&text);
         assert_eq!(
-            parsed.source_dir.as_ref().and_then(|p| p.canonicalize().ok()),
+            parsed
+                .source_dir
+                .as_ref()
+                .and_then(|p| p.canonicalize().ok()),
             checkout.canonicalize().ok()
         );
         assert_eq!(fs::read_to_string(&places).unwrap(), "/tmp/sessions\n");
@@ -351,7 +354,11 @@ mod tests {
         let checkout = dir.join("space path");
         fs::create_dir_all(&checkout).unwrap();
         let config = dir.join("config.toml");
-        fs::write(&config, "storage_dir = \"~/x\"\n[transcription]\nengine = apple\n").unwrap();
+        fs::write(
+            &config,
+            "storage_dir = \"~/x\"\n[transcription]\nengine = apple\n",
+        )
+        .unwrap();
         patch_top_level_source_dir(&config, &checkout).unwrap();
         patch_top_level_source_dir(&config, &checkout).unwrap();
         let text = fs::read_to_string(&config).unwrap();
@@ -359,7 +366,10 @@ mod tests {
         assert!(text.find("source_dir").unwrap() < text.find("[transcription]").unwrap());
         let parsed = RecallConfig::parse(&text);
         assert_eq!(
-            parsed.source_dir.as_ref().and_then(|p| p.canonicalize().ok()),
+            parsed
+                .source_dir
+                .as_ref()
+                .and_then(|p| p.canonicalize().ok()),
             checkout.canonicalize().ok()
         );
         assert!(parsed.storage_dir.is_some());
