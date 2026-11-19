@@ -1,6 +1,6 @@
 # Post-call chat
 
-Status (this commit): Matthew approved this design with the recommended defaults. This commit lands only the interactive launch map (`ChatLaunchProfile` / `chat_argv`) and the unit test named below. The missing-binary error stays in PR 3 with `recall chat`. Implementation of later PRs still follows the build order.
+Status (this commit): Matthew approved this design with the recommended defaults. PR 4 lands the TUI `C` shortcut and terminal suspend/resume handoff on top of `recall chat`. PR 5 (resume picker) remains later.
 
 Recall already runs a headless CLI agent after a call to write `meeting.md`. This design adds an interactive chat on the same agent so you can ask follow-up questions about what just happened. The baseline is commit `76fd97c`, crate version 0.7.5. This document is the design and the build order. It does not change the program.
 
@@ -301,13 +301,13 @@ Each source pull request bumps the patch version by 1 against its base and updat
 
 ### PR 4. TUI shortcut and handoff
 
-- [ ] Depends on PR 3. Branch from PR 3.
-- [ ] Edits `src/tui.rs` (footer, key, suspend/resume helper), tests, README or SPEC one-liners, and the crate version.
-- [ ] Builds `C` on the ended dashboard, footer hint, refuse-while-recording, and terminal suspend/restore around the PR 3 spawn path.
-- [ ] The result is that after a take ends, `C` leaves Recall, opens the agent, and returns to the ended dashboard with the same session selected.
-- [ ] Unit. Write `shift_c_is_ignored_while_recording` and `shift_c_requests_chat_when_ended` against the key handler or a extracted handoff plan type. They fail until the key exists.
+- [x] Depends on PR 3. Branch from PR 3.
+- [x] Edits `src/tui.rs` (footer, key, suspend/resume helper), tests, README or SPEC one-liners, and the crate version.
+- [x] Builds `C` on the ended dashboard, footer hint, refuse-while-recording, and terminal suspend/restore around the PR 3 spawn path.
+- [x] The result is that after a take ends, `C` leaves Recall, opens the agent, and returns to the ended dashboard with the same session selected.
+- [x] Unit. Write `shift_c_is_ignored_while_recording` and `shift_c_requests_chat_when_ended` against the key handler or a extracted handoff plan type. They fail until the key exists.
 - [ ] Live. Ghostty AppleScript per `AGENTS.md`, temp `--storage`, `--consent provided`, `--agent` set, end a short take, send `C`. Pass predicate: the child process for that agent appears in `pgrep`, and after quit the Recall window still shows the same session id. Close only that Ghostty window.
-- [ ] Perf. Not applicable. Fail the PR if handoff runs while a capture lock is held.
+- [x] Perf. Not applicable. Fail the PR if handoff runs while a capture lock is held.
 
 This pull request waits for Matthew's review before merge.
 

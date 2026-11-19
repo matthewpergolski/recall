@@ -75,6 +75,219 @@ fn output_text(output: &std::process::Output) -> String {
     format!("{stdout}{stderr}")
 }
 
+fn install_fake_claude(bin_dir: &std::path::Path, marker: &std::path::Path) {
+    fs::create_dir_all(bin_dir).unwrap();
+    let fake = bin_dir.join("claude");
+    fs::write(
+        &fake,
+        format!("#!/bin/sh\necho ran >{}\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fake).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake, perms).unwrap();
+    }
+}
+
+fn path_with_fake_bin(bin_dir: &std::path::Path) -> String {
+    format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+#[test]
+fn chat_without_a_tty_exits_2() {
+    let storage = unique_storage("chat-no-tty");
+    fs::create_dir_all(&storage).unwrap();
+    make_session(&storage, "20260526-chat-session", 100);
+    let session = storage.join("20260526-chat-session");
+    let bin_dir = storage.join("fake-bin");
+    let marker = storage.join("fake-claude-ran");
+    install_fake_claude(&bin_dir, &marker);
+    let output = recall()
+        .env("PATH", path_with_fake_bin(&bin_dir))
+        .args([
+            "chat",
+            "latest",
+            "--agent",
+            "claude",
+            "--storage",
+            storage.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run recall chat latest");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "piped chat must exit 2 without spawning: {}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        !text.contains("Unknown command"),
+        "chat subcommand must be recognized: {text}"
+    );
+    assert!(
+        text.contains(
+            "recall chat needs a live terminal (TTY). Run it from an interactive shell, not a pipe."
+        ),
+        "error must be the exact TTY sentence: {text}"
+    );
+    assert!(
+        session.join(".recall/chat/CONTEXT.md").is_file(),
+        "TTY gate runs after write_chat_context, so CONTEXT.md must exist"
+    );
+    assert!(
+        !marker.exists(),
+        "piped chat must not spawn the agent binary"
+    );
+    let _ = fs::remove_dir_all(storage);
+}
+
+#[test]
+fn chat_missing_binary_reports_agent_name() {
+    let storage = unique_storage("chat-missing-bin");
+    fs::create_dir_all(&storage).unwrap();
+    make_session(&storage, "20260526-chat-missing", 100);
+    let session = storage.join("20260526-chat-missing");
+    // Empty PATH so the selected agent binary cannot be found.
+    let output = recall()
+        .env("PATH", "")
+        .args([
+            "chat",
+            "latest",
+            "--agent",
+            "claude",
+            "--storage",
+            storage.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run recall chat with missing binary");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "missing binary must exit 1: {}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        !text.contains("Unknown command"),
+        "chat subcommand must be recognized: {text}"
+    );
+    assert!(
+        text.contains("Missing `claude` on PATH") || text.contains("Missing 'claude' on PATH"),
+        "missing-binary error must name the agent command: {text}"
+    );
+    assert!(
+        text.contains("recall agents doctor"),
+        "error should point at recall agents doctor: {text}"
+    );
+    assert!(
+        !session.join(".recall/chat").exists(),
+        "missing binary must refuse before writing .recall/chat/"
+    );
+    let _ = fs::remove_dir_all(storage);
+}
+
+#[test]
+fn chat_live_capture_lock_exits_2_without_writing_context() {
+    let storage = unique_storage("chat-live-lock");
+    fs::create_dir_all(&storage).unwrap();
+    make_session(&storage, "20260526-chat-locked", 100);
+    let session = storage.join("20260526-chat-locked");
+    // Live lock held by this test process (same path/format as acquire_capture_lock).
+    let state_dir = session.join(".recall/state");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("capture.lock"),
+        format!("{}\n{}\n", std::process::id(), 1),
+    )
+    .unwrap();
+    let bin_dir = storage.join("fake-bin");
+    let marker = storage.join("fake-claude-ran");
+    install_fake_claude(&bin_dir, &marker);
+    let output = recall()
+        .env("PATH", path_with_fake_bin(&bin_dir))
+        .args([
+            "chat",
+            "latest",
+            "--agent",
+            "claude",
+            "--storage",
+            storage.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run recall chat with live lock");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "live capture.lock must exit 2 before spawn: {}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        text.contains("already recording"),
+        "error must use the live lock message: {text}"
+    );
+    assert!(
+        !session.join(".recall/chat").exists(),
+        "live lock must refuse before writing .recall/chat/"
+    );
+    assert!(
+        !marker.exists(),
+        "live lock must not spawn the agent binary"
+    );
+    let _ = fs::remove_dir_all(storage);
+}
+
+#[test]
+fn chat_non_session_dir_exits_without_writing_context() {
+    let storage = unique_storage("chat-non-session");
+    fs::create_dir_all(&storage).unwrap();
+    let not_a_session = storage.join("just-a-folder");
+    fs::create_dir_all(&not_a_session).unwrap();
+    let bin_dir = storage.join("fake-bin");
+    let marker = storage.join("fake-claude-ran");
+    install_fake_claude(&bin_dir, &marker);
+    let output = recall()
+        .env("PATH", path_with_fake_bin(&bin_dir))
+        .args([
+            "chat",
+            not_a_session.to_str().unwrap(),
+            "--agent",
+            "claude",
+            "--storage",
+            storage.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run recall chat on non-session dir");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "non-session dir must exit 2: {}",
+        output_text(&output)
+    );
+    let text = output_text(&output);
+    assert!(
+        text.contains("is not a Recall session folder"),
+        "error must refuse non-session directories: {text}"
+    );
+    assert!(
+        !not_a_session.join(".recall/chat").exists(),
+        "non-session dir must not create .recall/chat/"
+    );
+    assert!(
+        !marker.exists(),
+        "non-session dir must not spawn the agent binary"
+    );
+    let _ = fs::remove_dir_all(storage);
+}
+
 #[test]
 fn help_mentions_resume() {
     let output = recall()
