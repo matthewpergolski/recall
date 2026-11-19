@@ -6,7 +6,7 @@ He also said this, and this note treats it as a bug in the current design.
 
 > needing to hand-edit config when `source_dir` names a deleted or moved checkout is not acceptable.
 
-The broader bar is zero manual steps beyond one install command and the one-time macOS permission grants. This file records what the program does today at `76fd97c`, the command to build, every step that would still need a person, and the decisions still open. It does not change the program. Building it waits for an explicit yes.
+The broader bar is zero manual steps beyond one install command and the one-time macOS permission grants. This file records what the program does today at `76fd97c`, the command to build, every step that would still need a person, and the decisions that are now closed. It does not change the program by itself. Matthew approved the design on 2026-11-19 with the words "Defaults are fine. Approve the spec and start building." Product work follows the build sequence below.
 
 ## Real test case
 
@@ -580,40 +580,30 @@ Change `README.md`, `docs/SETUP.md`, and `docs/PORTABILITY.md` so the only insta
 
 Prefer few pull requests. Do not merge product code in this docs pull request.
 
-1. **This docs pull request (draft pull request 5).** Land the design, including the real test case and the six stale states. Wait for Matthew's yes on the open decisions below before writing product code beyond pull request 8.
+1. **This docs pull request (pull request 5).** Land the design, including the real test case and the six stale states. Matthew approved all recommended defaults on 2026-11-19. Product code beyond pull request 8 follows steps 3 and 4.
 2. **Pull request 8, as is.** Land the invalid-`source_dir` fall-through only. Do not fold aside-and-clone into it. Pull request 8 does not fix the real test case, and widening it mid-review mixes two bugs.
 3. **One product pull request for phases 2 and 3 together.** Patch `source_dir`, add history classification, and add aside-and-clone. That pull request is what makes `recall update` repair Matthew's Mac after the new binary is installed. Bump the patch version once.
 4. **One product pull request for phases 4, 5, and 6 together.** Doctor, `scripts/install.sh`, and the docs curl line. That pull request is the bootstrap for every binary that still only fast-forwards. Bump the patch version once.
 
-If Matthew prefers even fewer product pull requests after the design yes, fold steps 3 and 4 into a single implementation pull request. Do not fold them into pull request 8.
+Do not fold steps 3 and 4 into pull request 8. Prefer those two product pull requests unless a later note asks to combine them.
 
 Temporary escape until step 4 ships: move `~/Scripts/recall` to `~/Scripts/recall-old-<date>`, clone into `~/Scripts/recall`, run `cargo install --path . --locked --force`. Keep `~/.config/recall` and sessions where they are.
 
 ## Decided
 
-Matthew decided the toolchain question on 2026-11-14. The words were "install, with one prompt". The script asks once, in the form `Missing: rustup, ffmpeg. Install them? [Y/n]`, and only names tools that are absent. `--yes` skips the question. A non-interactive run without `--yes` exits instead of reading stdin. Nothing is asked when nothing is missing. `rustup update stable` runs only for an older rustup-owned `rustc`. A Rust install that rustup does not own is not modified. The other defaults below stay as written.
+Matthew decided the toolchain question on 2026-11-14. The words were "install, with one prompt". The script asks once, in the form `Missing: rustup, ffmpeg. Install them? [Y/n]`, and only names tools that are absent. `--yes` skips the question. A non-interactive run without `--yes` exits instead of reading stdin. Nothing is asked when nothing is missing. `rustup update stable` runs only for an older rustup-owned `rustc`. A Rust install that rustup does not own is not modified.
 
-## Open decisions
+On 2026-11-19 Matthew approved this whole design and every recommended default below. His words were "Defaults are fine. Approve the spec and start building." There are no open decisions left for this design. Product work follows the build sequence above. Do not fold into pull request 8. Do not touch post-call chat merge work.
 
-These defaults are what the phases above assume. Each one is a preference. Say so in a sentence and the phase changes. Nothing here is a token to type back.
-
-1. **Aside-and-clone for unrelated history?** Recommended default: yes, after one prompt. This is the real test case. Say "refuse and print a manual recipe instead" if a directory rename is too strong.
-
-2. **Aside-and-clone for local-only commits too?** Recommended default: yes, after the same style of prompt, so unique commits are kept in the aside tree and the install path returns to `origin/main`. Say "refuse local-only ahead and never offer aside" if those commits must stay on the install path until a person moves them by hand.
-
-3. **Where does a fresh repair clone land?** Recommended default: the same path the broken checkout used (`~/Scripts/recall` in the real test case). Say "always reclone into `~/Projects/recall`" if the canonical path should win even during repair.
-
-4. **Does `recall update` run aside-and-clone, or only the script?** Recommended default: both, after the new binary ships. The script remains the bootstrap for old binaries. Say "only the script may rename a checkout" if `recall update` must stay fetch-and-fast-forward only.
-
-5. **The canonical clone path is `~/Projects/recall`.** The default is that path because it is already the first common candidate in `src/update.rs`. An existing valid checkout is never moved except by the aside-and-clone prompt above. Say "use this other directory as the canonical clone" and name the path if you want a different one.
-
-6. **When `--repo` or `RECALL_REPO` succeeds, the run writes `source_dir`.** The default is yes, so a one-time choice sticks. Say "do not write `source_dir` from `RECALL_REPO`" if a temporary env var must not become the pin. `--repo` should still write, or the two-checkout list comes back on the next run.
-
-7. **`recall update` does not clone from nothing.** The default is that only the script creates a checkout when none exists. Aside-and-clone is not "from nothing"; it restores a path that already held a checkout. Say "let `recall update` clone when nothing is installed" if you want the binary alone to finish a machine that has no checkout.
-
-8. **A `recall settings export` command is not in the phases.** The default is that you copy `config.toml` and `session-places.txt` yourself when you want them on a new Mac. Say "add an export command that copies those two files and no session audio" if you want that as another phase.
-
-9. **`storage_dir` stays unset.** Say "set a default storage directory on first install" and name a path outside iCloud if you want the script to write that key too. The patch would still be one line, and it would write the key only when it is absent.
+1. **Aside-and-clone for unrelated history.** Yes, after one prompt. This is the real test case.
+2. **Aside-and-clone for local-only commits.** Yes, after the same style of prompt. Unique commits stay in the aside tree. The install path returns to `origin/main`.
+3. **Fresh repair clone path.** Same path the broken checkout used (`~/Scripts/recall` in the real test case). Do not force `~/Projects/recall` during repair.
+4. **Who runs aside-and-clone.** Both `scripts/install.sh` and the new `recall update`. The script remains the bootstrap for old binaries.
+5. **Canonical clone path.** `~/Projects/recall`. An existing valid checkout is never moved except by the aside-and-clone prompt.
+6. **Write `source_dir` from `--repo` / `RECALL_REPO`.** Yes. A one-time choice sticks.
+7. **`recall update` does not clone from nothing.** Only the script creates a checkout when none exists. Aside-and-clone restores a path that already held a checkout.
+8. **`recall settings export`.** Not in the phases. Copy `config.toml` and `session-places.txt` by hand when needed on a new Mac.
+9. **`storage_dir`.** Stays unset. Default remains `<current directory>/sessions`.
 
 ## Out of scope
 
