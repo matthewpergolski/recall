@@ -833,7 +833,7 @@ fn deduplicate_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         .collect()
 }
 
-fn normalized_remote(remote: &str) -> Option<&'static str> {
+pub(crate) fn normalized_remote(remote: &str) -> Option<&'static str> {
     let mut remote = remote.trim().trim_end_matches('/').trim_end_matches(".git");
     for prefix in [
         "https://github.com/",

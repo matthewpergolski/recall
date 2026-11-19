@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # Install or update Recall on a Mac.
-# Docs show: curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh
+# Docs show: curl -fsSL …/install.sh | sh
+# Non-interactive (no TTY): curl … | sh -s -- --yes
+# Interactive curl | sh reads prompts from /dev/tty when available.
 #
 # Does not call an old `recall update`. Finds the checkout, repairs history when
 # needed, builds the helper, and cargo-installs with --force.
 set -euo pipefail
 
 OFFICIAL_CLONE="https://github.com/matthewpergolski/recall.git"
-OFFICIAL_REMOTE="github.com/matthewpergolski/recall"
 YES=0
 PLAN=0
 REWRITE_CONFIG=""
 REPO=""
 DATE="$(date +%F)"
+PENDING_CLONE=0
 
 usage() {
   cat <<'EOF'
@@ -23,6 +25,9 @@ Usage: scripts/install.sh [--yes] [--plan] [--repo <path>] [--rewrite-config <ch
   --repo <path>       Use this checkout and write source_dir to it
   --rewrite-config <checkout>
                       Only patch top-level source_dir for that checkout, then exit
+
+Non-interactive installs (curl | sh with no TTY) need --yes:
+  curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh -s -- --yes
 EOF
 }
 
@@ -89,17 +94,47 @@ absolute_path() {
   fi
 }
 
-is_checkout() {
+# Match src/update.rs normalized_remote: strip known prefixes, require exact owner/repo.
+official_remote_ok() {
+  local remote="$1"
+  remote="${remote%"${remote##*[![:space:]]}"}"
+  remote="${remote#"${remote%%[![:space:]]*}"}"
+  remote="${remote%/}"
+  while [[ "$remote" == *.git ]]; do
+    remote="${remote%.git}"
+  done
+  local prefix
+  for prefix in \
+    "https://github.com/" \
+    "http://github.com/" \
+    "git@github.com:" \
+    "ssh://git@github.com/"
+  do
+    case "$remote" in
+      "$prefix"*) remote="${remote#"$prefix"}"; break ;;
+    esac
+  done
+  local lower
+  lower="$(printf '%s' "$remote" | tr '[:upper:]' '[:lower:]')"
+  [[ "$lower" == "matthewpergolski/recall" ]]
+}
+
+looks_like_checkout_tree() {
   local path="$1"
   [[ -d "$path" \
     && -f "$path/Cargo.toml" \
-    && -f "$path/capture-helper/Package.swift" ]] || return 1
+    && -f "$path/capture-helper/Package.swift" ]]
+}
+
+is_checkout() {
+  local path="$1"
+  looks_like_checkout_tree "$path" || return 1
   local root remote
   root="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null || true)"
   [[ -n "$root" ]] || return 1
   [[ "$(absolute_path "$root")" == "$(absolute_path "$path")" ]] || return 1
   remote="$(git -C "$path" config --get remote.origin.url 2>/dev/null || true)"
-  [[ "$remote" == *"$OFFICIAL_REMOTE"* ]] || return 1
+  official_remote_ok "$remote" || return 1
   return 0
 }
 
@@ -210,6 +245,7 @@ common_candidates() {
 
 find_checkout() {
   local path configured
+  PENDING_CLONE=0
   if [[ -n "$REPO" ]]; then
     path="$(expand_path "$REPO")"
     if is_checkout "$path"; then
@@ -237,7 +273,15 @@ find_checkout() {
       WRITE_SOURCE_DIR=0
       return 0
     fi
-    # Fall through; mark write.
+    # Pin exists as a checkout-shaped tree but failed the remote/root check: stop.
+    if looks_like_checkout_tree "$path"; then
+      local remote
+      remote="$(git -C "$path" config --get remote.origin.url 2>/dev/null || echo "(none)")"
+      echo "install.sh: source_dir $path is not the official Recall remote ($remote)." >&2
+      echo "Fix origin, pass --repo <path>, or clear source_dir. Not cloning ~/Projects/recall over this pin." >&2
+      return 1
+    fi
+    # Missing or not a tree — fall through and rewrite later.
     WRITE_SOURCE_DIR=1
   else
     WRITE_SOURCE_DIR=1
@@ -288,6 +332,7 @@ find_checkout() {
   if [[ "$PLAN" -eq 1 ]]; then
     plan "clone $OFFICIAL_CLONE into $preferred"
     CHECKOUT="$preferred"
+    PENDING_CLONE=1
     return 0
   fi
   mkdir -p "$(dirname "$preferred")"
@@ -295,23 +340,36 @@ find_checkout() {
   CHECKOUT="$(absolute_path "$preferred")"
 }
 
-confirm() {
-  local prompt="$1"
+# Read yes/no from the controlling TTY when present (curl | sh). No TTY: refuse
+# without printing a fake [Y/n] prompt. Caller supplies the non-interactive line.
+confirm_tty() {
+  local interactive_prompt="$1"
+  local noninteractive_line="$2"
   if [[ "$YES" -eq 1 ]]; then
     return 0
   fi
-  if [[ ! -t 0 ]]; then
-    echo "${prompt%.} Re-run with --yes to continue." >&2
-    return 1
-  fi
+  # Prefer the controlling terminal (curl | sh). Opening /dev/tty can fail when
+  # there is no TTY even if the node exists — fall through to non-interactive.
   local answer=""
-  printf '%s ' "$prompt"
-  if ! IFS= read -r answer; then
-    # EOF / Ctrl-D → refuse
-    return 1
+  if printf '%s ' "$interactive_prompt" >/dev/tty 2>/dev/null     && IFS= read -r answer </dev/tty 2>/dev/null; then
+    answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "$answer" || "$answer" == y || "$answer" == yes ]]
+    return $?
   fi
-  answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  [[ -z "$answer" || "$answer" == y || "$answer" == yes ]]
+  echo "$noninteractive_line" >&2
+  return 1
+}
+
+join_comma_space() {
+  local -a items=("$@")
+  local i out=""
+  for ((i = 0; i < ${#items[@]}; i++)); do
+    if [[ $i -gt 0 ]]; then
+      out+=", "
+    fi
+    out+="${items[$i]}"
+  done
+  printf '%s\n' "$out"
 }
 
 tools_missing() {
@@ -335,20 +393,53 @@ tools_missing() {
   if [[ ${#missing[@]} -eq 0 ]]; then
     return 1
   fi
-  local joined
-  joined="$(IFS=', '; echo "${missing[*]}")"
-  TOOLS_MISSING_LINE="Missing: $joined"
+  TOOLS_MISSING_LINE="Missing: $(join_comma_space "${missing[@]}")"
   return 0
+}
+
+wait_for_xcode_clt() {
+  local i
+  for ((i = 0; i < 600; i++)); do
+    if xcode-select -p >/dev/null 2>&1; then
+      return 0
+    fi
+    # After the dialog has had time to appear, stop if no installer is running.
+    if [[ $i -gt 30 ]] && ! pgrep -f "Command Line Tools" >/dev/null 2>&1; then
+      return 1
+    fi
+    sleep 2
+  done
+  xcode-select -p >/dev/null 2>&1
+}
+
+rustc_meets_manifest() {
+  local checkout="$1"
+  local required have
+  required="$(
+    python3 - "$checkout/Cargo.toml" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+m = re.search(r'(?m)^rust-version\s*=\s*"([^"]+)"', text)
+print(m.group(1) if m else "")
+PY
+  )"
+  [[ -n "$required" ]] || return 0
+  have="$(rustc --version 2>/dev/null | awk '{print $2}')"
+  [[ -n "$have" ]] || return 1
+  printf '%s\n%s\n' "$required" "$have" | sort -V | head -n1 | grep -qx "$required"
 }
 
 install_missing_tools() {
   if ! xcode-select -p >/dev/null 2>&1; then
     if [[ "$PLAN" -eq 1 ]]; then
-      plan "install Xcode Command Line Tools via xcode-select --install"
+      plan "install Xcode Command Line Tools via xcode-select --install (wait until ready)"
     else
       xcode-select --install || true
-      echo "install.sh: finish the Command Line Tools dialog, then re-run." >&2
-      exit 1
+      log "Waiting for Xcode Command Line Tools…"
+      if ! wait_for_xcode_clt; then
+        echo "install.sh: Xcode Command Line Tools are still missing. Finish the dialog or install them, then re-run." >&2
+        exit 1
+      fi
     fi
   fi
   if ! command -v rustc >/dev/null 2>&1 || ! rustup show active-toolchain >/dev/null 2>&1; then
@@ -368,7 +459,7 @@ install_missing_tools() {
         brew install ffmpeg
       fi
     else
-      log "ffmpeg is missing and Homebrew is not installed. Install ffmpeg by hand, then re-run."
+      log "ffmpeg is missing and Homebrew is not installed. Install ffmpeg, place it at tools/ffmpeg/bin/ffmpeg, or set RECALL_FFMPEG_BIN=/path/to/ffmpeg, then re-run."
     fi
   fi
 }
@@ -424,6 +515,53 @@ aside_path_for() {
   return 1
 }
 
+choose_clone_temp() {
+  local checkout="$1"
+  local parent name pid n candidate
+  parent="$(dirname "$checkout")"
+  name="$(basename "$checkout")"
+  pid="$$"
+  for n in $(seq 0 9999); do
+    candidate="$parent/.${name}.recall-clone-${pid}-${n}"
+    if [[ ! -e "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  echo "install.sh: could not find a free clone temp path near $parent" >&2
+  return 1
+}
+
+print_unique_local_commits() {
+  local checkout="$1"
+  local aside="$2"
+  local subjects subject omitted count i
+  mapfile -t subjects < <(
+    git -C "$checkout" log --reverse --no-show-signature --format=%s HEAD --not refs/remotes/origin/main 2>/dev/null \
+      || git -C "$checkout" log --reverse --no-show-signature --format=%s HEAD 2>/dev/null \
+      || true
+  )
+  log "Keeping local commits in $aside"
+  count="${#subjects[@]}"
+  if [[ "$count" -eq 0 ]]; then
+    return 0
+  fi
+  log "Unique local commits"
+  omitted=0
+  if [[ "$count" -gt 8 ]]; then
+    omitted=$((count - 8))
+    log "  and $omitted earlier"
+  fi
+  for ((i = omitted; i < count; i++)); do
+    subject="${subjects[$i]}"
+    subject="$(printf '%s' "$subject" | tr -d '\033')"
+    if [[ ${#subject} -gt 96 ]]; then
+      subject="${subject:0:93}..."
+    fi
+    log "  · $subject"
+  done
+}
+
 aside_and_clone() {
   local checkout="$1"
   local aside temp
@@ -432,18 +570,25 @@ aside_and_clone() {
     plan "aside-and-clone: move $checkout to $aside and clone fresh into $checkout"
     return 0
   fi
-  temp="$(dirname "$checkout")/.$(basename "$checkout").recall-clone-$$"
-  rm -rf "$temp"
+  print_unique_local_commits "$checkout" "$aside"
+  temp="$(choose_clone_temp "$checkout")"
   if ! git clone --quiet "$OFFICIAL_CLONE" "$temp"; then
     rm -rf "$temp"
     echo "install.sh: failed to clone $OFFICIAL_CLONE" >&2
     return 1
   fi
-  mv "$checkout" "$aside"
+  if ! mv "$checkout" "$aside"; then
+    rm -rf "$temp"
+    echo "install.sh: failed to move $checkout aside" >&2
+    return 1
+  fi
   log "Moved $checkout to $aside"
   if ! mv "$temp" "$checkout"; then
-    mv "$aside" "$checkout" || true
-    echo "install.sh: failed to move clone into $checkout; restored from $aside when possible" >&2
+    if mv "$aside" "$checkout"; then
+      echo "install.sh: failed to move clone into $checkout; restored $aside back to $checkout" >&2
+    else
+      echo "install.sh: failed to move clone into $checkout; checkout is at $aside and clone temp may remain nearby" >&2
+    fi
     return 1
   fi
   log "Cloned origin/main into $checkout"
@@ -502,12 +647,51 @@ WRITE_SOURCE_DIR=0
 HISTORY_CLASS=""
 TOOLS_MISSING_LINE=""
 
+helper_binary_present() {
+  local checkout="$1"
+  local helper
+  for helper in \
+    "$checkout/capture-helper/.build/debug/recall-capture" \
+    "$checkout/capture-helper/.build/arm64-apple-macosx/debug/recall-capture" \
+    "$checkout/capture-helper/.build/x86_64-apple-macosx/debug/recall-capture"
+  do
+    if [[ -f "$helper" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+cargo_bin_dir() {
+  printf '%s\n' "${CARGO_HOME:-$HOME/.cargo}/bin"
+}
+
+ensure_cargo_bin_on_path_files() {
+  local bin_dir line rc
+  bin_dir="$(cargo_bin_dir)"
+  line="export PATH=\"$bin_dir:\$PATH\""
+  for rc in "$HOME/.zprofile" "$HOME/.zshrc"; do
+    if [[ -f "$rc" ]]; then
+      if grep -Fq "$bin_dir" "$rc" 2>/dev/null; then
+        continue
+      fi
+      if grep -Fq '.cargo/env' "$rc" 2>/dev/null; then
+        continue
+      fi
+    fi
+    printf '\n%s\n' "$line" >>"$rc"
+  done
+}
+
 # Tools prompt (skipped entirely when nothing is missing).
 if tools_missing; then
   if [[ "$PLAN" -eq 1 ]]; then
     plan "$TOOLS_MISSING_LINE. Install them"
   else
-    if ! confirm "${TOOLS_MISSING_LINE}. Install them? [Y/n]"; then
+    if ! confirm_tty \
+      "${TOOLS_MISSING_LINE}. Install them? [Y/n]" \
+      "${TOOLS_MISSING_LINE}. Re-run with --yes to install them."
+    then
       echo "$TOOLS_MISSING_LINE still missing." >&2
       exit 1
     fi
@@ -516,15 +700,21 @@ if tools_missing; then
 fi
 
 if ! find_checkout; then
-  if [[ "$PLAN" -eq 1 ]]; then
-    plan "no checkout found; would print the curl install line and stop"
-    exit 0
-  fi
   exit 1
 fi
 
 if [[ "$WRITE_SOURCE_DIR" -eq 1 ]]; then
   rewrite_source_dir "$CHECKOUT"
+fi
+
+# Plan-only pending clone: do not run git against the missing path.
+if [[ "$PENDING_CLONE" -eq 1 ]]; then
+  plan "fetch origin/main into $CHECKOUT after clone"
+  plan "swift build --package-path $CHECKOUT/capture-helper"
+  plan "cargo install --path $CHECKOUT --locked --force"
+  plan "print PATH hits, doctor, sources, audio-tap-probe, and permission steps"
+  log "plan: nothing else to change"
+  exit 0
 fi
 
 if [[ "$PLAN" -eq 1 ]]; then
@@ -537,6 +727,8 @@ fi
 
 if [[ "$PLAN" -eq 1 ]]; then
   plan "fetch origin/main into $CHECKOUT"
+elif [[ "${RECALL_INSTALL_SKIP_FETCH:-}" == "1" ]]; then
+  :
 else
   git -C "$CHECKOUT" fetch origin '+refs/heads/main:refs/remotes/origin/main'
 fi
@@ -564,15 +756,16 @@ case "$HISTORY_CLASS" in
       behind="${ahead_behind##*	}"
       aside="$(aside_path_for "$CHECKOUT")"
       if [[ "$HISTORY_CLASS" == "local-only" ]]; then
-        prompt="Local main has commits that are not on origin/main.
+        interactive="Local main has ${ahead} commits that are not on origin/main.
 Move $CHECKOUT to $aside and clone a fresh copy? [Y/n]"
+        noninteractive="Local main has ${ahead} commits that are not on origin/main. Recall will not install commits that are only on the local main. Re-run with --yes to move $CHECKOUT aside and clone fresh."
       else
-        prompt="Checkout $CHECKOUT does not share history with origin/main.
+        interactive="Checkout $CHECKOUT does not share history with origin/main.
 Local main is ${ahead} commits ahead and ${behind} commits behind origin/main.
 Move it to $aside and clone a fresh copy into $CHECKOUT? [Y/n]"
+        noninteractive="Checkout $CHECKOUT does not share history with origin/main. Local main is ${ahead} commits ahead and ${behind} commits behind origin/main. Re-run with --yes to move it aside and clone fresh, or pass --repo <path> to use another checkout."
       fi
-      if ! confirm "$prompt"; then
-        echo "Left $CHECKOUT unchanged. Re-run with --yes to move it aside and clone fresh, or pass --repo <path> to use another checkout." >&2
+      if ! confirm_tty "$interactive" "$noninteractive"; then
         exit 1
       fi
       aside_and_clone "$CHECKOUT"
@@ -586,18 +779,7 @@ Move it to $aside and clone a fresh copy into $CHECKOUT? [Y/n]"
 esac
 
 if [[ "$PLAN" -eq 1 ]]; then
-  helper_present=0
-  for helper in \
-    "$CHECKOUT/capture-helper/.build/debug/recall-capture" \
-    "$CHECKOUT/capture-helper/.build/arm64-apple-macosx/debug/recall-capture" \
-    "$CHECKOUT/capture-helper/.build/x86_64-apple-macosx/debug/recall-capture"
-  do
-    if [[ -f "$helper" ]]; then
-      helper_present=1
-      break
-    fi
-  done
-  if [[ "$HISTORY_CLASS" == "current" && "$helper_present" -eq 1 ]]; then
+  if [[ "$HISTORY_CLASS" == "current" ]] && helper_binary_present "$CHECKOUT"; then
     log "plan: nothing else to change"
     exit 0
   fi
@@ -614,20 +796,29 @@ if [[ "$PLAN" -eq 1 ]]; then
   exit 0
 fi
 
+# Real run: skip rebuild when already current with helper and Cargo recall.
+RECALL_BIN="$(cargo_bin_dir)/recall"
+if [[ "$HISTORY_CLASS" == "current" ]] \
+  && helper_binary_present "$CHECKOUT" \
+  && { command -v recall >/dev/null 2>&1 || [[ -x "$RECALL_BIN" ]]; }
+then
+  log "Recall is already up to date at $CHECKOUT."
+  exit 0
+fi
+
+# When rustup owns the toolchain and rustc is too old, update before build.
+if command -v rustup >/dev/null 2>&1 && rustup show active-toolchain >/dev/null 2>&1; then
+  if ! rustc_meets_manifest "$CHECKOUT"; then
+    rustup update stable
+  fi
+fi
+
 swift build --package-path "$CHECKOUT/capture-helper"
 cargo install --path "$CHECKOUT" --locked --force
 
-RECALL_BIN="${CARGO_HOME:-$HOME/.cargo}/bin/recall"
+RECALL_BIN="$(cargo_bin_dir)/recall"
 if ! command -v recall >/dev/null 2>&1 && [[ -x "$RECALL_BIN" ]]; then
-  for rc in "$HOME/.zprofile" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.bashrc"; do
-    if [[ -f "$rc" ]] && grep -Fq 'export PATH="$HOME/.cargo/bin:$PATH"' "$rc"; then
-      break
-    fi
-    if [[ -f "$rc" ]] || [[ "$rc" == "$HOME/.zprofile" ]]; then
-      printf '\nexport PATH="$HOME/.cargo/bin:$PATH"\n' >>"$rc"
-      break
-    fi
-  done
+  ensure_cargo_bin_on_path_files
 fi
 
 RECALL_HITS=()

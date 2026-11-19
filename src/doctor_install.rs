@@ -23,11 +23,22 @@ pub enum SourceDirStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistoryStatus {
     Ok,
+    /// Local main is behind origin/main (fast-forward available).
+    Behind,
     Unrelated,
     Diverged,
-    LocalOnly,
-    Dirty,
-    WrongBranch { branch: String },
+    LocalOnly {
+        subjects: Vec<String>,
+    },
+    Dirty {
+        paths: Vec<String>,
+    },
+    WrongBranch {
+        branch: String,
+    },
+    WrongUpstream {
+        upstream: String,
+    },
     Unknown,
 }
 
@@ -88,6 +99,9 @@ fn source_dir_lines(status: &SourceDirStatus) -> Vec<String> {
 fn history_lines(status: &HistoryStatus) -> Vec<String> {
     match status {
         HistoryStatus::Ok => vec!["  ok   checkout history: shares origin/main".into()],
+        HistoryStatus::Behind => vec![
+            "  warn checkout history: behind origin/main; next update will fast-forward".into(),
+        ],
         HistoryStatus::Unrelated => vec![
             "  warn checkout history: unrelated to origin/main; next update will offer aside-and-clone"
                 .into(),
@@ -96,15 +110,35 @@ fn history_lines(status: &HistoryStatus) -> Vec<String> {
             "  warn checkout history: diverged from origin/main; next update will offer aside-and-clone"
                 .into(),
         ],
-        HistoryStatus::LocalOnly => vec![
-            "  warn checkout history: local commits not on origin/main; next update will offer aside-and-clone"
-                .into(),
-        ],
-        HistoryStatus::Dirty => {
-            vec!["  warn checkout history: dirty tree; update will refuse until clean".into()]
+        HistoryStatus::LocalOnly { subjects } => {
+            let mut out = vec![
+                "  warn checkout history: local commits not on origin/main; next update will offer aside-and-clone"
+                    .into(),
+            ];
+            for subject in subjects.iter().take(8) {
+                out.push(format!("        · {subject}"));
+            }
+            if subjects.len() > 8 {
+                out.push(format!("        and {} earlier", subjects.len() - 8));
+            }
+            out
+        }
+        HistoryStatus::Dirty { paths } => {
+            let mut out =
+                vec!["  warn checkout history: dirty tree; update will refuse until clean".into()];
+            for path in paths.iter().take(8) {
+                out.push(format!("        {path}"));
+            }
+            if paths.len() > 8 {
+                out.push(format!("        and {} more", paths.len() - 8));
+            }
+            out
         }
         HistoryStatus::WrongBranch { branch } => vec![format!(
             "  warn checkout history: branch is '{branch}'; update requires main tracking origin/main"
+        )],
+        HistoryStatus::WrongUpstream { upstream } => vec![format!(
+            "  warn checkout history: upstream is '{upstream}'; update requires origin/main"
         )],
         HistoryStatus::Unknown => {
             vec!["  warn checkout history: could not classify".into()]
@@ -146,10 +180,10 @@ fn helper_lines(helpers: &[PathBuf], swift_present: bool) -> Vec<String> {
 
 fn commit_lines(version: &str, build_commit: &str, head: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
-    let build_norm = normalize_commit(build_commit);
+    let dirty_build = build_commit.trim().ends_with("-dirty");
     let mismatch = match head {
-        Some(head) => !commits_match(&build_norm, &normalize_commit(head)),
-        None => false,
+        Some(head) => dirty_build || !commits_match(build_commit, head),
+        None => true,
     };
     if mismatch {
         out.push(format!("  warn recall {version}"));
@@ -161,7 +195,14 @@ fn commit_lines(version: &str, build_commit: &str, head: Option<&str>) -> Vec<St
         Some(head) => out.push(format!("        checkout HEAD: {head}")),
         None => out.push("        checkout HEAD: unknown".into()),
     }
-    if mismatch {
+    if dirty_build {
+        out.push(
+            "        build commit ends in -dirty; rebuild from a clean tree or re-run the install command"
+                .into(),
+        );
+    } else if head.is_none() {
+        out.push("        checkout HEAD unknown; cannot verify the installed binary".into());
+    } else if mismatch {
         out.push(
             "        build commit and checkout HEAD differ; re-run the install command or `recall update`"
                 .into(),
@@ -170,15 +211,33 @@ fn commit_lines(version: &str, build_commit: &str, head: Option<&str>) -> Vec<St
     out
 }
 
-fn normalize_commit(commit: &str) -> String {
-    commit.trim_end_matches("-dirty").to_string()
-}
-
+/// Equal full hashes, or one is a unique abbreviated prefix of the other (≥7 hex digits).
 fn commits_match(build: &str, head: &str) -> bool {
+    let build = build.trim();
+    let head = head.trim();
     if build.is_empty() || head.is_empty() {
         return false;
     }
-    build == head || build.starts_with(head) || head.starts_with(build)
+    if build.ends_with("-dirty") || head.ends_with("-dirty") {
+        return false;
+    }
+    if build == head {
+        return true;
+    }
+    let (shorter, longer) = if build.len() < head.len() {
+        (build, head)
+    } else if head.len() < build.len() {
+        (head, build)
+    } else {
+        return false;
+    };
+    if shorter.len() < 7 {
+        return false;
+    }
+    if !shorter.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    longer.starts_with(shorter)
 }
 
 /// The three debug helper paths under a checkout's `capture-helper`.
@@ -312,6 +371,46 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("differ"), "{text}");
+    }
+
+    #[test]
+    fn dirty_build_commit_warns() {
+        let mut input = base_input();
+        input.build_commit = "abc1234-dirty".into();
+        input.checkout_head = Some("abc1234".into());
+        let text = format_install_doctor_lines(&input).join("\n");
+        assert!(text.contains("warn recall"), "{text}");
+        assert!(text.contains("-dirty"), "{text}");
+    }
+
+    #[test]
+    fn unknown_head_warns() {
+        let mut input = base_input();
+        input.checkout_head = None;
+        let text = format_install_doctor_lines(&input).join("\n");
+        assert!(text.contains("warn recall"), "{text}");
+        assert!(text.contains("checkout HEAD: unknown"), "{text}");
+    }
+
+    #[test]
+    fn short_prefix_under_seven_does_not_match() {
+        let mut input = base_input();
+        input.build_commit = "abc123".into(); // 6 hex
+        input.checkout_head = Some("abc123ffffffffff".into());
+        let text = format_install_doctor_lines(&input).join("\n");
+        assert!(text.contains("warn recall"), "{text}");
+    }
+
+    #[test]
+    fn dirty_paths_are_named() {
+        let mut input = base_input();
+        input.history = HistoryStatus::Dirty {
+            paths: vec![" M src/main.rs".into(), "?? dirty.txt".into()],
+        };
+        let text = format_install_doctor_lines(&input).join("\n");
+        assert!(text.contains("dirty tree"), "{text}");
+        assert!(text.contains("src/main.rs"), "{text}");
+        assert!(text.contains("dirty.txt"), "{text}");
     }
 
     #[test]

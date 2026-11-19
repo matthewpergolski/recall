@@ -40,6 +40,12 @@ Prefer the curl installer (also the update path for older binaries):
 curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh
 ```
 
+Without a TTY, append `--yes`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh -s -- --yes
+```
+
 That builds the helper, installs with `cargo install --path <checkout> --locked --force`, and rewrites a stale top-level `source_dir`. After that, `recall` should be available from any terminal if Cargo's bin directory is on your `PATH`.
 
 Check:

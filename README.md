@@ -77,6 +77,12 @@ One command installs Recall on a fresh Mac and updates an older install (includi
 curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh
 ```
 
+The script reads prompts from the controlling terminal (`/dev/tty`), so `curl | sh` can still ask once when a TTY is attached. Without a TTY, pass `--yes`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh -s -- --yes
+```
+
 The script installs missing tools after one prompt when needed, finds or clones the checkout, repairs unrelated history with one aside-and-clone prompt, builds the Swift helper, and runs `cargo install --path <checkout> --locked --force`. A stale top-level `source_dir` in `~/.config/recall/config.toml` is rewritten. Other config keys and `session-places.txt` stay untouched.
 
 After that binary is installed, `recall update` runs the same checkout repair. It does not install tools and does not clone when no checkout exists. Use `--yes` to answer prompts without a TTY. Use `--repo /path/to/recall` to pick a checkout; that path is written to `source_dir`.

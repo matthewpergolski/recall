@@ -8,6 +8,12 @@ One command for a fresh Mac and for an older install:
 curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh
 ```
 
+Prompts read `/dev/tty` when a terminal is attached. For a non-interactive Mac smoke (or any closed-stdin run), use:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh -s -- --yes
+```
+
 That script is also the update path when the installed `recall` is too old to repair itself (for example `0.7.2`). After the new binary is installed, `recall update` shares the checkout repair.
 
 Run setup checks:

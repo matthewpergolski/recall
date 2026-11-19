@@ -88,12 +88,49 @@ class InstallShTests(unittest.TestCase):
     def test_plan_second_run_says_nothing_else_to_change_when_current(self) -> None:
         checkout = self.home / "Projects" / "recall"
         init_checkout(checkout)
+        ignore = checkout / "capture-helper" / ".gitignore"
+        ignore.write_text(".build/\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(checkout), "add", "capture-helper/.gitignore"], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "ignore helper build",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        # Keep origin/main current with HEAD after the ignore commit.
+        subprocess.run(
+            ["git", "-C", str(checkout), "update-ref", "refs/remotes/origin/main", "HEAD"],
+            check=True,
+            capture_output=True,
+        )
+        helper = (
+            checkout
+            / "capture-helper"
+            / ".build"
+            / "debug"
+            / "recall-capture"
+        )
+        helper.parent.mkdir(parents=True)
+        helper.write_text("#!/bin/sh\necho stub\n", encoding="utf-8")
+        helper.chmod(0o755)
         first = run_install("--plan", "--repo", str(checkout), env=self.env)
         self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
         self.assertIn("plan:", first.stdout)
         second = run_install("--plan", "--repo", str(checkout), env=self.env)
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         self.assertIn("nothing else to change", second.stdout)
+        self.assertNotIn("swift build", second.stdout)
+        self.assertNotIn("cargo install", second.stdout)
 
     def test_plan_dirty_names_file_without_reset(self) -> None:
         checkout = self.home / "Projects" / "recall"
@@ -172,11 +209,15 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("aside-and-clone", result.stdout)
 
     def test_plan_missing_canonical_mentions_clone(self) -> None:
-        # Empty home: no checkout. Plan should mention clone into Projects/recall.
+        # Empty home: no checkout. Plan should mention clone into Projects/recall
+        # without running git against the missing path (no empty-branch refuse).
         result = run_install("--plan", env=self.env, cwd=self.home)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertIn("clone", result.stdout.lower())
         self.assertIn("Projects/recall", result.stdout)
+        self.assertNotIn("refuse branch", result.stdout)
+        self.assertNotIn("No such file or directory", result.stderr)
+        self.assertIn("cargo install", result.stdout)
 
     def test_rewrite_config_preserves_section_and_storage(self) -> None:
         checkout = self.home / "Scripts" / "recall"
@@ -207,6 +248,132 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
         text2 = cfg.read_text(encoding="utf-8")
         self.assertEqual(text2.count("source_dir = "), 1)
+
+
+    def test_non_tty_unrelated_refuses_without_fake_prompt(self) -> None:
+        """H1: closed stdin must not print [Y/n], then refuse clearly once."""
+        checkout = self.home / "Scripts" / "recall"
+        init_checkout(checkout)
+        other = self.tmp / "other"
+        init_checkout(other)
+        subprocess.run(
+            ["git", "-C", str(other), "checkout", "--orphan", "fresh"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(other), "rm", "-rf", "."], check=True, capture_output=True)
+        (other / "src").mkdir(exist_ok=True)
+        (other / "capture-helper").mkdir(exist_ok=True)
+        (other / "Cargo.toml").write_text(
+            '[package]\nname = "recall"\nversion = "0.0.1"\nedition = "2021"\n',
+            encoding="utf-8",
+        )
+        (other / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+        (other / "capture-helper" / "Package.swift").write_text("// fresh\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(other), "add", "."], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(other),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "fresh unrelated root",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        other_tip = subprocess.check_output(
+            ["git", "-C", str(other), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(
+            ["git", "-C", str(checkout), "remote", "add", "other", str(other)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "fetch",
+                "--quiet",
+                "other",
+                f"+{other_tip}:refs/remotes/origin/main",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        # Marker committed so the tree stays clean for the history prompt.
+        marker = checkout / "KEEP"
+        marker.write_text("keep\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(checkout), "add", "KEEP"], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "keep marker",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        env = dict(self.env)
+        env["RECALL_INSTALL_SKIP_FETCH"] = "1"
+        result = subprocess.run(
+            ["bash", str(INSTALL), "--repo", str(checkout)],
+            cwd=str(self.home),
+            env=env,
+            text=True,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+        combined = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, combined)
+        self.assertNotIn("[Y/n]", combined, combined)
+        self.assertIn("--yes", result.stderr, result.stderr)
+        self.assertTrue(marker.is_file())
+        self.assertNotIn("Left ", result.stderr)
+
+    def test_ssh_remote_is_accepted_as_checkout(self) -> None:
+        """H2: git@github.com:owner/repo.git must pass the official remote check."""
+        checkout = self.home / "Scripts" / "recall"
+        init_checkout(checkout, remote="git@github.com:matthewpergolski/recall.git")
+        result = run_install("--plan", "--repo", str(checkout), env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotIn("not a Recall checkout", result.stderr)
+        self.assertIn("plan:", result.stdout)
+
+    def test_archive_substring_remote_is_rejected(self) -> None:
+        checkout = self.home / "Scripts" / "recall"
+        init_checkout(
+            checkout, remote="https://github.com/matthewpergolski/recall-archive.git"
+        )
+        result = run_install("--plan", "--repo", str(checkout), env=self.env)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("not a Recall checkout", result.stderr)
+
+    def test_invalid_source_dir_remote_stops_without_cloning(self) -> None:
+        pinned = self.home / "Scripts" / "recall"
+        init_checkout(pinned, remote="https://github.com/other/not-recall.git")
+        cfg = self.config_dir / "config.toml"
+        cfg.write_text(f'source_dir = "{pinned}"\n', encoding="utf-8")
+        result = run_install("--plan", env=self.env, cwd=self.home)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("source_dir", result.stderr)
+        self.assertFalse((self.home / "Projects" / "recall").exists())
+        self.assertNotIn("clone", result.stdout.lower())
 
 
 if __name__ == "__main__":
