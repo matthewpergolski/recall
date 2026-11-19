@@ -8,6 +8,8 @@ One command for a fresh Mac and for an older install:
 curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh
 ```
 
+That one-liner targets macOS `/bin/sh` (bash 3.2 in POSIX mode). Linux `dash` is not a supported host for `| sh`; run the script with bash there, or save the file and execute it so the shebang applies.
+
 Prompts read `/dev/tty` when a terminal is attached. For a non-interactive Mac smoke (or any closed-stdin run), use:
 
 ```sh

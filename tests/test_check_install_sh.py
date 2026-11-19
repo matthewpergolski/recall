@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
+import select
 import shutil
 import subprocess
 import tempfile
+import termios
+import time
 import unittest
 from pathlib import Path
 
@@ -25,6 +30,119 @@ def run_install(*args: str, env: dict[str, str] | None = None, cwd: Path | None 
         capture_output=True,
         check=False,
     )
+
+
+def run_install_with_controlling_tty(
+    *args: str,
+    env: dict[str, str],
+    cwd: Path,
+    tty_reply: bytes,
+    timeout: float = 15.0,
+) -> tuple[int, str, str]:
+    """Run install.sh with stdin closed and a real controlling tty for prompts.
+
+    Captures stdout/stderr on pipes so a hijacked shell stderr is detectable.
+    """
+    master, slave = os.openpty()
+    stdout_r, stdout_w = os.pipe()
+    stderr_r, stderr_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(master)
+            os.close(stdout_r)
+            os.close(stderr_r)
+            os.setsid()
+            try:
+                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            except OSError:
+                pass
+            devnull = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(devnull, 0)
+            os.close(devnull)
+            os.dup2(stdout_w, 1)
+            os.dup2(stderr_w, 2)
+            os.close(stdout_w)
+            os.close(stderr_w)
+            # Leave ``slave`` open so /dev/tty resolves to this pty.
+            os.chdir(str(cwd))
+            merged = os.environ.copy()
+            merged.update(env)
+            os.execve("/bin/bash", ["bash", str(INSTALL), *args], merged)
+        except Exception:
+            os._exit(127)
+
+    os.close(slave)
+    os.close(stdout_w)
+    os.close(stderr_w)
+    for fd in (master, stdout_r, stderr_r):
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    answered = False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([master, stdout_r, stderr_r], [], [], 0.2)
+        for fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
+                # Peer closed the pty (EIO) — treat as EOF for that fd.
+                if exc.errno == errno.EIO:
+                    if fd == master and not answered:
+                        # Prompt may have been written before we polled; try once.
+                        try:
+                            os.write(master, tty_reply)
+                            answered = True
+                        except OSError:
+                            pass
+                    continue
+                raise
+            if not data:
+                continue
+            if fd == master:
+                if not answered and (b"[Y/n]" in data or b"Y/n" in data):
+                    os.write(master, tty_reply)
+                    answered = True
+            elif fd == stdout_r:
+                stdout_chunks.append(data)
+            else:
+                stderr_chunks.append(data)
+        waited = os.waitpid(pid, os.WNOHANG)
+        if waited[0] == pid:
+            # Drain remaining pipe data.
+            for fd, bucket in ((stdout_r, stdout_chunks), (stderr_r, stderr_chunks)):
+                while True:
+                    try:
+                        data = os.read(fd, 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    bucket.append(data)
+            status = waited[1]
+            code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (
+                os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+            )
+            os.close(master)
+            os.close(stdout_r)
+            os.close(stderr_r)
+            return (
+                code,
+                b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+                b"".join(stderr_chunks).decode("utf-8", errors="replace"),
+            )
+
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    os.close(master)
+    os.close(stdout_r)
+    os.close(stderr_r)
+    raise TimeoutError("install.sh with controlling tty timed out")
 
 
 def init_checkout(path: Path, *, remote: str = "https://github.com/matthewpergolski/recall.git") -> None:
@@ -124,6 +242,84 @@ class InstallShTests(unittest.TestCase):
         return subprocess.check_output(
             ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
         ).strip()
+
+    def _make_unrelated_clean(self, checkout: Path) -> Path:
+        """Checkout with clean tree whose origin/main tip does not share history."""
+        init_checkout(checkout)
+        other = self.tmp / f"other-{checkout.name}"
+        init_checkout(other)
+        subprocess.run(
+            ["git", "-C", str(other), "checkout", "--orphan", "fresh"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(other), "rm", "-rf", "."], check=True, capture_output=True)
+        (other / "src").mkdir(exist_ok=True)
+        (other / "capture-helper").mkdir(exist_ok=True)
+        (other / "Cargo.toml").write_text(
+            '[package]\nname = "recall"\nversion = "0.0.1"\nedition = "2021"\n',
+            encoding="utf-8",
+        )
+        (other / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+        (other / "capture-helper" / "Package.swift").write_text("// fresh\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(other), "add", "."], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(other),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "fresh unrelated root",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        other_tip = subprocess.check_output(
+            ["git", "-C", str(other), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(
+            ["git", "-C", str(checkout), "remote", "add", "other", str(other)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "fetch",
+                "--quiet",
+                "other",
+                f"+{other_tip}:refs/remotes/origin/main",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        marker = checkout / "KEEP"
+        marker.write_text("keep\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(checkout), "add", "KEEP"], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "keep marker",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return marker
 
     def test_plan_helper_without_recall_still_plans_cargo_install(self) -> None:
         """M3: helper alone is not enough; cargo install must still be planned."""
@@ -427,6 +623,175 @@ class InstallShTests(unittest.TestCase):
         src = INSTALL.read_text(encoding="utf-8")
         self.assertNotIn("mapfile", src)
         self.assertNotIn("< <(", src)
+
+    def test_tty_n_leaves_unchanged_message_on_stderr(self) -> None:
+        """H1: successful /dev/tty open must not silence later stderr (Left unchanged)."""
+        checkout = self.home / "Scripts" / "recall"
+        marker = self._make_unrelated_clean(checkout)
+        env = dict(self.env)
+        env["RECALL_INSTALL_SKIP_FETCH"] = "1"
+        code, stdout, stderr = run_install_with_controlling_tty(
+            "--repo",
+            str(checkout),
+            env=env,
+            cwd=self.home,
+            tty_reply=b"n\n",
+        )
+        combined = stdout + stderr
+        self.assertNotEqual(code, 0, combined)
+        self.assertIn("Left ", stderr, f"stdout={stdout!r} stderr={stderr!r}")
+        self.assertIn("unchanged", stderr, stderr)
+        self.assertTrue(marker.is_file())
+
+    def test_tty_y_clone_failure_prints_on_stderr(self) -> None:
+        """H1: after tty yes, a failed clone must still print on stderr."""
+        checkout = self.home / "Scripts" / "recall"
+        marker = self._make_unrelated_clean(checkout)
+        # Break the official HTTPS clone URL without touching the script.
+        gitconfig = self.home / ".gitconfig"
+        gitconfig.write_text(
+            "[url \"https://127.0.0.1:9/\"]\n"
+            "\tinsteadOf = https://github.com/matthewpergolski/recall.git\n",
+            encoding="utf-8",
+        )
+        env = dict(self.env)
+        env["RECALL_INSTALL_SKIP_FETCH"] = "1"
+        code, stdout, stderr = run_install_with_controlling_tty(
+            "--repo",
+            str(checkout),
+            env=env,
+            cwd=self.home,
+            tty_reply=b"y\n",
+            timeout=30.0,
+        )
+        combined = stdout + stderr
+        self.assertNotEqual(code, 0, combined)
+        self.assertIn("failed to clone", stderr, f"stdout={stdout!r} stderr={stderr!r}")
+        self.assertTrue(marker.is_file())
+
+    def test_rustc_compare_does_not_use_sort_v(self) -> None:
+        """macOS /usr/bin/sort has no -V; version compare must not call it."""
+        src = INSTALL.read_text(encoding="utf-8")
+        self.assertNotIn("sort -V", src)
+        checkout = self.home / "Projects" / "recall"
+        init_checkout(checkout)
+        cargo_toml = checkout / "Cargo.toml"
+        cargo_toml.write_text(
+            '[package]\nname = "recall"\nversion = "0.0.0"\nedition = "2021"\n'
+            'rust-version = "1.95"\n',
+            encoding="utf-8",
+        )
+        ignore = checkout / "capture-helper" / ".gitignore"
+        ignore.write_text(".build/\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(checkout), "add", "Cargo.toml", "capture-helper/.gitignore"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "rust-version",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(checkout), "update-ref", "refs/remotes/origin/main", "HEAD"],
+            check=True,
+            capture_output=True,
+        )
+        bin_dir = self.tmp / "bin-stubs"
+        bin_dir.mkdir()
+        (bin_dir / "sort").write_text(
+            "#!/bin/sh\necho \"sort: invalid option -- V\" >&2\nexit 2\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "rustc").write_text(
+            "#!/bin/sh\necho 'rustc 1.95.0 (aaaaaaaaa 2026-01-01)'\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "rustup").write_text(
+            "#!/bin/sh\necho rustup-stub-called >>\"$HOME/rustup.log\"\nexit 1\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "swift").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (bin_dir / "cargo").write_text(
+            "#!/bin/sh\n"
+            "mkdir -p \"$CARGO_HOME/bin\"\n"
+            "printf '#!/bin/sh\\necho ok\\n' >\"$CARGO_HOME/bin/recall\"\n"
+            "chmod +x \"$CARGO_HOME/bin/recall\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        for name in ("sort", "rustc", "rustup", "swift", "cargo"):
+            (bin_dir / name).chmod(0o755)
+        helper = checkout / "capture-helper" / ".build" / "debug" / "recall-capture"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("#!/bin/sh\necho stub\n", encoding="utf-8")
+        helper.chmod(0o755)
+        env = dict(self.env)
+        env["RECALL_INSTALL_SKIP_FETCH"] = "1"
+        env["CARGO_HOME"] = str(self.home / ".cargo")
+        env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
+        result = run_install("--repo", str(checkout), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotIn("invalid option", result.stderr)
+        self.assertNotIn("older than Cargo.toml", result.stderr)
+        self.assertFalse((self.home / "rustup.log").exists())
+
+    def test_foreign_recall_on_path_still_edits_rc(self) -> None:
+        """Foreign PATH recall must not skip appending Cargo's bin to shell rc."""
+        checkout = self.home / "Projects" / "recall"
+        head = self._prepare_current_with_helper(checkout)
+        foreign_dir = self.tmp / "foreign-bin"
+        foreign_dir.mkdir()
+        foreign = foreign_dir / "recall"
+        foreign.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
+        foreign.chmod(0o755)
+        cargo_home = self.home / ".cargo"
+        cargo_bin = cargo_home / "bin"
+        cargo_bin.mkdir(parents=True)
+        # Matching cargo binary exists but is not what command -v finds.
+        (cargo_bin / "recall").write_text(
+            f"#!/bin/sh\necho cargo\n# {head}\n", encoding="utf-8"
+        )
+        (cargo_bin / "recall").chmod(0o755)
+        bin_dir = self.tmp / "tool-stubs"
+        bin_dir.mkdir()
+        (bin_dir / "rustc").write_text(
+            "#!/bin/sh\necho 'rustc 1.95.0 (aaaaaaaaa 2026-01-01)'\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "swift").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (bin_dir / "cargo").write_text(
+            "#!/bin/sh\n"
+            f"printf '#!/bin/sh\\necho ok\\n# {head}\\n' >\"$CARGO_HOME/bin/recall\"\n"
+            "chmod +x \"$CARGO_HOME/bin/recall\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        for name in ("rustc", "swift", "cargo"):
+            (bin_dir / name).chmod(0o755)
+        env = dict(self.env)
+        env["RECALL_INSTALL_SKIP_FETCH"] = "1"
+        env["CARGO_HOME"] = str(cargo_home)
+        # Foreign first; Cargo bin not on PATH.
+        env["PATH"] = f"{foreign_dir}:{bin_dir}:/usr/bin:/bin"
+        result = run_install("--repo", str(checkout), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        zprofile = (self.home / ".zprofile").read_text(encoding="utf-8")
+        self.assertIn(str(cargo_bin), zprofile)
+        zshrc = (self.home / ".zshrc").read_text(encoding="utf-8")
+        self.assertIn(str(cargo_bin), zshrc)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,10 @@
 # Non-interactive (no TTY): curl … | sh -s -- --yes
 # Interactive curl | sh reads prompts from /dev/tty when available.
 #
+# Shell: macOS /bin/sh is bash 3.2 in POSIX mode and is the supported curl|sh
+# target. Linux dash rejects bash arrays (`local -a`) and `set -o pipefail`;
+# use bash there, or run the script as a file so the shebang applies.
+#
 # Does not call an old `recall update`. Finds the checkout, repairs history when
 # needed, builds the helper, and cargo-installs with --force.
 set -euo pipefail
@@ -356,10 +360,12 @@ confirm_tty() {
   if [[ "$YES" -eq 1 ]]; then
     return 0
   fi
-  # Prefer the controlling terminal (curl | sh). Open /dev/tty via exec so a
-  # missing controlling terminal does not print "No such device" on stderr.
+  # Prefer the controlling terminal (curl | sh). Probe /dev/tty in a subshell
+  # so a missing device stays quiet. Never attach 2>/dev/null to a bare exec in
+  # this shell — that would redirect stderr for the rest of the script.
   local answer=""
-  if exec 3<>/dev/tty 2>/dev/null; then
+  if (: 3<>/dev/tty) 2>/dev/null; then
+    exec 3<>/dev/tty
     CONFIRM_USED_TTY=1
     printf '%s ' "$interactive_prompt" >&3
     if IFS= read -r answer <&3; then
@@ -442,7 +448,19 @@ PY
   [[ -n "$required" ]] || return 0
   have="$(rustc --version 2>/dev/null | awk '{print $2}')"
   [[ -n "$have" ]] || return 1
-  printf '%s\n%s\n' "$required" "$have" | sort -V | head -n1 | grep -qx "$required"
+  # Portable dotted compare (macOS /usr/bin/sort has no -V).
+  python3 -c '
+import sys
+def parts(v):
+    out = []
+    for bit in v.split("."):
+        digits = "".join(ch for ch in bit if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    while len(out) < 3:
+        out.append(0)
+    return out[:3]
+sys.exit(0 if parts(sys.argv[1]) >= parts(sys.argv[2]) else 1)
+' "$have" "$required"
 }
 
 install_missing_tools() {
@@ -884,8 +902,20 @@ swift build --package-path "$CHECKOUT/capture-helper"
 cargo install --path "$CHECKOUT" --locked --force
 
 RECALL_BIN="$(cargo_bin_dir)/recall"
-if ! command -v recall >/dev/null 2>&1 && [[ -x "$RECALL_BIN" ]]; then
-  ensure_cargo_bin_on_path_files
+# Append Cargo's bin when it is missing from PATH, or when a foreign recall
+# wins `command -v` so future shells can prefer the installed binary.
+if [[ -x "$RECALL_BIN" ]]; then
+  _path_recall="$(command -v recall 2>/dev/null || true)"
+  if [[ -z "$_path_recall" ]]; then
+    ensure_cargo_bin_on_path_files
+  elif command -v realpath >/dev/null 2>&1; then
+    if [[ "$(realpath "$_path_recall")" != "$(realpath "$RECALL_BIN")" ]]; then
+      ensure_cargo_bin_on_path_files
+    fi
+  elif [[ "$(absolute_path "$_path_recall")" != "$(absolute_path "$RECALL_BIN")" ]]; then
+    ensure_cargo_bin_on_path_files
+  fi
+  unset _path_recall
 fi
 
 RECALL_HITS=()
