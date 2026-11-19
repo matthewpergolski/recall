@@ -38,14 +38,19 @@ bash scripts/test_commit_msg_hook.sh
 echo "==> scripts/test_cairnkit_check_gate.sh"
 bash scripts/test_cairnkit_check_gate.sh
 
-echo "==> python3 -m unittest discover (check_identity / check_pr_body)"
+echo "==> python3 -m unittest discover (check_identity / check_pr_body / install.sh)"
 python3 -m unittest discover -s tests -p 'test_check_*.py' -q
+
+echo "==> scripts/test_install_docs.sh"
+bash scripts/test_install_docs.sh
 
 echo "==> python3 scripts/check_identity.py origin/main..HEAD"
 python3 scripts/check_identity.py origin/main..HEAD
 
-echo "==> python3 scripts/check_version_bump.py --base origin/main --head HEAD"
-python3 scripts/check_version_bump.py --base origin/main --head HEAD
+# Stacked product PRs set RECALL_VERSION_BASE to the parent branch tip.
+version_base="${RECALL_VERSION_BASE:-origin/main}"
+echo "==> python3 scripts/check_version_bump.py --base ${version_base} --head HEAD"
+python3 scripts/check_version_bump.py --base "$version_base" --head HEAD
 
 # Optional local PR-body gate: pass a file path or the PR_BODY env var.
 # --head is this checkout. CI passes the pull request head SHA instead.

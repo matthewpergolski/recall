@@ -69,26 +69,26 @@ Optional for agent analysis:
 
 See [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md) for Homebrew and no-Brew setup paths.
 
-## Fresh Clone Quickstart
+## Install and update
 
-Clone the repo:
-
-```sh
-git clone https://github.com/matthewpergolski/recall.git
-cd recall
-```
-
-Install the local `recall` command:
+One command installs Recall on a fresh Mac and updates an older install (including a `0.7.2` binary that only fast-forwards):
 
 ```sh
-cargo install --path . --locked
+curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh
 ```
 
-Or run from the repo without installing:
+The script installs missing tools after one prompt when needed, finds or clones the checkout, repairs unrelated history with one aside-and-clone prompt, builds the Swift helper, and runs `cargo install --path <checkout> --locked --force`. A stale top-level `source_dir` in `~/.config/recall/config.toml` is rewritten. Other config keys and `session-places.txt` stay untouched.
+
+After that binary is installed, `recall update` runs the same checkout repair. It does not install tools and does not clone when no checkout exists. Use `--yes` to answer prompts without a TTY. Use `--repo /path/to/recall` to pick a checkout; that path is written to `source_dir`.
 
 ```sh
-cargo run
+recall update
+recall update --verbose
 ```
+
+Before the first recording, grant **Microphone** and **System Audio Recording Only** access to the terminal application that will launch Recall. macOS scopes these permissions to the launcher: Apple Terminal, Ghostty, VS Code, and Codex are separate applications. Permission granted to one does not apply to the others. Fully quit and reopen the launcher after changing its permission.
+
+During a short test, play system audio and confirm that Recall's **Call** meter moves. A created `call.m4a` file does not by itself prove that macOS supplied audible system audio.
 
 Check the local setup:
 
@@ -97,18 +97,6 @@ recall doctor
 recall sources
 recall audio-tap-probe
 ```
-
-Before the first recording, grant **Microphone** and **System Audio Recording Only** access to the terminal application that will launch Recall. macOS scopes these permissions to the launcher: Apple Terminal, Ghostty, VS Code, and Codex are separate applications. Permission granted to one does not apply to the others. Fully quit and reopen the launcher after changing its permission.
-
-During a short test, play system audio and confirm that Recall's **Call** meter moves. A created `call.m4a` file does not by itself prove that macOS supplied audible system audio.
-
-After this first installation, update the source checkout and installed command from any directory:
-
-```sh
-recall update
-```
-
-Recall locates its verified source checkout and checks `origin/main`. If the checkout and installed executable already match, it exits with one short message. When an update exists, it fast-forwards safely, runs the Rust tests, builds the Swift helper, and reinstalls the command. A terminal shows a one-row level meter while those steps run. The meter fills as the work advances. After a successful update, Recall prints up to eight new commit subjects, one line each. Older subjects are counted on one line. A pipe, `NO_COLOR`, `TERM=dumb`, or CI uses one plain line per step. Those runs print the same subjects with no pause. Use `recall update --repo /path/to/recall` if automatic discovery cannot find the checkout.
 
 `recall update --verbose` drops the meter and shows each step's command, its full output, and how long it took, with the total at the end. Use it to see why an update is slow.
 
