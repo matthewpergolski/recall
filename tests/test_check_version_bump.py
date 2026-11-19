@@ -16,6 +16,28 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "check_version_bump.py"
 
 
+_HOOK_GIT_VARS = (
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_WORK_TREE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+)
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """Drop hook-exported git vars so fixture commits never hit the outer repo."""
+    env = {k: v for k, v in os.environ.items()}
+    for name in _HOOK_GIT_VARS:
+        env.pop(name, None)
+    for key in list(env):
+        if key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+            env.pop(key, None)
+    return env
+
+
 def git(cwd: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -23,6 +45,7 @@ def git(cwd: Path, *args: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        env=_scrubbed_env(),
     )
     return result.stdout
 
