@@ -123,6 +123,8 @@ impl UpdateProgress {
             let _ = self.write_raw("\r\x1b[K");
         }
         self.running = false;
+        // Fetch may have hidden the cursor; show it again before any [Y/n] prompt.
+        self.show_cursor();
         drawn
     }
 
@@ -753,6 +755,19 @@ mod tests {
         pause();
         progress.fail().unwrap();
         progress.rest();
+    }
+
+    #[test]
+    fn disarm_ephemeral_shows_cursor_again() {
+        use std::sync::atomic::Ordering;
+
+        let mut progress = UpdateProgress::with_mode(true, false);
+        progress.state.cursor_hidden.store(true, Ordering::SeqCst);
+        progress.disarm_ephemeral();
+        assert!(
+            !progress.state.cursor_hidden.load(Ordering::SeqCst),
+            "disarm_ephemeral must clear the hidden-cursor flag before a prompt"
+        );
     }
 
     #[test]

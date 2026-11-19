@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::session::ConsentMode;
 use crate::transcription::TranscriptionEngine;
@@ -55,7 +56,7 @@ impl RecallConfig {
         Self::parse(&content)
     }
 
-    fn parse(content: &str) -> Self {
+    pub(crate) fn parse(content: &str) -> Self {
         let mut config = Self::default();
         let mut section = String::new();
 
@@ -156,6 +157,101 @@ impl RecallConfig {
     }
 }
 
+/// Rewrite only the top-level `source_dir` line. Preserve comments, unknown keys,
+/// and every other setting. Insert before the first `[section]` when missing.
+pub fn patch_top_level_source_dir(config_file: &Path, checkout: &Path) -> io::Result<()> {
+    let absolute = canonical_or_absolute(checkout)?;
+    let quoted = toml_quoted_path(&absolute);
+    let line = format!("source_dir = {quoted}");
+
+    if let Some(parent) = config_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let original = match fs::read_to_string(config_file) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut body = line;
+            body.push('\n');
+            fs::write(config_file, body)?;
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+
+    let patched = patch_source_dir_text(&original, &line);
+    if patched != original {
+        fs::write(config_file, patched)?;
+    }
+    Ok(())
+}
+
+fn canonical_or_absolute(path: &Path) -> io::Result<PathBuf> {
+    fs::canonicalize(path).or_else(|_| {
+        if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            env::current_dir().map(|cwd| cwd.join(path))
+        }
+    })
+}
+
+fn toml_quoted_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn patch_source_dir_text(content: &str, new_line: &str) -> String {
+    let mut out = String::with_capacity(content.len() + new_line.len() + 2);
+    let mut section = false;
+    let mut replaced = false;
+    let had_trailing_newline = content.ends_with('\n');
+
+    for raw_line in content.split_inclusive('\n') {
+        let line_no_nl = raw_line.trim_end_matches(['\n', '\r']);
+        let trimmed = line_no_nl.split('#').next().unwrap_or_default().trim();
+
+        if !section && trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if !replaced {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(new_line);
+                out.push('\n');
+                replaced = true;
+            }
+            section = true;
+        }
+
+        if !section {
+            let key = trimmed.split_once('=').map(|(k, _)| k.trim());
+            if key == Some("source_dir") {
+                out.push_str(new_line);
+                if raw_line.ends_with('\n') {
+                    out.push('\n');
+                }
+                replaced = true;
+                continue;
+            }
+        }
+
+        out.push_str(raw_line);
+    }
+
+    if !replaced {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(new_line);
+        out.push('\n');
+    } else if had_trailing_newline && !out.ends_with('\n') {
+        out.push('\n');
+    }
+
+    out
+}
+
 pub fn config_path() -> Option<PathBuf> {
     if let Some(config_home) = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
         return Some(config_home.join("recall/config.toml"));
@@ -201,9 +297,102 @@ pub(crate) fn expand_path(value: String) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::RecallConfig;
+    use super::{patch_top_level_source_dir, RecallConfig};
     use crate::session::ConsentMode;
     use crate::transcription::TranscriptionEngine;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "recall-config-patch-{}-{}-{id}",
+            label,
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn patch_keeps_comments_unknown_keys_and_storage_dir() {
+        let dir = temp_dir("keep");
+        let checkout = dir.join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        let config = dir.join("config.toml");
+        let places = dir.join("session-places.txt");
+        fs::write(&places, "/tmp/sessions\n").unwrap();
+        fs::write(
+            &config,
+            "# keep me\nweird_key = 1\nstorage_dir = \"~/Documents\"\nsource_dir = \"/old\"\n",
+        )
+        .unwrap();
+        patch_top_level_source_dir(&config, &checkout).unwrap();
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(text.contains("# keep me"), "{text}");
+        assert!(text.contains("weird_key = 1"), "{text}");
+        assert!(text.contains("storage_dir"), "{text}");
+        assert_eq!(text.matches("source_dir").count(), 1, "{text}");
+        let parsed = RecallConfig::parse(&text);
+        assert_eq!(
+            parsed
+                .source_dir
+                .as_ref()
+                .and_then(|p| p.canonicalize().ok()),
+            checkout.canonicalize().ok()
+        );
+        assert_eq!(fs::read_to_string(&places).unwrap(), "/tmp/sessions\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn patch_inserts_before_section_and_is_idempotent() {
+        let dir = temp_dir("section");
+        let checkout = dir.join("space path");
+        fs::create_dir_all(&checkout).unwrap();
+        let config = dir.join("config.toml");
+        fs::write(
+            &config,
+            "storage_dir = \"~/x\"\n[transcription]\nengine = apple\n",
+        )
+        .unwrap();
+        patch_top_level_source_dir(&config, &checkout).unwrap();
+        patch_top_level_source_dir(&config, &checkout).unwrap();
+        let text = fs::read_to_string(&config).unwrap();
+        assert_eq!(text.matches("source_dir").count(), 1, "{text}");
+        assert!(text.find("source_dir").unwrap() < text.find("[transcription]").unwrap());
+        let parsed = RecallConfig::parse(&text);
+        assert_eq!(
+            parsed
+                .source_dir
+                .as_ref()
+                .and_then(|p| p.canonicalize().ok()),
+            checkout.canonicalize().ok()
+        );
+        assert!(parsed.storage_dir.is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn patch_handles_missing_file_and_no_trailing_newline() {
+        let dir = temp_dir("edge");
+        let checkout = dir.join("c");
+        fs::create_dir_all(&checkout).unwrap();
+        let missing = dir.join("new.toml");
+        patch_top_level_source_dir(&missing, &checkout).unwrap();
+        assert!(fs::read_to_string(&missing).unwrap().ends_with('\n'));
+
+        let no_nl = dir.join("nonl.toml");
+        fs::write(&no_nl, "keep_audio = false").unwrap();
+        patch_top_level_source_dir(&no_nl, &checkout).unwrap();
+        let text = fs::read_to_string(&no_nl).unwrap();
+        assert!(text.starts_with("keep_audio = false\n"), "{text:?}");
+        assert!(text.contains("source_dir"), "{text}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn transcription_engine_defaults_to_platform_engine() {

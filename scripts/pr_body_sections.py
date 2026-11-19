@@ -83,6 +83,8 @@ def _name_from(value: str) -> str | None:
     cleaned = value.strip().strip("`").strip()
     if not cleaned or _MODEL_ID.search(cleaned):
         return None
+    if cleaned.casefold() == "pending":
+        return "pending"
     if _BARE_MODEL.match(cleaned):
         return re.sub(r"\s+", " ", cleaned)
     return None

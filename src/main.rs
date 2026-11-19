@@ -14,6 +14,7 @@ mod transcription;
 mod tui;
 mod update;
 mod update_progress;
+mod update_repair;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -188,9 +189,10 @@ EXPORT OPTIONS:
     --storage <path>                      Storage directory for latest lookup
 
 UPDATE OPTIONS:
-    recall update [--repo <path>] [--verbose]
+    recall update [--repo <path>] [--verbose] [--yes]
     --repo <path>                         Explicit Recall source checkout
-    --verbose                             Show each step's command, output, and time"#
+    --verbose                             Show each step's command, output, and time
+    --yes                                 Answer yes to aside-and-clone without a prompt"#
     );
 }
 
@@ -200,7 +202,7 @@ fn run_update(args: Vec<String>) {
         Ok(options) => options,
         Err(message) => {
             eprintln!("{message}");
-            eprintln!("Usage: recall update [--repo <path>] [--verbose]");
+            eprintln!("Usage: recall update [--repo <path>] [--verbose] [--yes]");
             std::process::exit(2);
         }
     };

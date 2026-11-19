@@ -70,6 +70,29 @@ GOOD_PR_BODY = textwrap.dedent(
 )
 
 
+_HOOK_GIT_VARS = (
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_WORK_TREE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+)
+
+
+def _scrubbed_env(extra: dict | None = None) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items()}
+    for name in _HOOK_GIT_VARS:
+        env.pop(name, None)
+    for key in list(env):
+        if key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+            env.pop(key, None)
+    if extra:
+        env.update(extra)
+    return env
+
+
 def git(cwd: Path, *args: str, env: dict | None = None) -> None:
     subprocess.run(
         ["git", *args],
@@ -77,7 +100,7 @@ def git(cwd: Path, *args: str, env: dict | None = None) -> None:
         check=True,
         capture_output=True,
         text=True,
-        env=env,
+        env=_scrubbed_env(env),
     )
 
 

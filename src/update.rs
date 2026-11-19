@@ -6,8 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use crate::config::expand_path;
+use crate::config::{config_path, expand_path, patch_top_level_source_dir};
 use crate::update_progress::{plan_total, UpdateProgress};
+use crate::update_repair::{classify_history, maybe_repair_history, HistoryClass};
+
+include!("../git_hook_env.rs");
 
 const RECALL_REMOTE: &str = "github.com/matthewpergolski/recall";
 const BUILD_COMMIT: &str = env!("RECALL_BUILD_COMMIT");
@@ -18,12 +21,15 @@ pub struct UpdateOptions {
     pub configured_repo: Option<PathBuf>,
     /// Show each step's command, its output, and how long it took.
     pub verbose: bool,
+    /// Answer yes to aside-and-clone (and other update prompts) without a TTY.
+    pub yes: bool,
 }
 
 impl UpdateOptions {
     pub fn parse(args: Vec<String>, configured_repo: Option<PathBuf>) -> Result<Self, String> {
         let mut repo = None;
         let mut verbose = false;
+        let mut yes = false;
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -38,6 +44,7 @@ impl UpdateOptions {
                     ));
                 }
                 "--verbose" => verbose = true,
+                "--yes" => yes = true,
                 value => return Err(format!("Unknown update option: {value}")),
             }
         }
@@ -46,12 +53,19 @@ impl UpdateOptions {
             repo,
             configured_repo,
             verbose,
+            yes,
         })
     }
 }
 
 pub fn update(options: &UpdateOptions) -> io::Result<()> {
-    let checkout = discover_checkout(options)?;
+    let found = discover_checkout(options)?;
+    let checkout = found.path;
+    if found.write_source_dir {
+        if let Some(path) = config_path() {
+            patch_top_level_source_dir(&path, &checkout)?;
+        }
+    }
     validate_checkout(&checkout)?;
     ensure_clean(&checkout)?;
     ensure_update_branch(&checkout)?;
@@ -74,15 +88,7 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     }
     progress.arm_ephemeral("Checking origin/main");
     let fetch_started = Instant::now();
-    let fetched = run_quiet_command(
-        Command::new("git").arg("-C").arg(&checkout).args([
-            "fetch",
-            "--quiet",
-            "origin",
-            "refs/heads/main:refs/remotes/origin/main",
-        ]),
-        "fetch origin/main",
-    );
+    let fetched = fetch_origin_main(&checkout);
     let check_shown = progress.disarm_ephemeral();
     if let Err(error) = fetched {
         if check_shown {
@@ -102,22 +108,41 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
         times.add("Check", elapsed);
     }
 
-    if previous_commit == remote_commit && build_matches(&previous_commit, BUILD_COMMIT) {
+    let history = classify_history(&checkout)?;
+    if matches!(history, HistoryClass::Current) && build_matches(&previous_commit, BUILD_COMMIT) {
         progress.rest();
         println!("Already up to date ({}).", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
-    let refreshing = previous_commit == remote_commit;
-    let crate_version = if refreshing {
+    // Unrelated, diverged, or local-only: one aside-and-clone prompt, then continue.
+    let repaired = maybe_repair_history(
+        &checkout,
+        &history,
+        options.yes,
+        &crate::update_repair::today_ymd(),
+        crate::update_repair::clone_official,
+    )?
+    .is_some();
+
+    let head_commit = git_output(&checkout, &["rev-parse", "HEAD"])?;
+    let remote_commit = git_output(&checkout, &["rev-parse", "refs/remotes/origin/main"])?;
+    let history = classify_history(&checkout)?;
+
+    let refreshing = matches!(history, HistoryClass::Current) && !repaired;
+    let crate_version = if refreshing || repaired {
         let crate_version = validate_checkout(&checkout)?;
         if progress.is_interactive() {
-            progress.open_bar(
-                &format!("Refreshing Recall {crate_version}"),
-                plan_total(&["Tests", "Capture helper", "Install"]),
-            )?;
-        } else {
+            let title = if refreshing {
+                format!("Refreshing Recall {crate_version}")
+            } else {
+                format!("Updating Recall {crate_version}")
+            };
+            progress.open_bar(&title, plan_total(&["Tests", "Capture helper", "Install"]))?;
+        } else if refreshing {
             println!("Refreshing Recall {crate_version}...");
+        } else {
+            println!("Updating Recall {crate_version}...");
         }
         crate_version
     } else {
@@ -141,12 +166,7 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             &mut progress,
             times.as_mut(),
             "Fast-forward",
-            Command::new("git").arg("-C").arg(&checkout).args([
-                "merge",
-                "--ff-only",
-                "--quiet",
-                "refs/remotes/origin/main",
-            ]),
+            git_at(&checkout).args(["merge", "--ff-only", "--quiet", "refs/remotes/origin/main"]),
         )?;
         validate_checkout(&checkout)?
     };
@@ -208,12 +228,14 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             short_commit(&current_commit)
         );
     }
-    print_changes(
-        &checkout,
-        &previous_commit,
-        &current_commit,
-        change_pause(progress.is_interactive()),
-    );
+    if !repaired {
+        print_changes(
+            &checkout,
+            &head_commit,
+            &current_commit,
+            change_pause(progress.is_interactive()),
+        );
+    }
     if let Some(times) = times {
         println!("{}", times.summary());
     }
@@ -221,59 +243,132 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     Ok(())
 }
 
-fn discover_checkout(options: &UpdateOptions) -> io::Result<PathBuf> {
-    if let Some(path) = &options.repo {
-        return require_checkout(path, "--repo");
-    }
+struct CheckoutSearch {
+    explicit: Option<PathBuf>,
+    from_env: Option<PathBuf>,
+    configured: Option<PathBuf>,
+    embedded: PathBuf,
+    current_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+}
 
-    if let Some(path) = env::var_os("RECALL_REPO").map(PathBuf::from) {
-        return require_checkout(
-            &expand_path(path.to_string_lossy().into_owned()),
-            "RECALL_REPO",
-        );
+fn discover_checkout(options: &UpdateOptions) -> io::Result<CheckoutFound> {
+    let from_env =
+        env::var_os("RECALL_REPO").map(|value| expand_path(value.to_string_lossy().into_owned()));
+    let found = choose_checkout(&CheckoutSearch {
+        explicit: options.repo.clone(),
+        from_env,
+        configured: options.configured_repo.clone(),
+        embedded: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        current_dir: env::current_dir().ok(),
+        home: env::var_os("HOME").map(PathBuf::from),
+    })?;
+    if let Some(warning) = &found.warning {
+        eprintln!("{warning}");
     }
+    Ok(found)
+}
 
-    if let Some(path) = &options.configured_repo {
-        return require_checkout(path, "source_dir in Recall config");
+#[derive(Debug)]
+struct CheckoutFound {
+    path: PathBuf,
+    warning: Option<String>,
+    /// Patch top-level `source_dir` when discovery chose via --repo, RECALL_REPO,
+    /// fall-through, or a missing key.
+    write_source_dir: bool,
+}
+
+fn choose_checkout(search: &CheckoutSearch) -> io::Result<CheckoutFound> {
+    if let Some(path) = &search.explicit {
+        return found_checkout(require_checkout(path, "--repo")?, true);
     }
-
-    let embedded = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if validate_checkout(&embedded).is_ok() {
-        return canonical_path(&embedded);
+    if let Some(path) = &search.from_env {
+        return found_checkout(require_checkout(path, "RECALL_REPO")?, true);
     }
+    if let Some(path) = &search.configured {
+        if let Ok(found) = require_checkout(path, "source_dir in Recall config") {
+            // Valid pin: use it and do not rewrite yet.
+            return found_checkout(found, false);
+        }
+        let chosen = choose_without_config(search)?;
+        return Ok(CheckoutFound {
+            warning: Some(format!(
+                "source_dir {} is not a Recall checkout; using {}.",
+                path.display(),
+                chosen.display()
+            )),
+            path: chosen,
+            write_source_dir: true,
+        });
+    }
+    // Missing source_dir: write the chosen checkout.
+    found_checkout(choose_without_config(search)?, true)
+}
 
-    if let Ok(current_dir) = env::current_dir() {
+fn found_checkout(path: PathBuf, write_source_dir: bool) -> io::Result<CheckoutFound> {
+    Ok(CheckoutFound {
+        path,
+        warning: None,
+        write_source_dir,
+    })
+}
+
+fn choose_without_config(search: &CheckoutSearch) -> io::Result<PathBuf> {
+    if validate_checkout(&search.embedded).is_ok() {
+        return canonical_path(&search.embedded);
+    }
+    if let Some(current_dir) = &search.current_dir {
         for ancestor in current_dir.ancestors() {
             if validate_checkout(ancestor).is_ok() {
                 return canonical_path(ancestor);
             }
         }
     }
+    let Some(home) = &search.home else {
+        return missing_checkout();
+    };
+    select_common(valid_common_checkouts(home)?, home)
+}
 
-    let valid_common = common_checkout_candidates()
+fn valid_common_checkouts(home: &Path) -> io::Result<Vec<PathBuf>> {
+    let valid = common_checkout_candidates(home)
         .into_iter()
         .filter(|path| validate_checkout(path).is_ok())
         .map(|path| canonical_path(&path))
         .collect::<io::Result<Vec<_>>>()?;
-    let valid_common = deduplicate_paths(valid_common);
+    Ok(deduplicate_paths(valid))
+}
 
-    match valid_common.as_slice() {
-        [path] => Ok(path.clone()),
-        [] => Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "Could not find the Recall source checkout. Run `recall update --repo /path/to/recall`, set RECALL_REPO, or add source_dir to ~/.config/recall/config.toml.",
-        )),
-        paths => {
-            let choices = paths
-                .iter()
-                .map(|path| format!("  - {}", path.display()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Err(io::Error::other(format!(
-                "Multiple Recall checkouts were found:\n{choices}\nChoose one with `recall update --repo <path>`."
-            )))
+fn select_common(valid: Vec<PathBuf>, home: &Path) -> io::Result<PathBuf> {
+    let preferred = home.join("Projects/recall");
+    if let Ok(preferred) = canonical_path(&preferred) {
+        if valid.iter().any(|path| path == &preferred) {
+            return Ok(preferred);
         }
     }
+    match valid.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => missing_checkout(),
+        paths => Err(multiple_checkouts(paths)),
+    }
+}
+
+fn missing_checkout() -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "Could not find the Recall source checkout. Run `recall update --repo /path/to/recall`, set RECALL_REPO, or add source_dir to ~/.config/recall/config.toml.",
+    ))
+}
+
+fn multiple_checkouts(paths: &[PathBuf]) -> io::Error {
+    let choices = paths
+        .iter()
+        .map(|path| format!("  - {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    io::Error::other(format!(
+        "Multiple Recall checkouts were found:\n{choices}\nChoose one with `recall update --repo <path>`."
+    ))
 }
 
 fn require_checkout(path: &Path, source: &str) -> io::Result<PathBuf> {
@@ -414,11 +509,17 @@ fn ensure_at_origin_main(checkout: &Path) -> io::Result<()> {
     ))
 }
 
-fn git_output(checkout: &Path, args: &[&str]) -> io::Result<String> {
-    let output = command_output(
-        Command::new("git").arg("-C").arg(checkout).args(args),
-        &format!("run git {}", args.join(" ")),
-    )?;
+pub(crate) fn git_at(checkout: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(checkout);
+    scrub_git_command(&mut command);
+    command
+}
+
+pub(crate) fn git_output(checkout: &Path, args: &[&str]) -> io::Result<String> {
+    let mut command = git_at(checkout);
+    command.args(args);
+    let output = command_output(&mut command, &format!("run git {}", args.join(" ")))?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
@@ -445,6 +546,24 @@ fn command_output(command: &mut Command, description: &str) -> io::Result<Output
 
 fn run_quiet_command(command: &mut Command, description: &str) -> io::Result<()> {
     command_output(command, description).map(|_| ())
+}
+
+/// Fetch `origin/main` into `refs/remotes/origin/main` only.
+///
+/// Uses a force-tracking refspec (`+`) so an unrelated remote tip can replace a
+/// stale remote-tracking ref. This does not move local `main` and is not a
+/// force-push.
+pub(crate) fn fetch_origin_main(checkout: &Path) -> io::Result<()> {
+    // `+` force-updates the remote-tracking ref only (same as a normal
+    // `git fetch` configured refspec). No `--quiet` so failure stderr is kept.
+    run_quiet_command(
+        git_at(checkout).args([
+            "fetch",
+            "origin",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ]),
+        "fetch origin/main",
+    )
 }
 
 fn run_quiet_step(
@@ -687,11 +806,7 @@ fn canonical_path(path: &Path) -> io::Result<PathBuf> {
     })
 }
 
-fn common_checkout_candidates() -> Vec<PathBuf> {
-    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
-        return Vec::new();
-    };
-
+fn common_checkout_candidates(home: &Path) -> Vec<PathBuf> {
     [
         "Projects/recall",
         "Developer/recall",
@@ -742,11 +857,12 @@ fn normalized_remote(remote: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_matches, change_pause, command_line, commit_subjects, deduplicate_paths,
-        ensure_at_origin_main, ensure_clean, git_output, normalized_remote, note_lines,
-        run_quiet_step, run_shown_step, short_commit, subjects_from_log, times_summary,
-        unread_changes, validate_checkout, version_from_metadata, StepTimes, UpdateOptions,
-        HISTORY_LOG_ARGS, NOTE_LIMIT, RECALL_REMOTE,
+        build_matches, change_pause, choose_checkout, command_line, commit_subjects,
+        deduplicate_paths, ensure_at_origin_main, ensure_clean, git_at, git_output,
+        normalized_remote, note_lines, run_quiet_step, run_shown_step, scrub_git_command,
+        short_commit, subjects_from_log, times_summary, unread_changes, validate_checkout,
+        version_from_metadata, CheckoutSearch, StepTimes, UpdateOptions, HISTORY_LOG_ARGS,
+        NOTE_LIMIT, RECALL_REMOTE,
     };
     use crate::update_progress::UpdateProgress;
     use std::fs;
@@ -766,6 +882,10 @@ mod tests {
             let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir()
                 .join(format!("recall-update-test-{}-{id}", std::process::id()));
+            Self::at(path)
+        }
+
+        fn at(path: PathBuf) -> Self {
             fs::create_dir_all(path.join("src")).unwrap();
             fs::create_dir_all(path.join("capture-helper")).unwrap();
             fs::write(
@@ -824,12 +944,7 @@ mod tests {
 
     fn run_git(path: &Path, args: &[&str]) {
         // Collected, so git's chatter stays out of the test output.
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(args)
-            .output()
-            .unwrap();
+        let output = git_at(path).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "git {} failed: {}",
@@ -971,9 +1086,7 @@ mod tests {
                 "Signed subject",
             ],
         ] {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(&fixture.path)
+            let output = git_at(&fixture.path)
                 .env("GNUPGHOME", &gpg_home)
                 .args(args)
                 .output()
@@ -984,9 +1097,7 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        let noisy = Command::new("git")
-            .arg("-C")
-            .arg(&fixture.path)
+        let noisy = git_at(&fixture.path)
             .env("GNUPGHOME", &gpg_home)
             .args(["-c", "log.showSignature=true", "log", "-1", "--format=%s"])
             .output()
@@ -1034,6 +1145,16 @@ mod tests {
             UpdateOptions::parse(vec!["--verbose".to_string()], None)
                 .unwrap()
                 .verbose
+        );
+    }
+
+    #[test]
+    fn yes_is_off_unless_asked_for() {
+        assert!(!UpdateOptions::parse(Vec::new(), None).unwrap().yes);
+        assert!(
+            UpdateOptions::parse(vec!["--yes".to_string()], None)
+                .unwrap()
+                .yes
         );
     }
 
@@ -1183,5 +1304,226 @@ mod tests {
 
         let error = ensure_at_origin_main(&fixture.path).unwrap_err();
         assert!(error.to_string().contains("not on origin/main"));
+    }
+
+    struct TempHome {
+        path: PathBuf,
+    }
+
+    impl TempHome {
+        fn new(label: &str) -> Self {
+            let id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("recall-home-{label}-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn search_at(
+        home: &Path,
+        embedded: PathBuf,
+        configured: Option<PathBuf>,
+        from_env: Option<PathBuf>,
+    ) -> CheckoutSearch {
+        let cwd = home.join("cwd");
+        fs::create_dir_all(&cwd).unwrap();
+        CheckoutSearch {
+            explicit: None,
+            from_env,
+            configured,
+            embedded,
+            current_dir: Some(cwd),
+            home: Some(home.to_path_buf()),
+        }
+    }
+
+    #[test]
+    fn a_stale_source_dir_falls_through_to_the_embedded_checkout() {
+        let home = TempHome::new("stale");
+        let embedded = CheckoutFixture::at(home.path.join("embedded"));
+        let found = choose_checkout(&search_at(
+            &home.path,
+            embedded.path.clone(),
+            Some(home.path.join("missing-source")),
+            None,
+        ))
+        .unwrap();
+        let chosen = fs::canonicalize(&embedded.path).unwrap();
+        assert_eq!(found.path, chosen);
+        assert!(found.write_source_dir);
+        let warning = found.warning.expect("a skipped source_dir warns");
+        assert!(warning.contains("missing-source"), "{warning}");
+        assert!(
+            warning.contains(&format!("{}", chosen.display())),
+            "{warning}"
+        );
+        assert!(!warning.contains('\n'), "{warning}");
+    }
+
+    #[test]
+    fn git_at_drops_a_leaked_hook_environment() {
+        let home = TempHome::new("git-env");
+        let fixture = CheckoutFixture::at(home.path.join("repo"));
+        let leaked = Command::new("git")
+            .current_dir(&fixture.path)
+            .env("GIT_DIR", "/tmp/recall-not-a-git-dir")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.bare")
+            .env("GIT_CONFIG_VALUE_0", "true")
+            .args(["rev-parse", "--is-bare-repository"])
+            .output()
+            .unwrap();
+        assert!(
+            !leaked.status.success(),
+            "a leaked GIT_DIR must fail before the scrub"
+        );
+        let mut command = Command::new("git");
+        command
+            .current_dir(&fixture.path)
+            .env("GIT_DIR", "/tmp/recall-not-a-git-dir")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.bare")
+            .env("GIT_CONFIG_VALUE_0", "true");
+        scrub_git_command(&mut command);
+        let output = command
+            .args(["rev-parse", "--is-bare-repository"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "false");
+        let via_helper = git_at(&fixture.path)
+            .args(["rev-parse", "--is-bare-repository"])
+            .output()
+            .unwrap();
+        assert!(via_helper.status.success());
+    }
+
+    #[test]
+    fn a_valid_source_dir_wins_over_the_canonical_checkout() {
+        let home = TempHome::new("valid-source");
+        let configured = CheckoutFixture::at(home.path.join("configured"));
+        let _canonical = CheckoutFixture::at(home.path.join("Projects/recall"));
+        let found = choose_checkout(&search_at(
+            &home.path,
+            home.path.join("no-embedded"),
+            Some(configured.path.clone()),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(found.path, fs::canonicalize(&configured.path).unwrap());
+        assert!(found.warning.is_none());
+        assert!(!found.write_source_dir);
+    }
+
+    #[test]
+    fn an_invalid_recall_repo_does_not_fall_through() {
+        let home = TempHome::new("bad-env");
+        let embedded = CheckoutFixture::at(home.path.join("embedded"));
+        let error = choose_checkout(&search_at(
+            &home.path,
+            embedded.path.clone(),
+            None,
+            Some(home.path.join("missing-env")),
+        ))
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("RECALL_REPO"), "{message}");
+        assert!(
+            !message.contains(&format!("{}", embedded.path.display())),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn two_common_checkouts_without_a_canonical_path_are_listed() {
+        let home = TempHome::new("two");
+        let code = CheckoutFixture::at(home.path.join("Code/recall"));
+        let developer = CheckoutFixture::at(home.path.join("Developer/recall"));
+        let error = choose_checkout(&search_at(
+            &home.path,
+            home.path.join("no-embedded"),
+            None,
+            None,
+        ))
+        .unwrap_err();
+        let message = error.to_string();
+        let code = fs::canonicalize(&code.path).unwrap();
+        let developer = fs::canonicalize(&developer.path).unwrap();
+        assert!(message.contains("Multiple Recall checkouts"), "{message}");
+        assert!(
+            message.contains(&format!("{}", code.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("{}", developer.display())),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_canonical_checkout_wins_over_another_common_folder() {
+        let home = TempHome::new("canonical");
+        let projects = CheckoutFixture::at(home.path.join("Projects/recall"));
+        let _other = CheckoutFixture::at(home.path.join("Code/recall"));
+        let found = choose_checkout(&search_at(
+            &home.path,
+            home.path.join("no-embedded"),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(found.path, fs::canonicalize(&projects.path).unwrap());
+        assert!(found.warning.is_none());
+        assert!(found.write_source_dir);
+    }
+
+    #[test]
+    fn dirty_checkout_still_gets_source_dir_patched() {
+        use crate::config::{patch_top_level_source_dir, RecallConfig};
+
+        let home = TempHome::new("dirty-write");
+        let fixture = CheckoutFixture::at(home.path.join("checkout"));
+        fixture.commit();
+        fixture.mark_origin_main();
+        fs::write(fixture.path.join("dirty.txt"), "stay dirty\n").unwrap();
+        assert!(ensure_clean(&fixture.path).is_err());
+
+        let config_dir = home.path.join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config = config_dir.join("config.toml");
+        let places = config_dir.join("session-places.txt");
+        fs::write(&places, "/tmp/sessions\n").unwrap();
+        fs::write(
+            &config,
+            "# keep\nstorage_dir = \"~/Sessions\"\n[transcription]\nengine = apple\n",
+        )
+        .unwrap();
+        patch_top_level_source_dir(&config, &fixture.path).unwrap();
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(text.contains("# keep"), "{text}");
+        assert!(text.contains("storage_dir"), "{text}");
+        assert_eq!(text.matches("source_dir").count(), 1, "{text}");
+        let parsed = RecallConfig::parse(&text);
+        assert_eq!(
+            parsed
+                .source_dir
+                .as_ref()
+                .and_then(|p| p.canonicalize().ok()),
+            fixture.path.canonicalize().ok()
+        );
+        assert_eq!(fs::read_to_string(&places).unwrap(), "/tmp/sessions\n");
+        assert!(fixture.path.join("dirty.txt").is_file());
+        assert!(ensure_clean(&fixture.path).is_err());
     }
 }
