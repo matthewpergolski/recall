@@ -102,6 +102,69 @@ struct AgentProfile {
     raw_output_file: &'static str,
 }
 
+/// Interactive CLI launch plan for post-call chat (not headless analyze).
+/// Follow-up PRs spawn from this profile; kept public ahead of those callers.
+///
+/// `args` may still contain the literal `{prompt}` token. Spawn must call
+/// [`chat_argv`] so the briefing is substituted; do not pass `args` to
+/// `Command` unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatLaunchProfile {
+    pub command: &'static str,
+    pub args: &'static [&'static str],
+}
+
+/// First prompt shared by agents that accept an interactive initial message.
+pub const DEFAULT_CHAT_PROMPT: &str = concat!(
+    "You are in a Recall meeting session folder. ",
+    "Read .recall/chat/CONTEXT.md first, then help me discuss this meeting. ",
+    "Prefer transcript.md and meeting.md over guesses."
+);
+
+/// Map a known analysis agent id to its interactive chat argv template.
+pub fn chat_launch_profile(agent: &str) -> Option<ChatLaunchProfile> {
+    match agent {
+        "grok" => Some(ChatLaunchProfile {
+            command: "grok",
+            args: &["--prompt", "{prompt}"],
+        }),
+        "cline" => Some(ChatLaunchProfile {
+            command: "cline",
+            args: &[],
+        }),
+        "codex" => Some(ChatLaunchProfile {
+            command: "codex",
+            args: &["{prompt}"],
+        }),
+        "claude" => Some(ChatLaunchProfile {
+            command: "claude",
+            args: &["{prompt}"],
+        }),
+        "opencode" => Some(ChatLaunchProfile {
+            command: "opencode",
+            args: &[],
+        }),
+        "pi" => Some(ChatLaunchProfile {
+            command: "pi",
+            args: &["{prompt}"],
+        }),
+        _ => None,
+    }
+}
+
+/// Render `command` plus profile args with `{prompt}` substituted.
+pub fn chat_argv(profile: &ChatLaunchProfile, prompt: &str) -> Vec<String> {
+    let mut argv = Vec::with_capacity(1 + profile.args.len());
+    argv.push(profile.command.to_string());
+    for arg in profile.args {
+        match *arg {
+            "{prompt}" => argv.push(prompt.to_string()),
+            other => argv.push(other.to_string()),
+        }
+    }
+    argv
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct AgentMeetingResult {
     #[serde(default, alias = "suggested_title", alias = "meeting_title")]
@@ -1318,13 +1381,83 @@ fn append_detail(markdown: &mut String, label: &str, value: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        analysis_work_dir, extract_agent_result_json, known_agents,
+        analysis_work_dir, chat_argv, chat_launch_profile, extract_agent_result_json, known_agents,
         maybe_rename_session_dir_for_title, meeting_markdown, session_timestamp_prefix, title_slug,
         write_analysis_markdown, ActionItem, AgentMeetingResult, Decision, Followup, Insight,
-        Question,
+        Question, DEFAULT_CHAT_PROMPT,
     };
     use crate::audio::{write_capture_progress, CaptureProgress};
     use std::fs;
+
+    #[test]
+    fn chat_launch_for_claude_is_interactive_not_print_mode() {
+        const PROMPT: &str = "discuss this meeting";
+        let expected: &[(&str, &[&str])] = &[
+            ("grok", &["grok", "--prompt", PROMPT]),
+            ("cline", &["cline"]),
+            ("codex", &["codex", PROMPT]),
+            ("claude", &["claude", PROMPT]),
+            ("opencode", &["opencode"]),
+            ("pi", &["pi", PROMPT]),
+        ];
+        assert_eq!(
+            expected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            known_agents(),
+            "chat launch table must cover every known agent id in order"
+        );
+
+        let denylist = [
+            "-p",
+            "--print",
+            "--json",
+            "exec",
+            "e",
+            "--mode",
+            "--mode=json",
+            "--output-format",
+            "--bare",
+            "--no-session",
+            "--single-turn",
+            "--yolo",
+            "--always-approve",
+            "--dangerously-skip-permissions",
+        ];
+
+        for &(agent, want) in expected {
+            let profile = chat_launch_profile(agent)
+                .unwrap_or_else(|| panic!("missing chat profile for {agent}"));
+            let argv = chat_argv(&profile, PROMPT);
+            assert_eq!(
+                argv,
+                want.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+                "{agent} chat argv must match the interactive map, including prompt placement"
+            );
+            for banned in denylist {
+                assert!(
+                    !argv.iter().any(|arg| arg == banned),
+                    "{agent} chat argv must not include headless/unsafe flag {banned}: {argv:?}"
+                );
+            }
+        }
+
+        assert!(
+            chat_launch_profile("agent").is_none(),
+            "Cursor agent binary stays out of v1 chat map"
+        );
+        assert!(chat_launch_profile("cursor-agent").is_none());
+        assert!(chat_launch_profile("unknown").is_none());
+        assert!(chat_launch_profile("").is_none());
+
+        // DEFAULT_CHAT_PROMPT is the briefing spawners pass when an agent accepts one.
+        let claude = chat_argv(
+            &chat_launch_profile("claude").expect("claude"),
+            DEFAULT_CHAT_PROMPT,
+        );
+        assert_eq!(
+            claude,
+            vec!["claude".to_string(), DEFAULT_CHAT_PROMPT.to_string()]
+        );
+    }
 
     #[test]
     fn extracts_direct_agent_json() {

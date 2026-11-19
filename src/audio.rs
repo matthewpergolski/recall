@@ -152,14 +152,22 @@ impl Drop for CaptureLock {
     }
 }
 
-pub fn resume_block_reason(session_path: &Path) -> Option<String> {
+/// Refuse chat (or resume) when another Recall process holds a live capture lock.
+pub fn live_capture_block_reason(session_path: &Path) -> Option<String> {
     let lock_path = capture_lock_path(session_path);
-    let progress = read_capture_progress(session_path);
     if lock_path.exists() && !lock_holder_is_dead(&lock_path) {
         return Some(live_capture_lock_message(session_path, &lock_path));
     }
+    None
+}
+
+pub fn resume_block_reason(session_path: &Path) -> Option<String> {
+    if let Some(reason) = live_capture_block_reason(session_path) {
+        return Some(reason);
+    }
     // Leave stale lock files in place. Acquire reclaims them with an identity
     // check so resume inspection cannot unlink a lock another process just created.
+    let progress = read_capture_progress(session_path);
     if progress.take_in_progress() {
         return Some(unfinished_take_message(session_path));
     }

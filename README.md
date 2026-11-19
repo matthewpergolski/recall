@@ -306,6 +306,7 @@ recall export latest --output ~/Desktop/project-sync.md
 ## TUI Keys
 
 - `c`: toggle consent noted
+- `C`: open post-call chat with the selected agent after a take ends (ignored while recording). Shows one toast that meeting text may leave this machine, then hands the TTY to the agent and restores the ended dashboard when the agent exits. Same session stays selected. Also available as `recall chat [latest|id]`.
 - `Enter`: start recording when idle; end and finalize when recording; continue the same session after it ends
 - `Space`: mute or unmute Recall's microphone track while recording. Zoom/Teams/Meet stay unmuted; call audio keeps recording. Space does not start or end a take.
 - transcript progress starts after recording ends; a continued take re-transcribes the full concatenated audio
