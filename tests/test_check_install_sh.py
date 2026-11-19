@@ -85,12 +85,15 @@ class InstallShTests(unittest.TestCase):
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_plan_second_run_says_nothing_else_to_change_when_current(self) -> None:
-        checkout = self.home / "Projects" / "recall"
+    def _prepare_current_with_helper(self, checkout: Path) -> str:
         init_checkout(checkout)
         ignore = checkout / "capture-helper" / ".gitignore"
         ignore.write_text(".build/\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(checkout), "add", "capture-helper/.gitignore"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(checkout), "add", "capture-helper/.gitignore"],
+            check=True,
+            capture_output=True,
+        )
         subprocess.run(
             [
                 "git",
@@ -107,30 +110,47 @@ class InstallShTests(unittest.TestCase):
             check=True,
             capture_output=True,
         )
-        # Keep origin/main current with HEAD after the ignore commit.
         subprocess.run(
             ["git", "-C", str(checkout), "update-ref", "refs/remotes/origin/main", "HEAD"],
             check=True,
             capture_output=True,
         )
         helper = (
-            checkout
-            / "capture-helper"
-            / ".build"
-            / "debug"
-            / "recall-capture"
+            checkout / "capture-helper" / ".build" / "debug" / "recall-capture"
         )
         helper.parent.mkdir(parents=True)
         helper.write_text("#!/bin/sh\necho stub\n", encoding="utf-8")
         helper.chmod(0o755)
-        first = run_install("--plan", "--repo", str(checkout), env=self.env)
-        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
-        self.assertIn("plan:", first.stdout)
-        second = run_install("--plan", "--repo", str(checkout), env=self.env)
-        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
-        self.assertIn("nothing else to change", second.stdout)
-        self.assertNotIn("swift build", second.stdout)
-        self.assertNotIn("cargo install", second.stdout)
+        return subprocess.check_output(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
+        ).strip()
+
+    def test_plan_helper_without_recall_still_plans_cargo_install(self) -> None:
+        """M3: helper alone is not enough; cargo install must still be planned."""
+        checkout = self.home / "Projects" / "recall"
+        self._prepare_current_with_helper(checkout)
+        result = run_install("--plan", "--repo", str(checkout), env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("cargo install", result.stdout)
+        self.assertNotIn("already up to date", result.stdout.lower())
+
+    def test_plan_current_with_matching_cargo_recall_is_idle(self) -> None:
+        """M3: skip rebuild only when PATH recall is Cargo's bin for this HEAD."""
+        checkout = self.home / "Projects" / "recall"
+        head = self._prepare_current_with_helper(checkout)
+        cargo_bin = self.home / ".cargo" / "bin"
+        cargo_bin.mkdir(parents=True)
+        recall = cargo_bin / "recall"
+        recall.write_text(f"#!/bin/sh\necho recall-stub\n# {head}\n", encoding="utf-8")
+        recall.chmod(0o755)
+        env = dict(self.env)
+        env["PATH"] = f"{cargo_bin}:{env.get('PATH', '/usr/bin')}"
+        env["CARGO_HOME"] = str(self.home / ".cargo")
+        result = run_install("--plan", "--repo", str(checkout), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("nothing else to change", result.stdout)
+        self.assertNotIn("swift build", result.stdout)
+        self.assertNotIn("cargo install", result.stdout)
 
     def test_plan_dirty_names_file_without_reset(self) -> None:
         checkout = self.home / "Projects" / "recall"
@@ -374,6 +394,39 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("source_dir", result.stderr)
         self.assertFalse((self.home / "Projects" / "recall").exists())
         self.assertNotIn("clone", result.stdout.lower())
+
+
+    def test_script_parses_under_sh_posix(self) -> None:
+        """Blocker: macOS curl|sh is bash 3.2 POSIX — no process substitution."""
+        result = subprocess.run(
+            ["bash", "--posix", "-n", str(INSTALL)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_plan_under_sh_posix_reaches_plan_output(self) -> None:
+        """curl|sh must get past find_checkout and print a plan line."""
+        checkout = self.home / "Projects" / "recall"
+        init_checkout(checkout)
+        result = subprocess.run(
+            ["bash", "--posix", str(INSTALL), "--plan", "--repo", str(checkout)],
+            cwd=str(self.home),
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("plan:", result.stdout)
+        self.assertNotIn("syntax error", (result.stderr + result.stdout).lower())
+
+    def test_print_unique_commits_without_mapfile(self) -> None:
+        """M1: aside path must not call mapfile or process substitution."""
+        src = INSTALL.read_text(encoding="utf-8")
+        self.assertNotIn("mapfile", src)
+        self.assertNotIn("< <(", src)
 
 
 if __name__ == "__main__":
