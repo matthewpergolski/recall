@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use crate::config::expand_path;
+use crate::config::{config_path, expand_path, patch_top_level_source_dir};
 use crate::update_progress::{plan_total, UpdateProgress};
+use crate::update_repair::{classify_history, maybe_repair_history, HistoryClass};
 
 include!("../git_hook_env.rs");
 
@@ -20,12 +21,15 @@ pub struct UpdateOptions {
     pub configured_repo: Option<PathBuf>,
     /// Show each step's command, its output, and how long it took.
     pub verbose: bool,
+    /// Answer yes to aside-and-clone (and other update prompts) without a TTY.
+    pub yes: bool,
 }
 
 impl UpdateOptions {
     pub fn parse(args: Vec<String>, configured_repo: Option<PathBuf>) -> Result<Self, String> {
         let mut repo = None;
         let mut verbose = false;
+        let mut yes = false;
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -40,6 +44,7 @@ impl UpdateOptions {
                     ));
                 }
                 "--verbose" => verbose = true,
+                "--yes" => yes = true,
                 value => return Err(format!("Unknown update option: {value}")),
             }
         }
@@ -48,12 +53,19 @@ impl UpdateOptions {
             repo,
             configured_repo,
             verbose,
+            yes,
         })
     }
 }
 
 pub fn update(options: &UpdateOptions) -> io::Result<()> {
-    let checkout = discover_checkout(options)?;
+    let found = discover_checkout(options)?;
+    let checkout = found.path;
+    if found.write_source_dir {
+        if let Some(path) = config_path() {
+            patch_top_level_source_dir(&path, &checkout)?;
+        }
+    }
     validate_checkout(&checkout)?;
     ensure_clean(&checkout)?;
     ensure_update_branch(&checkout)?;
@@ -104,22 +116,41 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
         times.add("Check", elapsed);
     }
 
-    if previous_commit == remote_commit && build_matches(&previous_commit, BUILD_COMMIT) {
+    let history = classify_history(&checkout)?;
+    if matches!(history, HistoryClass::Current) && build_matches(&previous_commit, BUILD_COMMIT) {
         progress.rest();
         println!("Already up to date ({}).", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
-    let refreshing = previous_commit == remote_commit;
-    let crate_version = if refreshing {
+    // Unrelated, diverged, or local-only: one aside-and-clone prompt, then continue.
+    let repaired = maybe_repair_history(
+        &checkout,
+        &history,
+        options.yes,
+        &crate::update_repair::today_ymd(),
+        crate::update_repair::clone_official,
+    )?
+    .is_some();
+
+    let head_commit = git_output(&checkout, &["rev-parse", "HEAD"])?;
+    let remote_commit = git_output(&checkout, &["rev-parse", "refs/remotes/origin/main"])?;
+    let history = classify_history(&checkout)?;
+
+    let refreshing = matches!(history, HistoryClass::Current) && !repaired;
+    let crate_version = if refreshing || repaired {
         let crate_version = validate_checkout(&checkout)?;
         if progress.is_interactive() {
-            progress.open_bar(
-                &format!("Refreshing Recall {crate_version}"),
-                plan_total(&["Tests", "Capture helper", "Install"]),
-            )?;
-        } else {
+            let title = if refreshing {
+                format!("Refreshing Recall {crate_version}")
+            } else {
+                format!("Updating Recall {crate_version}")
+            };
+            progress.open_bar(&title, plan_total(&["Tests", "Capture helper", "Install"]))?;
+        } else if refreshing {
             println!("Refreshing Recall {crate_version}...");
+        } else {
+            println!("Updating Recall {crate_version}...");
         }
         crate_version
     } else {
@@ -205,12 +236,14 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
             short_commit(&current_commit)
         );
     }
-    print_changes(
-        &checkout,
-        &previous_commit,
-        &current_commit,
-        change_pause(progress.is_interactive()),
-    );
+    if !repaired {
+        print_changes(
+            &checkout,
+            &head_commit,
+            &current_commit,
+            change_pause(progress.is_interactive()),
+        );
+    }
     if let Some(times) = times {
         println!("{}", times.summary());
     }
@@ -227,7 +260,7 @@ struct CheckoutSearch {
     home: Option<PathBuf>,
 }
 
-fn discover_checkout(options: &UpdateOptions) -> io::Result<PathBuf> {
+fn discover_checkout(options: &UpdateOptions) -> io::Result<CheckoutFound> {
     let from_env =
         env::var_os("RECALL_REPO").map(|value| expand_path(value.to_string_lossy().into_owned()));
     let found = choose_checkout(&CheckoutSearch {
@@ -238,28 +271,32 @@ fn discover_checkout(options: &UpdateOptions) -> io::Result<PathBuf> {
         current_dir: env::current_dir().ok(),
         home: env::var_os("HOME").map(PathBuf::from),
     })?;
-    if let Some(warning) = found.warning {
+    if let Some(warning) = &found.warning {
         eprintln!("{warning}");
     }
-    Ok(found.path)
+    Ok(found)
 }
 
 #[derive(Debug)]
 struct CheckoutFound {
     path: PathBuf,
     warning: Option<String>,
+    /// Patch top-level `source_dir` when discovery chose via --repo, RECALL_REPO,
+    /// fall-through, or a missing key.
+    write_source_dir: bool,
 }
 
 fn choose_checkout(search: &CheckoutSearch) -> io::Result<CheckoutFound> {
     if let Some(path) = &search.explicit {
-        return found_checkout(require_checkout(path, "--repo")?);
+        return found_checkout(require_checkout(path, "--repo")?, true);
     }
     if let Some(path) = &search.from_env {
-        return found_checkout(require_checkout(path, "RECALL_REPO")?);
+        return found_checkout(require_checkout(path, "RECALL_REPO")?, true);
     }
     if let Some(path) = &search.configured {
         if let Ok(found) = require_checkout(path, "source_dir in Recall config") {
-            return found_checkout(found);
+            // Valid pin: use it and do not rewrite yet.
+            return found_checkout(found, false);
         }
         let chosen = choose_without_config(search)?;
         return Ok(CheckoutFound {
@@ -269,15 +306,18 @@ fn choose_checkout(search: &CheckoutSearch) -> io::Result<CheckoutFound> {
                 chosen.display()
             )),
             path: chosen,
+            write_source_dir: true,
         });
     }
-    found_checkout(choose_without_config(search)?)
+    // Missing source_dir: write the chosen checkout.
+    found_checkout(choose_without_config(search)?, true)
 }
 
-fn found_checkout(path: PathBuf) -> io::Result<CheckoutFound> {
+fn found_checkout(path: PathBuf, write_source_dir: bool) -> io::Result<CheckoutFound> {
     Ok(CheckoutFound {
         path,
         warning: None,
+        write_source_dir,
     })
 }
 
@@ -477,14 +517,14 @@ fn ensure_at_origin_main(checkout: &Path) -> io::Result<()> {
     ))
 }
 
-fn git_at(checkout: &Path) -> Command {
+pub(crate) fn git_at(checkout: &Path) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(checkout);
     scrub_git_command(&mut command);
     command
 }
 
-fn git_output(checkout: &Path, args: &[&str]) -> io::Result<String> {
+pub(crate) fn git_output(checkout: &Path, args: &[&str]) -> io::Result<String> {
     let mut command = git_at(checkout);
     command.args(args);
     let output = command_output(&mut command, &format!("run git {}", args.join(" ")))?;
@@ -1099,6 +1139,16 @@ mod tests {
     }
 
     #[test]
+    fn yes_is_off_unless_asked_for() {
+        assert!(!UpdateOptions::parse(Vec::new(), None).unwrap().yes);
+        assert!(
+            UpdateOptions::parse(vec!["--yes".to_string()], None)
+                .unwrap()
+                .yes
+        );
+    }
+
+    #[test]
     fn a_shown_step_notes_its_time_and_a_failed_one_says_where_to_look() {
         let mut times = StepTimes::start();
 
@@ -1297,6 +1347,7 @@ mod tests {
         .unwrap();
         let chosen = fs::canonicalize(&embedded.path).unwrap();
         assert_eq!(found.path, chosen);
+        assert!(found.write_source_dir);
         let warning = found.warning.expect("a skipped source_dir warns");
         assert!(warning.contains("missing-source"), "{warning}");
         assert!(
@@ -1362,6 +1413,7 @@ mod tests {
         .unwrap();
         assert_eq!(found.path, fs::canonicalize(&configured.path).unwrap());
         assert!(found.warning.is_none());
+        assert!(!found.write_source_dir);
     }
 
     #[test]
@@ -1423,5 +1475,45 @@ mod tests {
         .unwrap();
         assert_eq!(found.path, fs::canonicalize(&projects.path).unwrap());
         assert!(found.warning.is_none());
+        assert!(found.write_source_dir);
+    }
+
+    #[test]
+    fn dirty_checkout_still_gets_source_dir_patched() {
+        use crate::config::{patch_top_level_source_dir, RecallConfig};
+
+        let home = TempHome::new("dirty-write");
+        let fixture = CheckoutFixture::at(home.path.join("checkout"));
+        fixture.commit();
+        fixture.mark_origin_main();
+        fs::write(fixture.path.join("dirty.txt"), "stay dirty\n").unwrap();
+        assert!(ensure_clean(&fixture.path).is_err());
+
+        let config_dir = home.path.join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config = config_dir.join("config.toml");
+        let places = config_dir.join("session-places.txt");
+        fs::write(&places, "/tmp/sessions\n").unwrap();
+        fs::write(
+            &config,
+            "# keep\nstorage_dir = \"~/Sessions\"\n[transcription]\nengine = apple\n",
+        )
+        .unwrap();
+        patch_top_level_source_dir(&config, &fixture.path).unwrap();
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(text.contains("# keep"), "{text}");
+        assert!(text.contains("storage_dir"), "{text}");
+        assert_eq!(text.matches("source_dir").count(), 1, "{text}");
+        let parsed = RecallConfig::parse(&text);
+        assert_eq!(
+            parsed
+                .source_dir
+                .as_ref()
+                .and_then(|p| p.canonicalize().ok()),
+            fixture.path.canonicalize().ok()
+        );
+        assert_eq!(fs::read_to_string(&places).unwrap(), "/tmp/sessions\n");
+        assert!(fixture.path.join("dirty.txt").is_file());
+        assert!(ensure_clean(&fixture.path).is_err());
     }
 }
