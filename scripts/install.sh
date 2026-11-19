@@ -15,6 +15,7 @@ REWRITE_CONFIG=""
 REPO=""
 DATE="$(date +%F)"
 PENDING_CLONE=0
+CONFIRM_USED_TTY=0
 
 usage() {
   cat <<'EOF'
@@ -300,11 +301,17 @@ find_checkout() {
 
   preferred="${HOME%/}/Projects/recall"
   local -a found=()
+  local candidate_list candidate
+  # Avoid process substitution: macOS /bin/sh (bash 3.2 POSIX) rejects it.
+  candidate_list="$(common_candidates)"
   while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
     if is_checkout "$candidate"; then
       found+=("$(absolute_path "$candidate")")
     fi
-  done < <(common_candidates)
+  done <<EOF
+$candidate_list
+EOF
 
   if is_checkout "$preferred"; then
     CHECKOUT="$(absolute_path "$preferred")"
@@ -345,16 +352,24 @@ find_checkout() {
 confirm_tty() {
   local interactive_prompt="$1"
   local noninteractive_line="$2"
+  CONFIRM_USED_TTY=0
   if [[ "$YES" -eq 1 ]]; then
     return 0
   fi
-  # Prefer the controlling terminal (curl | sh). Opening /dev/tty can fail when
-  # there is no TTY even if the node exists — fall through to non-interactive.
+  # Prefer the controlling terminal (curl | sh). Open /dev/tty via exec so a
+  # missing controlling terminal does not print "No such device" on stderr.
   local answer=""
-  if printf '%s ' "$interactive_prompt" >/dev/tty 2>/dev/null     && IFS= read -r answer </dev/tty 2>/dev/null; then
-    answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    [[ -z "$answer" || "$answer" == y || "$answer" == yes ]]
-    return $?
+  if exec 3<>/dev/tty 2>/dev/null; then
+    CONFIRM_USED_TTY=1
+    printf '%s ' "$interactive_prompt" >&3
+    if IFS= read -r answer <&3; then
+      exec 3>&-
+      answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [[ -z "$answer" || "$answer" == y || "$answer" == yes ]]
+      return $?
+    fi
+    exec 3>&-
+    return 1
   fi
   echo "$noninteractive_line" >&2
   return 1
@@ -404,7 +419,8 @@ wait_for_xcode_clt() {
       return 0
     fi
     # After the dialog has had time to appear, stop if no installer is running.
-    if [[ $i -gt 30 ]] && ! pgrep -f "Command Line Tools" >/dev/null 2>&1; then
+    # Dialog process is "Install Command Line Developer Tools".
+    if [[ $i -gt 30 ]] && ! pgrep -f "Install Command Line Developer Tools" >/dev/null 2>&1; then
       return 1
     fi
     sleep 2
@@ -535,15 +551,18 @@ choose_clone_temp() {
 print_unique_local_commits() {
   local checkout="$1"
   local aside="$2"
-  local subjects subject omitted count i
-  mapfile -t subjects < <(
+  local tmp subject omitted count
+  tmp="$(mktemp "${TMPDIR:-/tmp}/recall-subjects.XXXXXX")"
+  # Portable: no bash-4-only builtins, no process substitution.
+  {
     git -C "$checkout" log --reverse --no-show-signature --format=%s HEAD --not refs/remotes/origin/main 2>/dev/null \
       || git -C "$checkout" log --reverse --no-show-signature --format=%s HEAD 2>/dev/null \
       || true
-  )
+  } >"$tmp"
   log "Keeping local commits in $aside"
-  count="${#subjects[@]}"
-  if [[ "$count" -eq 0 ]]; then
+  count="$(wc -l <"$tmp" | tr -d '[:space:]')"
+  if [[ -z "$count" || "$count" -eq 0 ]]; then
+    rm -f "$tmp"
     return 0
   fi
   log "Unique local commits"
@@ -552,14 +571,16 @@ print_unique_local_commits() {
     omitted=$((count - 8))
     log "  and $omitted earlier"
   fi
-  for ((i = omitted; i < count; i++)); do
-    subject="${subjects[$i]}"
+  # --reverse log is oldest-first; tail shows the newest eight.
+  tail -n 8 "$tmp" | while IFS= read -r subject; do
+    [[ -n "$subject" ]] || continue
     subject="$(printf '%s' "$subject" | tr -d '\033')"
     if [[ ${#subject} -gt 96 ]]; then
       subject="${subject:0:93}..."
     fi
     log "  · $subject"
   done
+  rm -f "$tmp"
 }
 
 aside_and_clone() {
@@ -666,6 +687,24 @@ cargo_bin_dir() {
   printf '%s\n' "${CARGO_HOME:-$HOME/.cargo}/bin"
 }
 
+# True when PATH's recall is Cargo's bin and embeds this checkout HEAD.
+cargo_recall_matches_checkout() {
+  local checkout="$1"
+  local cargo_bin path head
+  cargo_bin="$(cargo_bin_dir)/recall"
+  path="$(command -v recall 2>/dev/null || true)"
+  [[ -n "$path" && -x "$cargo_bin" ]] || return 1
+  if command -v realpath >/dev/null 2>&1; then
+    [[ "$(realpath "$path")" == "$(realpath "$cargo_bin")" ]] || return 1
+  else
+    [[ "$(absolute_path "$path")" == "$(absolute_path "$cargo_bin")" ]] || return 1
+  fi
+  head="$(git -C "$checkout" rev-parse HEAD 2>/dev/null || true)"
+  [[ -n "$head" ]] || return 1
+  # build.rs embeds RECALL_BUILD_COMMIT as ASCII in the binary.
+  grep -a -F -q "$head" "$cargo_bin" 2>/dev/null
+}
+
 ensure_cargo_bin_on_path_files() {
   local bin_dir line rc
   bin_dir="$(cargo_bin_dir)"
@@ -766,6 +805,9 @@ Move it to $aside and clone a fresh copy into $CHECKOUT? [Y/n]"
         noninteractive="Checkout $CHECKOUT does not share history with origin/main. Local main is ${ahead} commits ahead and ${behind} commits behind origin/main. Re-run with --yes to move it aside and clone fresh, or pass --repo <path> to use another checkout."
       fi
       if ! confirm_tty "$interactive" "$noninteractive"; then
+        if [[ "${CONFIRM_USED_TTY:-0}" -eq 1 ]]; then
+          echo "Left $CHECKOUT unchanged. Re-run with --yes to move it aside and clone fresh, or pass --repo <path> to use another checkout." >&2
+        fi
         exit 1
       fi
       aside_and_clone "$CHECKOUT"
@@ -779,13 +821,20 @@ Move it to $aside and clone a fresh copy into $CHECKOUT? [Y/n]"
 esac
 
 if [[ "$PLAN" -eq 1 ]]; then
-  if [[ "$HISTORY_CLASS" == "current" ]] && helper_binary_present "$CHECKOUT"; then
+  if [[ "$HISTORY_CLASS" == "current" ]] \
+    && helper_binary_present "$CHECKOUT" \
+    && cargo_recall_matches_checkout "$CHECKOUT"
+  then
     log "plan: nothing else to change"
     exit 0
   fi
   if [[ "$HISTORY_CLASS" == "current" ]]; then
-    plan "swift build --package-path $CHECKOUT/capture-helper (helper binary missing)"
-    plan "cargo install --path $CHECKOUT --locked --force"
+    if ! helper_binary_present "$CHECKOUT"; then
+      plan "swift build --package-path $CHECKOUT/capture-helper (helper binary missing)"
+    fi
+    if ! cargo_recall_matches_checkout "$CHECKOUT"; then
+      plan "cargo install --path $CHECKOUT --locked --force"
+    fi
     log "plan: nothing else to change after those steps"
     exit 0
   fi
@@ -796,20 +845,38 @@ if [[ "$PLAN" -eq 1 ]]; then
   exit 0
 fi
 
-# Real run: skip rebuild when already current with helper and Cargo recall.
+# Real run: skip rebuild only when helper + PATH recall is Cargo's bin for HEAD.
 RECALL_BIN="$(cargo_bin_dir)/recall"
 if [[ "$HISTORY_CLASS" == "current" ]] \
   && helper_binary_present "$CHECKOUT" \
-  && { command -v recall >/dev/null 2>&1 || [[ -x "$RECALL_BIN" ]]; }
+  && cargo_recall_matches_checkout "$CHECKOUT"
 then
   log "Recall is already up to date at $CHECKOUT."
   exit 0
 fi
 
-# When rustup owns the toolchain and rustc is too old, update before build.
-if command -v rustup >/dev/null 2>&1 && rustup show active-toolchain >/dev/null 2>&1; then
-  if ! rustc_meets_manifest "$CHECKOUT"; then
+# Cargo binary exists but is not on PATH: fix rc files for future shells, and
+# put Cargo's bin on PATH for this process so a matching install can short-circuit.
+if [[ -x "$RECALL_BIN" ]] && ! command -v recall >/dev/null 2>&1; then
+  ensure_cargo_bin_on_path_files
+  export PATH="$(cargo_bin_dir):${PATH:-}"
+  if [[ "$HISTORY_CLASS" == "current" ]] \
+    && helper_binary_present "$CHECKOUT" \
+    && cargo_recall_matches_checkout "$CHECKOUT"
+  then
+    log "Recall is already up to date at $CHECKOUT."
+    exit 0
+  fi
+fi
+
+# Toolchain: update when rustup owns an old rustc; stop when rustc is too old
+# and rustup does not own it.
+if ! rustc_meets_manifest "$CHECKOUT"; then
+  if command -v rustup >/dev/null 2>&1 && rustup show active-toolchain >/dev/null 2>&1; then
     rustup update stable
+  else
+    echo "install.sh: rustc is older than Cargo.toml rust-version and rustup does not own this toolchain. Install or update rustup, then re-run." >&2
+    exit 1
   fi
 fi
 
