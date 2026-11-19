@@ -104,14 +104,14 @@ def explain_github_denied(status: int, payload: str) -> str:
     )
 
 
-def check_body(text: str, head: str | None = None) -> list[str]:
+def check_body(text: str, head: str | None = None, *, draft: bool | None = None) -> list[str]:
     """Return problem lines for one PR body (empty when clean)."""
     from pr_body_sections import how_to_test_errors, review_errors
 
     errors: list[str] = []
     errors.extend(_marker_errors(text))
     errors.extend(_heading_errors(text))
-    errors.extend(review_errors(text, head))
+    errors.extend(review_errors(text, head, draft=draft))
     errors.extend(how_to_test_errors(text))
     return errors
 

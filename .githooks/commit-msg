@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Commit trailers. Enable with scripts/install-git-hooks.sh (core.hooksPath).
 set -euo pipefail
+source "$(cd "$(dirname "$0")/.." && pwd)/scripts/git_env.sh"
 
 msg_file="${1:-}"
 if [[ -z "${msg_file}" || ! -f "${msg_file}" ]]; then

@@ -8,6 +8,8 @@ import subprocess
 import unittest
 from pathlib import Path
 
+from tests.git_env import without_hook_git
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "check_identity.py"
 
@@ -30,7 +32,7 @@ def git(cwd: Path, *args: str, env: dict | None = None) -> str:
         check=True,
         capture_output=True,
         text=True,
-        env=env,
+        env=without_hook_git(env),
     )
     return result.stdout
 

@@ -12,6 +12,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
+# shellcheck source=git_env.sh
+source "$root/scripts/git_env.sh"
 
 echo "==> scripts/install-git-hooks.sh"
 bash scripts/install-git-hooks.sh
