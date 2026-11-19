@@ -148,6 +148,7 @@ class CheckShGatesTests(unittest.TestCase):
             "check_version_freshness.sh",
             "test_commit_msg_hook.sh",
             "test_cairnkit_check_gate.sh",
+            "test_install_docs.sh",
         ):
             write_exec(scripts / name, "#!/usr/bin/env bash\nexit 0\n")
 
@@ -201,9 +202,10 @@ class CheckShGatesTests(unittest.TestCase):
             **os.environ,
             "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
         }
-        # Drop any inherited PR body so only the test controls it.
+        # Drop any inherited PR body / stacked-base override so only the test controls them.
         env.pop("PR_BODY", None)
         env.pop("PR_BODY_FILE", None)
+        env.pop("RECALL_VERSION_BASE", None)
         if env_extra:
             env.update(env_extra)
         return subprocess.run(

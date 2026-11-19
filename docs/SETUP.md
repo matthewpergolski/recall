@@ -1,18 +1,22 @@
 # Setup
 
-## Fresh Clone
+## Install
+
+One command for a fresh Mac and for an older install:
 
 ```sh
-git clone https://github.com/matthewpergolski/recall.git
-cd recall
-cargo install --path . --locked
+curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh
 ```
 
-Or run without installing:
+That one-liner targets macOS `/bin/sh` (bash 3.2 in POSIX mode). Linux `dash` is not a supported host for `| sh`; run the script with bash there, or save the file and execute it so the shebang applies.
+
+Prompts read `/dev/tty` when a terminal is attached. For a non-interactive Mac smoke (or any closed-stdin run), use:
 
 ```sh
-cargo run
+curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh -s -- --yes
 ```
+
+That script is also the update path when the installed `recall` is too old to repair itself (for example `0.7.2`). After the new binary is installed, `recall update` shares the checkout repair.
 
 Run setup checks:
 
@@ -124,25 +128,25 @@ recall transcribe latest
 recall update
 ```
 
-Install the local binary:
-
-```sh
-cargo install --path . --locked
-```
-
 The default Apple Silicon engine is Apple SpeechAnalyzer on macOS 26+. It uses the on-device speech model and does not require `parakeet-mlx`. If SpeechAnalyzer is unavailable, Recall falls back to Parakeet unless you pass `--engine apple`. `uv tool install parakeet-mlx` is only needed for `--engine parakeet` or that fallback. `recall update` does not install it. Whisper remains available with `--engine whisper` if you already have `whisper-cli`.
 
 The first Parakeet run may download `mlx-community/parakeet-tdt-0.6b-v3` from Hugging Face (NVIDIA CC-BY-4.0). Credit NVIDIA only when that engine ran.
 
 ## Updating An Installed Checkout
 
-After the initial clone and install, run this from any directory:
+Prefer the same curl line when you are not sure which binary is installed:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh
+```
+
+After this design's binary is installed, run from any directory:
 
 ```sh
 recall update
 ```
 
-`recall update` looks for the checkout in this order. `--repo` and `RECALL_REPO` must name a valid checkout, or the command stops. A `source_dir` in the config is used when that folder is a Recall checkout. When it is missing or not one, Recall prints one line naming that path and the checkout it used instead, then keeps looking. Next is the checkout compiled into the installed binary, then a checkout found by walking up from the current directory, then the usual source folders under the home directory. When more than one of those folders is a Recall checkout, `~/Projects/recall` is the one that is used. The command verifies the official Git remote and requires a clean `main` branch tracking `origin/main`. An already-current checkout and executable produce one short message. A fast-forward update is merged, tested, built, and installed. Unrelated, diverged, or local-only history gets one aside-and-clone prompt (`--yes` answers yes without a TTY); a yes moves the checkout aside and clones a fresh copy into the same path before those steps. A terminal shows a one-row level meter while those steps run. A pipe, `NO_COLOR`, `TERM=dumb`, or CI stays on one plain line per step. After a successful update, Recall prints up to eight new commit subjects, one line each. Older subjects are counted on one line.
+`recall update` looks for the checkout in this order. `--repo` and `RECALL_REPO` must name a valid checkout, or the command stops. A `source_dir` in the config is used when that folder is a Recall checkout. When it is missing or not one, Recall prints one line naming that path and the checkout it used instead, then keeps looking and rewrites the top-level `source_dir` line. Next is the checkout compiled into the installed binary, then a checkout found by walking up from the current directory, then the usual source folders under the home directory. When more than one of those folders is a Recall checkout, `~/Projects/recall` is the one that is used. The command verifies the official Git remote and requires a clean `main` branch tracking `origin/main`. An already-current checkout and executable produce one short message. A fast-forward update is merged, tested, built, and installed. Unrelated, diverged, or local-only history gets one aside-and-clone prompt (`--yes` answers yes without a TTY); a yes moves the checkout aside and clones a fresh copy into the same path before those steps. A terminal shows a one-row level meter while those steps run. A pipe, `NO_COLOR`, `TERM=dumb`, or CI stays on one plain line per step. After a successful update, Recall prints up to eight new commit subjects, one line each. Older subjects are counted on one line.
 
 If several common folders exist and none of them is `~/Projects/recall`, name the one you want:
 

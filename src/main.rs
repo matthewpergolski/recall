@@ -3,6 +3,7 @@ mod audio;
 mod capture_sources;
 mod citations;
 mod config;
+mod doctor_install;
 mod loudness;
 mod mic_recorder;
 mod places;
@@ -27,6 +28,10 @@ use analysis::{
 use audio::live_capture_block_reason;
 use capture_sources::{detect_sources, probe_audio_tap};
 use config::{config_path, RecallConfig};
+use doctor_install::{
+    existing_helpers, format_install_doctor_lines, recall_binaries_on_path, HistoryStatus,
+    InstallDoctorInput, SourceDirStatus,
+};
 use session::{
     default_storage_dir, export_session, faded_text, holds_sessions, is_session_dir,
     latest_session, list_sessions, open_path, primary_document_path, resolve_timezone, resume_hint,
@@ -42,6 +47,7 @@ use transcription::{
 };
 use tui::{ResumeTarget, TuiOptions};
 use update::{update, UpdateOptions};
+use update_repair::{classify_history, HistoryClass};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -1522,6 +1528,10 @@ fn print_doctor() {
     print_binary_check("cargo", "Cargo package manager");
     print_binary_check("swift", "Swift toolchain");
     println!();
+    for line in format_install_doctor_lines(&gather_install_doctor_input(&config)) {
+        println!("{line}");
+    }
+    println!();
     println!("Capture:");
     print_binary_check("swift", "Swift helper runner");
     println!("  - CoreAudio process tap probe: run `recall audio-tap-probe`");
@@ -1581,6 +1591,190 @@ fn print_doctor() {
     println!("Agents:");
     for agent in known_agents() {
         print_binary_check(agent, agent);
+    }
+}
+
+fn gather_install_doctor_input(config: &RecallConfig) -> InstallDoctorInput {
+    let embedded = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let configured = config.source_dir.clone();
+    let (source_dir, checkout) = match &configured {
+        None => (
+            SourceDirStatus::Missing,
+            doctor_fallback_checkout(&embedded),
+        ),
+        Some(path) => match doctor_validate_checkout(path) {
+            Ok(()) => (
+                SourceDirStatus::Valid { path: path.clone() },
+                Some(path.clone()),
+            ),
+            Err(reason) => {
+                let replacement = doctor_fallback_checkout(&embedded);
+                (
+                    SourceDirStatus::Invalid {
+                        path: path.clone(),
+                        reason,
+                        replacement: replacement.clone(),
+                    },
+                    replacement,
+                )
+            }
+        },
+    };
+
+    let history = match &checkout {
+        Some(path) => doctor_history_status(path),
+        None => HistoryStatus::Unknown,
+    };
+    let helper_paths = checkout
+        .as_ref()
+        .map(|path| existing_helpers(path))
+        .unwrap_or_default();
+    let checkout_head = checkout.as_ref().and_then(|path| {
+        Command::new("git")
+            .args(["-C", &path.display().to_string(), "rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    });
+
+    let path_env = env::var("PATH").ok();
+    InstallDoctorInput {
+        source_dir,
+        history,
+        recall_paths: recall_binaries_on_path(path_env.as_deref()),
+        helper_paths,
+        swift_present: binary_exists("swift"),
+        crate_version: VERSION.to_string(),
+        build_commit: env!("RECALL_BUILD_COMMIT").to_string(),
+        checkout_head,
+    }
+}
+
+fn looks_like_checkout_tree(path: &Path) -> bool {
+    path.is_dir()
+        && path.join("Cargo.toml").is_file()
+        && path.join("capture-helper/Package.swift").is_file()
+}
+
+fn doctor_git_stdout(checkout: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn doctor_validate_checkout(path: &Path) -> Result<(), String> {
+    if !looks_like_checkout_tree(path) {
+        return Err("not a Recall checkout".into());
+    }
+    let root = doctor_git_stdout(path, &["rev-parse", "--show-toplevel"])
+        .ok_or_else(|| "not a git checkout".to_string())?;
+    let root_path = PathBuf::from(&root);
+    let same = match (path.canonicalize(), root_path.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => path == root_path,
+    };
+    if !same {
+        return Err("path is not the root of the Git checkout".into());
+    }
+    let remote =
+        doctor_git_stdout(path, &["config", "--get", "remote.origin.url"]).unwrap_or_default();
+    if update::normalized_remote(&remote).is_none() {
+        return Err(format!(
+            "origin is not the official Recall repository: {remote}"
+        ));
+    }
+    Ok(())
+}
+
+fn doctor_fallback_checkout(embedded: &Path) -> Option<PathBuf> {
+    if doctor_validate_checkout(embedded).is_ok() {
+        return Some(embedded.to_path_buf());
+    }
+    if let Ok(cwd) = env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            if doctor_validate_checkout(ancestor).is_ok() {
+                return Some(ancestor.to_path_buf());
+            }
+        }
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        let preferred = home.join("Projects/recall");
+        if doctor_validate_checkout(&preferred).is_ok() {
+            return Some(preferred);
+        }
+    }
+    None
+}
+
+fn doctor_history_status(checkout: &Path) -> HistoryStatus {
+    let dirty_raw = doctor_git_stdout(
+        checkout,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )
+    .unwrap_or_default();
+    if !dirty_raw.is_empty() {
+        let paths = dirty_raw
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        return HistoryStatus::Dirty { paths };
+    }
+    let branch = doctor_git_stdout(checkout, &["branch", "--show-current"]).unwrap_or_default();
+    if branch != "main" {
+        return HistoryStatus::WrongBranch { branch };
+    }
+    let upstream = doctor_git_stdout(
+        checkout,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .unwrap_or_else(|| "none".into());
+    if upstream != "origin/main" {
+        return HistoryStatus::WrongUpstream { upstream };
+    }
+    match classify_history(checkout) {
+        Ok(HistoryClass::Current) => HistoryStatus::Ok,
+        Ok(HistoryClass::FastForward) => HistoryStatus::Behind,
+        Ok(HistoryClass::Unrelated { .. }) => HistoryStatus::Unrelated,
+        Ok(HistoryClass::Diverged { .. }) => HistoryStatus::Diverged,
+        Ok(HistoryClass::LocalOnly { .. }) => {
+            let subjects = doctor_git_stdout(
+                checkout,
+                &[
+                    "log",
+                    "--reverse",
+                    "--no-show-signature",
+                    "--format=%s",
+                    "HEAD",
+                    "--not",
+                    "refs/remotes/origin/main",
+                ],
+            )
+            .map(|log| {
+                log.lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+            HistoryStatus::LocalOnly { subjects }
+        }
+        Err(_) => HistoryStatus::Unknown,
     }
 }
 

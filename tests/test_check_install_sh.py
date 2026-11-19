@@ -1,0 +1,798 @@
+"""Tests for scripts/install.sh --plan and --rewrite-config."""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import os
+import select
+import shutil
+import subprocess
+import tempfile
+import termios
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+INSTALL = ROOT / "scripts" / "install.sh"
+
+
+def run_install(*args: str, env: dict[str, str] | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+    return subprocess.run(
+        ["bash", str(INSTALL), *args],
+        cwd=str(cwd or ROOT),
+        env=merged,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def run_install_with_controlling_tty(
+    *args: str,
+    env: dict[str, str],
+    cwd: Path,
+    tty_reply: bytes,
+    timeout: float = 15.0,
+) -> tuple[int, str, str]:
+    """Run install.sh with stdin closed and a real controlling tty for prompts.
+
+    Captures stdout/stderr on pipes so a hijacked shell stderr is detectable.
+    """
+    master, slave = os.openpty()
+    stdout_r, stdout_w = os.pipe()
+    stderr_r, stderr_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(master)
+            os.close(stdout_r)
+            os.close(stderr_r)
+            os.setsid()
+            try:
+                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            except OSError:
+                pass
+            devnull = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(devnull, 0)
+            os.close(devnull)
+            os.dup2(stdout_w, 1)
+            os.dup2(stderr_w, 2)
+            os.close(stdout_w)
+            os.close(stderr_w)
+            # Leave ``slave`` open so /dev/tty resolves to this pty.
+            os.chdir(str(cwd))
+            merged = os.environ.copy()
+            merged.update(env)
+            os.execve("/bin/bash", ["bash", str(INSTALL), *args], merged)
+        except Exception:
+            os._exit(127)
+
+    os.close(slave)
+    os.close(stdout_w)
+    os.close(stderr_w)
+    for fd in (master, stdout_r, stderr_r):
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    answered = False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([master, stdout_r, stderr_r], [], [], 0.2)
+        for fd in readable:
+            try:
+                data = os.read(fd, 4096)
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
+                # Peer closed the pty (EIO) — treat as EOF for that fd.
+                if exc.errno == errno.EIO:
+                    if fd == master and not answered:
+                        # Prompt may have been written before we polled; try once.
+                        try:
+                            os.write(master, tty_reply)
+                            answered = True
+                        except OSError:
+                            pass
+                    continue
+                raise
+            if not data:
+                continue
+            if fd == master:
+                if not answered and (b"[Y/n]" in data or b"Y/n" in data):
+                    os.write(master, tty_reply)
+                    answered = True
+            elif fd == stdout_r:
+                stdout_chunks.append(data)
+            else:
+                stderr_chunks.append(data)
+        waited = os.waitpid(pid, os.WNOHANG)
+        if waited[0] == pid:
+            # Drain remaining pipe data.
+            for fd, bucket in ((stdout_r, stdout_chunks), (stderr_r, stderr_chunks)):
+                while True:
+                    try:
+                        data = os.read(fd, 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    bucket.append(data)
+            status = waited[1]
+            code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (
+                os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+            )
+            os.close(master)
+            os.close(stdout_r)
+            os.close(stderr_r)
+            return (
+                code,
+                b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+                b"".join(stderr_chunks).decode("utf-8", errors="replace"),
+            )
+
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    os.close(master)
+    os.close(stdout_r)
+    os.close(stderr_r)
+    raise TimeoutError("install.sh with controlling tty timed out")
+
+
+def init_checkout(path: Path, *, remote: str = "https://github.com/matthewpergolski/recall.git") -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "src").mkdir(exist_ok=True)
+    (path / "capture-helper").mkdir(exist_ok=True)
+    (path / "Cargo.toml").write_text(
+        '[package]\nname = "recall"\nversion = "0.0.0"\nedition = "2021"\n',
+        encoding="utf-8",
+    )
+    (path / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    (path / "capture-helper" / "Package.swift").write_text("// fixture\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-b", "main"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", remote], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Recall Test",
+            "-c",
+            "user.email=recall@example.invalid",
+            "commit",
+            "-m",
+            "root",
+        ],
+        cwd=path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "branch", "--set-upstream-to=origin/main", "main"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+    )
+
+
+class InstallShTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="recall-install-sh-"))
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.config_dir = self.home / ".config" / "recall"
+        self.config_dir.mkdir(parents=True)
+        self.env = {
+            "HOME": str(self.home),
+            "XDG_CONFIG_HOME": str(self.home / ".config"),
+            "RECALL_INSTALL_SKIP_TOOLS": "1",
+        }
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _prepare_current_with_helper(self, checkout: Path) -> str:
+        init_checkout(checkout)
+        ignore = checkout / "capture-helper" / ".gitignore"
+        ignore.write_text(".build/\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(checkout), "add", "capture-helper/.gitignore"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "ignore helper build",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(checkout), "update-ref", "refs/remotes/origin/main", "HEAD"],
+            check=True,
+            capture_output=True,
+        )
+        helper = (
+            checkout / "capture-helper" / ".build" / "debug" / "recall-capture"
+        )
+        helper.parent.mkdir(parents=True)
+        helper.write_text("#!/bin/sh\necho stub\n", encoding="utf-8")
+        helper.chmod(0o755)
+        return subprocess.check_output(
+            ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
+        ).strip()
+
+    def _make_unrelated_clean(self, checkout: Path) -> Path:
+        """Checkout with clean tree whose origin/main tip does not share history."""
+        init_checkout(checkout)
+        other = self.tmp / f"other-{checkout.name}"
+        init_checkout(other)
+        subprocess.run(
+            ["git", "-C", str(other), "checkout", "--orphan", "fresh"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(other), "rm", "-rf", "."], check=True, capture_output=True)
+        (other / "src").mkdir(exist_ok=True)
+        (other / "capture-helper").mkdir(exist_ok=True)
+        (other / "Cargo.toml").write_text(
+            '[package]\nname = "recall"\nversion = "0.0.1"\nedition = "2021"\n',
+            encoding="utf-8",
+        )
+        (other / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+        (other / "capture-helper" / "Package.swift").write_text("// fresh\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(other), "add", "."], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(other),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "fresh unrelated root",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        other_tip = subprocess.check_output(
+            ["git", "-C", str(other), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(
+            ["git", "-C", str(checkout), "remote", "add", "other", str(other)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "fetch",
+                "--quiet",
+                "other",
+                f"+{other_tip}:refs/remotes/origin/main",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        marker = checkout / "KEEP"
+        marker.write_text("keep\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(checkout), "add", "KEEP"], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "keep marker",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return marker
+
+    def test_plan_helper_without_recall_still_plans_cargo_install(self) -> None:
+        """M3: helper alone is not enough; cargo install must still be planned."""
+        checkout = self.home / "Projects" / "recall"
+        self._prepare_current_with_helper(checkout)
+        result = run_install("--plan", "--repo", str(checkout), env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("cargo install", result.stdout)
+        self.assertNotIn("already up to date", result.stdout.lower())
+
+    def test_plan_current_with_matching_cargo_recall_is_idle(self) -> None:
+        """M3: skip rebuild only when PATH recall is Cargo's bin for this HEAD."""
+        checkout = self.home / "Projects" / "recall"
+        head = self._prepare_current_with_helper(checkout)
+        cargo_bin = self.home / ".cargo" / "bin"
+        cargo_bin.mkdir(parents=True)
+        recall = cargo_bin / "recall"
+        recall.write_text(f"#!/bin/sh\necho recall-stub\n# {head}\n", encoding="utf-8")
+        recall.chmod(0o755)
+        env = dict(self.env)
+        env["PATH"] = f"{cargo_bin}:{env.get('PATH', '/usr/bin')}"
+        env["CARGO_HOME"] = str(self.home / ".cargo")
+        result = run_install("--plan", "--repo", str(checkout), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("nothing else to change", result.stdout)
+        self.assertNotIn("swift build", result.stdout)
+        self.assertNotIn("cargo install", result.stdout)
+
+    def test_plan_dirty_names_file_without_reset(self) -> None:
+        checkout = self.home / "Projects" / "recall"
+        init_checkout(checkout)
+        dirty = checkout / "dirty.txt"
+        dirty.write_text("x\n", encoding="utf-8")
+        result = run_install("--plan", "--repo", str(checkout), env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("dirty", result.stdout.lower())
+        self.assertIn("dirty.txt", result.stdout)
+        self.assertNotIn("reset", result.stdout.lower())
+        self.assertTrue(dirty.is_file())
+
+    def test_plan_unrelated_names_aside_and_clone(self) -> None:
+        old = self.home / "Scripts" / "recall"
+        init_checkout(old)
+        # Orphan history so merge-base fails (true unrelated), then force-track it.
+        other = self.tmp / "other"
+        init_checkout(other)
+        subprocess.run(
+            ["git", "-C", str(other), "checkout", "--orphan", "fresh"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(other), "rm", "-rf", "."], check=True, capture_output=True)
+        (other / "src").mkdir(exist_ok=True)
+        (other / "capture-helper").mkdir(exist_ok=True)
+        (other / "Cargo.toml").write_text(
+            '[package]\nname = "recall"\nversion = "0.0.1"\nedition = "2021"\n',
+            encoding="utf-8",
+        )
+        (other / "src" / "main.rs").write_text(
+            "fn main() { /* fresh */ }\n", encoding="utf-8"
+        )
+        (other / "capture-helper" / "Package.swift").write_text("// fresh\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(other), "add", "."], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(other),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "fresh unrelated root",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        other_tip = subprocess.check_output(
+            ["git", "-C", str(other), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(
+            ["git", "-C", str(old), "remote", "add", "other", str(other)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(old),
+                "fetch",
+                "--quiet",
+                "other",
+                f"+{other_tip}:refs/remotes/origin/main",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        result = run_install("--plan", "--repo", str(old), env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("aside-and-clone", result.stdout)
+
+    def test_plan_missing_canonical_mentions_clone(self) -> None:
+        # Empty home: no checkout. Plan should mention clone into Projects/recall
+        # without running git against the missing path (no empty-branch refuse).
+        result = run_install("--plan", env=self.env, cwd=self.home)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("clone", result.stdout.lower())
+        self.assertIn("Projects/recall", result.stdout)
+        self.assertNotIn("refuse branch", result.stdout)
+        self.assertNotIn("No such file or directory", result.stderr)
+        self.assertIn("cargo install", result.stdout)
+
+    def test_rewrite_config_preserves_section_and_storage(self) -> None:
+        checkout = self.home / "Scripts" / "recall"
+        init_checkout(checkout)
+        cfg = self.config_dir / "config.toml"
+        cfg.write_text(
+            'storage_dir = "~/Documents/Recall/sessions"\n'
+            "keep_audio = false\n"
+            "\n"
+            "[transcription]\n"
+            'engine = "apple"\n',
+            encoding="utf-8",
+        )
+        places = self.config_dir / "session-places.txt"
+        places.write_text("/tmp/sessions-a\n", encoding="utf-8")
+        places_before = places.read_bytes()
+
+        first = run_install("--rewrite-config", str(checkout), env=self.env)
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        text = cfg.read_text(encoding="utf-8")
+        self.assertIn("source_dir = ", text)
+        self.assertTrue(text.index("source_dir") < text.index("[transcription]"))
+        self.assertIn('storage_dir = "~/Documents/Recall/sessions"', text)
+        self.assertIn('engine = "apple"', text)
+        self.assertEqual(places.read_bytes(), places_before)
+
+        second = run_install("--rewrite-config", str(checkout), env=self.env)
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+        text2 = cfg.read_text(encoding="utf-8")
+        self.assertEqual(text2.count("source_dir = "), 1)
+
+
+    def test_non_tty_unrelated_refuses_without_fake_prompt(self) -> None:
+        """H1: closed stdin must not print [Y/n], then refuse clearly once."""
+        checkout = self.home / "Scripts" / "recall"
+        init_checkout(checkout)
+        other = self.tmp / "other"
+        init_checkout(other)
+        subprocess.run(
+            ["git", "-C", str(other), "checkout", "--orphan", "fresh"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(other), "rm", "-rf", "."], check=True, capture_output=True)
+        (other / "src").mkdir(exist_ok=True)
+        (other / "capture-helper").mkdir(exist_ok=True)
+        (other / "Cargo.toml").write_text(
+            '[package]\nname = "recall"\nversion = "0.0.1"\nedition = "2021"\n',
+            encoding="utf-8",
+        )
+        (other / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+        (other / "capture-helper" / "Package.swift").write_text("// fresh\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(other), "add", "."], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(other),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "fresh unrelated root",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        other_tip = subprocess.check_output(
+            ["git", "-C", str(other), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(
+            ["git", "-C", str(checkout), "remote", "add", "other", str(other)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "fetch",
+                "--quiet",
+                "other",
+                f"+{other_tip}:refs/remotes/origin/main",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        # Marker committed so the tree stays clean for the history prompt.
+        marker = checkout / "KEEP"
+        marker.write_text("keep\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(checkout), "add", "KEEP"], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "keep marker",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        env = dict(self.env)
+        env["RECALL_INSTALL_SKIP_FETCH"] = "1"
+        result = subprocess.run(
+            ["bash", str(INSTALL), "--repo", str(checkout)],
+            cwd=str(self.home),
+            env=env,
+            text=True,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+        combined = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, combined)
+        self.assertNotIn("[Y/n]", combined, combined)
+        self.assertIn("--yes", result.stderr, result.stderr)
+        self.assertTrue(marker.is_file())
+        self.assertNotIn("Left ", result.stderr)
+
+    def test_ssh_remote_is_accepted_as_checkout(self) -> None:
+        """H2: git@github.com:owner/repo.git must pass the official remote check."""
+        checkout = self.home / "Scripts" / "recall"
+        init_checkout(checkout, remote="git@github.com:matthewpergolski/recall.git")
+        result = run_install("--plan", "--repo", str(checkout), env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotIn("not a Recall checkout", result.stderr)
+        self.assertIn("plan:", result.stdout)
+
+    def test_archive_substring_remote_is_rejected(self) -> None:
+        checkout = self.home / "Scripts" / "recall"
+        init_checkout(
+            checkout, remote="https://github.com/matthewpergolski/recall-archive.git"
+        )
+        result = run_install("--plan", "--repo", str(checkout), env=self.env)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("not a Recall checkout", result.stderr)
+
+    def test_invalid_source_dir_remote_stops_without_cloning(self) -> None:
+        pinned = self.home / "Scripts" / "recall"
+        init_checkout(pinned, remote="https://github.com/other/not-recall.git")
+        cfg = self.config_dir / "config.toml"
+        cfg.write_text(f'source_dir = "{pinned}"\n', encoding="utf-8")
+        result = run_install("--plan", env=self.env, cwd=self.home)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("source_dir", result.stderr)
+        self.assertFalse((self.home / "Projects" / "recall").exists())
+        self.assertNotIn("clone", result.stdout.lower())
+
+
+    def test_script_parses_under_sh_posix(self) -> None:
+        """Blocker: macOS curl|sh is bash 3.2 POSIX — no process substitution."""
+        result = subprocess.run(
+            ["bash", "--posix", "-n", str(INSTALL)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_plan_under_sh_posix_reaches_plan_output(self) -> None:
+        """curl|sh must get past find_checkout and print a plan line."""
+        checkout = self.home / "Projects" / "recall"
+        init_checkout(checkout)
+        result = subprocess.run(
+            ["bash", "--posix", str(INSTALL), "--plan", "--repo", str(checkout)],
+            cwd=str(self.home),
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("plan:", result.stdout)
+        self.assertNotIn("syntax error", (result.stderr + result.stdout).lower())
+
+    def test_print_unique_commits_without_mapfile(self) -> None:
+        """M1: aside path must not call mapfile or process substitution."""
+        src = INSTALL.read_text(encoding="utf-8")
+        self.assertNotIn("mapfile", src)
+        self.assertNotIn("< <(", src)
+
+    def test_tty_n_leaves_unchanged_message_on_stderr(self) -> None:
+        """H1: successful /dev/tty open must not silence later stderr (Left unchanged)."""
+        checkout = self.home / "Scripts" / "recall"
+        marker = self._make_unrelated_clean(checkout)
+        env = dict(self.env)
+        env["RECALL_INSTALL_SKIP_FETCH"] = "1"
+        code, stdout, stderr = run_install_with_controlling_tty(
+            "--repo",
+            str(checkout),
+            env=env,
+            cwd=self.home,
+            tty_reply=b"n\n",
+        )
+        combined = stdout + stderr
+        self.assertNotEqual(code, 0, combined)
+        self.assertIn("Left ", stderr, f"stdout={stdout!r} stderr={stderr!r}")
+        self.assertIn("unchanged", stderr, stderr)
+        self.assertTrue(marker.is_file())
+
+    def test_tty_y_clone_failure_prints_on_stderr(self) -> None:
+        """H1: after tty yes, a failed clone must still print on stderr."""
+        checkout = self.home / "Scripts" / "recall"
+        marker = self._make_unrelated_clean(checkout)
+        # Break the official HTTPS clone URL without touching the script.
+        gitconfig = self.home / ".gitconfig"
+        gitconfig.write_text(
+            "[url \"https://127.0.0.1:9/\"]\n"
+            "\tinsteadOf = https://github.com/matthewpergolski/recall.git\n",
+            encoding="utf-8",
+        )
+        env = dict(self.env)
+        env["RECALL_INSTALL_SKIP_FETCH"] = "1"
+        code, stdout, stderr = run_install_with_controlling_tty(
+            "--repo",
+            str(checkout),
+            env=env,
+            cwd=self.home,
+            tty_reply=b"y\n",
+            timeout=30.0,
+        )
+        combined = stdout + stderr
+        self.assertNotEqual(code, 0, combined)
+        self.assertIn("failed to clone", stderr, f"stdout={stdout!r} stderr={stderr!r}")
+        self.assertTrue(marker.is_file())
+
+    def test_rustc_compare_does_not_use_sort_v(self) -> None:
+        """macOS /usr/bin/sort has no -V; version compare must not call it."""
+        src = INSTALL.read_text(encoding="utf-8")
+        self.assertNotIn("sort -V", src)
+        checkout = self.home / "Projects" / "recall"
+        init_checkout(checkout)
+        cargo_toml = checkout / "Cargo.toml"
+        cargo_toml.write_text(
+            '[package]\nname = "recall"\nversion = "0.0.0"\nedition = "2021"\n'
+            'rust-version = "1.95"\n',
+            encoding="utf-8",
+        )
+        ignore = checkout / "capture-helper" / ".gitignore"
+        ignore.write_text(".build/\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(checkout), "add", "Cargo.toml", "capture-helper/.gitignore"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "-c",
+                "user.name=Recall Test",
+                "-c",
+                "user.email=recall@example.invalid",
+                "commit",
+                "-m",
+                "rust-version",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(checkout), "update-ref", "refs/remotes/origin/main", "HEAD"],
+            check=True,
+            capture_output=True,
+        )
+        bin_dir = self.tmp / "bin-stubs"
+        bin_dir.mkdir()
+        (bin_dir / "sort").write_text(
+            "#!/bin/sh\necho \"sort: invalid option -- V\" >&2\nexit 2\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "rustc").write_text(
+            "#!/bin/sh\necho 'rustc 1.95.0 (aaaaaaaaa 2026-01-01)'\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "rustup").write_text(
+            "#!/bin/sh\necho rustup-stub-called >>\"$HOME/rustup.log\"\nexit 1\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "swift").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (bin_dir / "cargo").write_text(
+            "#!/bin/sh\n"
+            "mkdir -p \"$CARGO_HOME/bin\"\n"
+            "printf '#!/bin/sh\\necho ok\\n' >\"$CARGO_HOME/bin/recall\"\n"
+            "chmod +x \"$CARGO_HOME/bin/recall\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        for name in ("sort", "rustc", "rustup", "swift", "cargo"):
+            (bin_dir / name).chmod(0o755)
+        helper = checkout / "capture-helper" / ".build" / "debug" / "recall-capture"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("#!/bin/sh\necho stub\n", encoding="utf-8")
+        helper.chmod(0o755)
+        env = dict(self.env)
+        env["RECALL_INSTALL_SKIP_FETCH"] = "1"
+        env["CARGO_HOME"] = str(self.home / ".cargo")
+        env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
+        result = run_install("--repo", str(checkout), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertNotIn("invalid option", result.stderr)
+        self.assertNotIn("older than Cargo.toml", result.stderr)
+        self.assertFalse((self.home / "rustup.log").exists())
+
+    def test_foreign_recall_on_path_still_edits_rc(self) -> None:
+        """Foreign PATH recall must not skip appending Cargo's bin to shell rc."""
+        checkout = self.home / "Projects" / "recall"
+        head = self._prepare_current_with_helper(checkout)
+        foreign_dir = self.tmp / "foreign-bin"
+        foreign_dir.mkdir()
+        foreign = foreign_dir / "recall"
+        foreign.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
+        foreign.chmod(0o755)
+        cargo_home = self.home / ".cargo"
+        cargo_bin = cargo_home / "bin"
+        cargo_bin.mkdir(parents=True)
+        # Matching cargo binary exists but is not what command -v finds.
+        (cargo_bin / "recall").write_text(
+            f"#!/bin/sh\necho cargo\n# {head}\n", encoding="utf-8"
+        )
+        (cargo_bin / "recall").chmod(0o755)
+        bin_dir = self.tmp / "tool-stubs"
+        bin_dir.mkdir()
+        (bin_dir / "rustc").write_text(
+            "#!/bin/sh\necho 'rustc 1.95.0 (aaaaaaaaa 2026-01-01)'\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "swift").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (bin_dir / "cargo").write_text(
+            "#!/bin/sh\n"
+            f"printf '#!/bin/sh\\necho ok\\n# {head}\\n' >\"$CARGO_HOME/bin/recall\"\n"
+            "chmod +x \"$CARGO_HOME/bin/recall\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        for name in ("rustc", "swift", "cargo"):
+            (bin_dir / name).chmod(0o755)
+        env = dict(self.env)
+        env["RECALL_INSTALL_SKIP_FETCH"] = "1"
+        env["CARGO_HOME"] = str(cargo_home)
+        # Foreign first; Cargo bin not on PATH.
+        env["PATH"] = f"{foreign_dir}:{bin_dir}:/usr/bin:/bin"
+        result = run_install("--repo", str(checkout), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        zprofile = (self.home / ".zprofile").read_text(encoding="utf-8")
+        self.assertIn(str(cargo_bin), zprofile)
+        zshrc = (self.home / ".zshrc").read_text(encoding="utf-8")
+        self.assertIn(str(cargo_bin), zshrc)
+
+
+if __name__ == "__main__":
+    unittest.main()

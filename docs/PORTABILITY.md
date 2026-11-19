@@ -34,19 +34,26 @@ This is enough for development. No alias is required.
 
 ## Installing `recall`
 
-From the repo root:
+Prefer the curl installer (also the update path for older binaries):
 
 ```sh
-cargo install --path . --locked
+curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh
 ```
 
-After that, `recall` should be available from any terminal if Cargo's bin directory is on your `PATH`.
+Without a TTY, append `--yes`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh -s -- --yes
+```
+
+That builds the helper, installs with `cargo install --path <checkout> --locked --force`, and rewrites a stale top-level `source_dir`. After that, `recall` should be available from any terminal if Cargo's bin directory is on your `PATH`.
 
 Check:
 
 ```sh
 which recall
 recall --version
+recall doctor
 ```
 
 Cargo usually installs binaries into:
@@ -97,19 +104,19 @@ For longer-term defaults, prefer `~/.config/recall/config.toml`; see `docs/AGENT
 
 ## Reinstall After Moving
 
-If you installed Recall with `cargo install --path . --locked` and later move the project, reinstall from the new location:
+From inside the moved checkout, re-run the install command so `source_dir` records that path:
 
 ```sh
-cargo install --path . --locked
+curl -fsSL https://raw.githubusercontent.com/matthewpergolski/recall/main/scripts/install.sh | sh
 ```
 
-The installed binary embeds the current package build, so reinstalling keeps your global `recall` command aligned with the moved source tree.
+Or, after the new binary is installed:
 
-Set the new source location in Recall's config if you want future updates to keep finding it even after another installation method changes the embedded build path:
-
-```toml
-source_dir = "~/Projects/recall"
+```sh
+recall update --repo /path/to/moved/recall
 ```
+
+The top-level `source_dir` line is rewritten. Other config keys stay as they are.
 
 ## Updating From GitHub
 
