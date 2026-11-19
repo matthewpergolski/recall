@@ -199,9 +199,18 @@ pub(crate) fn confirm_aside(yes: bool, interactive: bool) -> io::Result<bool> {
         return Ok(false);
     }
     let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
+    let bytes_read = io::stdin().lock().read_line(&mut line)?;
+    Ok(accept_aside_answer(bytes_read, &line))
+}
+
+/// Interpret one `[Y/n]` read. Enter (newline → empty trim) is yes. EOF / Ctrl-D
+/// (`bytes_read == 0`) is refuse. `y` / `yes` are yes; anything else is no.
+pub(crate) fn accept_aside_answer(bytes_read: usize, line: &str) -> bool {
+    if bytes_read == 0 {
+        return false;
+    }
     let answer = line.trim();
-    Ok(answer.is_empty() || answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+    answer.is_empty() || answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
 }
 
 pub(crate) fn stdin_is_terminal() -> bool {
@@ -209,6 +218,10 @@ pub(crate) fn stdin_is_terminal() -> bool {
 }
 
 /// Move the broken checkout aside and clone a fresh tree into the original path.
+///
+/// Clones into a sibling temp directory first. The user's checkout is renamed
+/// aside only after that clone succeeds, so a failed clone leaves the original
+/// path untouched.
 pub(crate) fn aside_and_clone<F>(
     checkout: &Path,
     date: &str,
@@ -244,22 +257,45 @@ where
     }
     let _ = io::stdout().flush();
 
-    fs::rename(checkout, &aside).map_err(|error| {
-        io::Error::new(
+    let temp = choose_clone_temp(checkout)?;
+    if let Err(error) = clone_into(&temp) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(checkout, &aside) {
+        let _ = fs::remove_dir_all(&temp);
+        return Err(io::Error::new(
             error.kind(),
             format!(
                 "Failed to move {} to {}: {error}",
                 checkout.display(),
                 aside.display()
             ),
-        )
-    })?;
+        ));
+    }
     println!("Moved {} to {}", checkout.display(), aside.display());
 
-    if let Err(error) = clone_into(checkout) {
-        // Best-effort restore so a failed clone does not leave the path empty.
-        let _ = fs::rename(&aside, checkout);
-        return Err(error);
+    if let Err(error) = fs::rename(&temp, checkout) {
+        let restore = fs::rename(&aside, checkout);
+        let restore_note = match &restore {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&temp);
+                format!("Restored {} from {}.", checkout.display(), aside.display())
+            }
+            Err(restore_err) => format!(
+                "Could not restore {checkout} from {aside}: {restore_err}. \
+Local files are in {aside}. Clone is in {temp}.",
+                checkout = checkout.display(),
+                aside = aside.display(),
+                temp = temp.display(),
+            ),
+        };
+        return Err(io::Error::other(format!(
+            "Failed to move clone from {} into {}: {error}. {restore_note}",
+            temp.display(),
+            checkout.display()
+        )));
     }
     println!("Cloned origin/main into {}", checkout.display());
 
@@ -268,6 +304,35 @@ where
         aside,
         unique_subjects,
     })
+}
+
+fn choose_clone_temp(checkout: &Path) -> io::Result<PathBuf> {
+    let parent = checkout.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Checkout {} has no parent directory", checkout.display()),
+        )
+    })?;
+    let name = checkout
+        .file_name()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Checkout {} has no directory name", checkout.display()),
+            )
+        })?
+        .to_string_lossy();
+    let pid = std::process::id();
+    for n in 0..10_000 {
+        let candidate = parent.join(format!(".{name}.recall-clone-{pid}-{n}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::other(format!(
+        "Could not find a free clone temp path near {}",
+        parent.display()
+    )))
 }
 
 pub(crate) fn clone_official(checkout: &Path) -> io::Result<()> {
@@ -683,5 +748,126 @@ mod tests {
                 "repair path must not contain {banned}"
             );
         }
+    }
+
+    /// F1: stale `origin/main` on an unrelated remote must update via fetch so
+    /// classification can reach Unrelated (aside prompt). Non-force refspec
+    /// leaves the tracking tip stuck; production `fetch_origin_main` must not.
+    #[test]
+    fn unrelated_remote_fetch_updates_tracking_ref() {
+        use crate::update::fetch_origin_main;
+
+        let old = Fixture::new("stale-track");
+        old.commit("old root");
+        old.mark_origin();
+        let head_before = git_output(&old.path, &["rev-parse", "HEAD"]).unwrap();
+        let stale_origin =
+            git_output(&old.path, &["rev-parse", "refs/remotes/origin/main"]).unwrap();
+
+        let fresh = Fixture::new("fresh-remote");
+        fresh.commit("fresh unrelated root");
+        let fresh_tip = git_output(&fresh.path, &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(head_before, fresh_tip);
+
+        let url = format!("file://{}", fresh.path.display());
+        run(&old.path, &["remote", "set-url", "origin", &url]);
+
+        // Reproduce the hole: non-force refspec rejects the unrelated update.
+        let non_force = git_at(&old.path)
+            .args([
+                "fetch",
+                "--quiet",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            !non_force.success(),
+            "non-force refspec should fail on unrelated remote"
+        );
+        assert_eq!(
+            git_output(&old.path, &["rev-parse", "refs/remotes/origin/main"]).unwrap(),
+            stale_origin,
+            "failed non-force fetch must leave the stale tracking tip"
+        );
+
+        fetch_origin_main(&old.path).expect("force-tracking fetch must update origin/main");
+
+        let head_after = git_output(&old.path, &["rev-parse", "HEAD"]).unwrap();
+        let origin_after =
+            git_output(&old.path, &["rev-parse", "refs/remotes/origin/main"]).unwrap();
+        assert_eq!(head_after, head_before, "fetch must not move local HEAD");
+        assert_eq!(
+            origin_after, fresh_tip,
+            "tracking tip must become fresh main"
+        );
+        assert_ne!(origin_after, stale_origin);
+        assert!(
+            matches!(
+                classify_history(&old.path).unwrap(),
+                HistoryClass::Unrelated { .. }
+            ),
+            "after fetch, history must classify as Unrelated"
+        );
+    }
+
+    /// F2: a failed clone must leave the original checkout path in place.
+    /// Clone into a sibling temp first so a partial clone cannot block undo
+    /// and leave the user's tree only at an aside path.
+    #[test]
+    fn failed_clone_leaves_checkout_unmoved() {
+        let fixture = Fixture::new("clone-fail");
+        fixture.commit("keep me");
+        fixture.mark_origin();
+        let head = git_output(&fixture.path, &["rev-parse", "HEAD"]).unwrap();
+        let checkout = fixture.path.clone();
+
+        let err = aside_and_clone(&checkout, "2026-11-19", |dest| {
+            // Occupy the clone destination (old code used the checkout path).
+            fs::create_dir_all(dest)?;
+            fs::write(dest.join("partial.txt"), "partial\n")?;
+            Err(io::Error::other("clone boom"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("clone boom"), "{err}");
+        assert!(checkout.is_dir(), "checkout path must still exist");
+        assert!(
+            !checkout.join("partial.txt").is_file(),
+            "partial clone must not replace the user's checkout"
+        );
+        assert_eq!(
+            git_output(&checkout, &["rev-parse", "HEAD"]).unwrap(),
+            head,
+            "local commits must remain at the original path"
+        );
+        let parent = checkout.parent().unwrap();
+        let name = checkout.file_name().unwrap().to_string_lossy();
+        for entry in fs::read_dir(parent).unwrap() {
+            let entry = entry.unwrap();
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if fname.starts_with(&format!("{name}-old-")) {
+                panic!("aside path left behind after failed clone: {fname}");
+            }
+            if fname.contains(".recall-clone-") {
+                panic!("temp clone path left behind after failed clone: {fname}");
+            }
+        }
+    }
+
+    /// F4: Ctrl-D / EOF at `[Y/n]` must refuse (not treat empty buffer as yes).
+    #[test]
+    fn eof_at_prompt_refuses() {
+        assert!(
+            !accept_aside_answer(0, ""),
+            "EOF (0 bytes) must refuse aside-and-clone"
+        );
+        assert!(accept_aside_answer(1, "\n"), "Enter alone remains yes");
+        assert!(accept_aside_answer(2, "y\n"));
+        assert!(accept_aside_answer(4, "yes\n"));
+        assert!(!accept_aside_answer(2, "n\n"));
+        assert!(!accept_aside_answer(3, "no\n"));
+        assert!(!accept_aside_answer(6, "maybe\n"));
     }
 }

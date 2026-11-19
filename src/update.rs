@@ -88,15 +88,7 @@ pub fn update(options: &UpdateOptions) -> io::Result<()> {
     }
     progress.arm_ephemeral("Checking origin/main");
     let fetch_started = Instant::now();
-    let fetched = run_quiet_command(
-        git_at(&checkout).args([
-            "fetch",
-            "--quiet",
-            "origin",
-            "refs/heads/main:refs/remotes/origin/main",
-        ]),
-        "fetch origin/main",
-    );
+    let fetched = fetch_origin_main(&checkout);
     let check_shown = progress.disarm_ephemeral();
     if let Err(error) = fetched {
         if check_shown {
@@ -554,6 +546,24 @@ fn command_output(command: &mut Command, description: &str) -> io::Result<Output
 
 fn run_quiet_command(command: &mut Command, description: &str) -> io::Result<()> {
     command_output(command, description).map(|_| ())
+}
+
+/// Fetch `origin/main` into `refs/remotes/origin/main` only.
+///
+/// Uses a force-tracking refspec (`+`) so an unrelated remote tip can replace a
+/// stale remote-tracking ref. This does not move local `main` and is not a
+/// force-push.
+pub(crate) fn fetch_origin_main(checkout: &Path) -> io::Result<()> {
+    // `+` force-updates the remote-tracking ref only (same as a normal
+    // `git fetch` configured refspec). No `--quiet` so failure stderr is kept.
+    run_quiet_command(
+        git_at(checkout).args([
+            "fetch",
+            "origin",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ]),
+        "fetch origin/main",
+    )
 }
 
 fn run_quiet_step(
